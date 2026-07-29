@@ -1,8 +1,8 @@
 #![cfg_attr(docsrs, procmacros::doc_replace(
     "analog_pin" => {
-        cfg(esp32) => "let analog_pin = peripherals.GPIO32;",
-        cfg(any(esp32s2, esp32s3)) => "let analog_pin = peripherals.GPIO3;",
-        cfg(not(any(esp32, esp32s2, esp32s3)))  => "let analog_pin = peripherals.GPIO2;"
+        cfg(esp32) => "GPIO32",
+        cfg(any(esp32s2, esp32s3)) => "GPIO3",
+        cfg(not(any(esp32, esp32s2, esp32s3)))  => "GPIO2"
     }
 ))]
 //! # Analog to Digital Converter (ADC)
@@ -34,9 +34,8 @@
 //! # use esp_hal::analog::adc::Attenuation;
 //! # use esp_hal::analog::adc::Adc;
 //! # use esp_hal::delay::Delay;
-//! # {analog_pin}
 //! let mut adc1_config = AdcConfig::new();
-//! let mut pin = adc1_config.enable_pin(analog_pin, Attenuation::_11dB);
+//! let mut pin = adc1_config.enable_pin(peripherals.__analog_pin__, Attenuation::_11dB);
 //! let mut adc1 = Adc::new(peripherals.ADC1, adc1_config);
 //!
 //! let mut delay = Delay::new();
@@ -98,32 +97,53 @@ pub enum AdcCalSource {
 }
 
 /// An I/O pin which can be read using the ADC.
-pub struct AdcPin<PIN, ADCI, CS = ()> {
+pub struct AdcPin<PIN, ADCX, CS = ()> {
     /// The underlying GPIO pin
     pub pin: PIN,
     /// Calibration scheme used for the configured ADC pin
     pub cal_scheme: CS,
-    _phantom: PhantomData<ADCI>,
+    _phantom: PhantomData<ADCX>,
+}
+
+impl<PIN: core::fmt::Debug, ADCX, CS: core::fmt::Debug> core::fmt::Debug for AdcPin<PIN, ADCX, CS> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdcPin")
+            .field("pin", &self.pin)
+            .field("cal_scheme", &self.cal_scheme)
+            .finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<PIN: defmt::Format, ADCX, CS: defmt::Format> defmt::Format for AdcPin<PIN, ADCX, CS> {
+    fn format(&self, fmt: defmt::Formatter<'_>) {
+        defmt::write!(
+            fmt,
+            "AdcPin {{ pin: {}, cal_scheme: {} }}",
+            self.pin,
+            self.cal_scheme
+        );
+    }
 }
 
 /// Configuration for the ADC.
 #[cfg(feature = "unstable")]
-pub struct AdcConfig<ADCI> {
+pub struct AdcConfig<ADCX> {
     #[cfg(esp32)]
     resolution: Resolution,
     attenuations: [Option<Attenuation>; NUM_ATTENS],
-    _phantom: PhantomData<ADCI>,
+    _phantom: PhantomData<ADCX>,
 }
 
 #[cfg(feature = "unstable")]
-impl<ADCI> AdcConfig<ADCI> {
+impl<ADCX> AdcConfig<ADCX> {
     /// Create a new configuration struct with its default values
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Enable the specified pin with the given attenuation
-    pub fn enable_pin<PIN>(&mut self, pin: PIN, attenuation: Attenuation) -> AdcPin<PIN, ADCI>
+    pub fn enable_pin<PIN>(&mut self, pin: PIN, attenuation: Attenuation) -> AdcPin<PIN, ADCX>
     where
         PIN: AdcChannel + AnalogPin,
     {
@@ -146,11 +166,11 @@ impl<ADCI> AdcConfig<ADCI> {
         &mut self,
         pin: PIN,
         attenuation: Attenuation,
-    ) -> AdcPin<PIN, ADCI, CS>
+    ) -> AdcPin<PIN, ADCX, CS>
     where
-        ADCI: CalibrationAccess,
+        ADCX: CalibrationAccess,
         PIN: AdcChannel + AnalogPin,
-        CS: AdcCalScheme<ADCI>,
+        CS: AdcCalScheme<ADCX>,
     {
         // TODO revert this on drop
         pin.set_analog(crate::private::Internal);
@@ -165,7 +185,7 @@ impl<ADCI> AdcConfig<ADCI> {
 }
 
 #[cfg(feature = "unstable")]
-impl<ADCI> Default for AdcConfig<ADCI> {
+impl<ADCX> Default for AdcConfig<ADCX> {
     fn default() -> Self {
         Self {
             #[cfg(esp32)]
@@ -201,7 +221,7 @@ pub trait AdcChannel {
 /// The methods in this trait are mostly for internal use. To get
 /// calibrated ADC reads, all you need to do is call `enable_pin_with_cal`
 /// and specify some implementor of this trait.
-pub trait AdcCalScheme<ADCI>: Sized + crate::private::Sealed {
+pub trait AdcCalScheme<ADCX>: Sized + crate::private::Sealed {
     /// Create a new calibration scheme for the given attenuation.
     fn new_cal(atten: Attenuation) -> Self;
 
@@ -218,7 +238,7 @@ pub trait AdcCalScheme<ADCI>: Sized + crate::private::Sealed {
 
 impl crate::private::Sealed for () {}
 
-impl<ADCI> AdcCalScheme<ADCI> for () {
+impl<ADCX> AdcCalScheme<ADCX> for () {
     fn new_cal(_atten: Attenuation) -> Self {}
 }
 
@@ -239,6 +259,12 @@ trait AdcCalEfuse {
     ///
     /// Returns digital value for reference voltage for a given attenuation
     fn cal_code(atten: Attenuation) -> Option<u16>;
+
+    /// Get the ADC channel specific calibration
+    ///
+    /// Returns digital per channel offset from reference voltage
+    #[cfg(esp32c5)]
+    fn cal_chan_compens(atten: Attenuation, channel: u16) -> Option<i32>;
 }
 
 for_each_analog_function! {

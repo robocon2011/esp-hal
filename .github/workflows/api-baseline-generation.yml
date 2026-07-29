@@ -71,7 +71,7 @@ jobs:
       - name: Install xtensa toolchain
         uses: esp-rs/xtensa-toolchain@v1.6
         with:
-          version: 1.92.0.0
+          version: 1.97.0.0
 
       - name: Check if baseline generation is needed
         id: check-generation
@@ -125,10 +125,17 @@ jobs:
             fi
 
             if [ -n "$PACKAGES" ]; then
-              echo "Breaking change detected for package(s): $PACKAGES"
-              echo "should_generate=true" >> "$GITHUB_OUTPUT"
-              echo "trigger_reason=breaking_change" >> "$GITHUB_OUTPUT"
-              echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+              # skip-semver-checks indicates a compiler upgrade
+              if echo "$LABELS" | grep -q "^skip-semver-checks$"; then
+                echo "skip-semver-checks label found, suppressing auto-regeneration"
+                echo "should_generate=false" >> "$GITHUB_OUTPUT"
+                echo "trigger_reason=skip_semver_checks" >> "$GITHUB_OUTPUT"
+              else
+                echo "Breaking change detected for package(s): $PACKAGES"
+                echo "should_generate=true" >> "$GITHUB_OUTPUT"
+                echo "trigger_reason=breaking_change" >> "$GITHUB_OUTPUT"
+                echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+              fi
             else
               echo "No breaking-change-* labels found"
               echo "should_generate=false" >> "$GITHUB_OUTPUT"
@@ -156,15 +163,15 @@ jobs:
         if: steps.check-generation.outputs.should_generate == 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: api-baselines-${{ github.event.inputs.package_name }}
-          path: ${{ github.event.inputs.package_name }}/api-baseline/
+          name: api-baselines-${{ steps.check-generation.outputs.packages }}
+          path: ${{ steps.check-generation.outputs.packages }}/api-baseline/
           retention-days: 90 # Maximum for public repos
 
       - name: Create baseline summary
         if: steps.check-generation.outputs.should_generate == 'true'
         shell: bash
         run: |
-          PACKAGE_NAME="${{ github.event.inputs.package_name }}"
+          PACKAGE_NAME="${{ steps.check-generation.outputs.packages }}"
           echo "Successfully generated and uploaded API baselines"
           echo "Artifact name: api-baselines-$PACKAGE_NAME"
           echo "Retention: 90 days (expires on $(date -d '+90 days' '+%Y-%m-%d'))"
@@ -215,6 +222,10 @@ jobs:
         if: steps.check-generation.outputs.should_generate == 'false'
         shell: bash
         run: |
-          echo "## No Baseline Generation Needed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "No breaking change detected in the merged PR. API baselines will not be regenerated." >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check-generation.outputs.trigger_reason }}" = "skip_semver_checks" ]; then
+            echo "## Baseline Generation Suppressed" >> $GITHUB_STEP_SUMMARY
+            echo "The \`skip-semver-checks\` label was found. Automatic regeneration was skipped to allow for manual baseline targeting." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## No Baseline Generation Needed" >> $GITHUB_STEP_SUMMARY
+            echo "No breaking change detected." >> $GITHUB_STEP_SUMMARY
+          fi

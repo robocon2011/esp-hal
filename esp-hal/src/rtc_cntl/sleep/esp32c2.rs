@@ -1,8 +1,7 @@
-use super::{TimerWakeupSource, WakeSource, WakeTriggers, WakeupLevel};
+use super::WakeTriggers;
 use crate::{
-    gpio::{RtcFunction, RtcPinWithResistors},
-    peripherals::{APB_CTRL, BB, EXTMEM, GPIO, IO_MUX, LPWR, SPI0, SPI1, SYSTEM},
-    rtc_cntl::{Clock, Rtc, RtcClock, sleep::RtcioWakeupSource},
+    peripherals::{APB_CTRL, BB, EXTMEM, LPWR, SPI0, SPI1, SYSTEM},
+    rtc_cntl::Rtc,
     soc::regi2c,
 };
 
@@ -88,172 +87,6 @@ pub const SIG_GPIO_OUT_IDX: u32 = 128;
 /// Maximum number of GPIO pins supported.
 pub const GPIO_NUM_MAX: usize = 22;
 
-impl WakeSource for TimerWakeupSource {
-    fn apply(
-        &self,
-        rtc: &Rtc<'_>,
-        triggers: &mut WakeTriggers,
-        _sleep_config: &mut RtcSleepConfig,
-    ) {
-        triggers.set_timer(true);
-        let rtc_cntl = LPWR::regs();
-        let clock_freq = RtcClock::slow_freq();
-        // TODO: maybe add sleep time adjustlemnt like idf
-        // TODO: maybe add check to prevent overflow?
-        let clock_hz = clock_freq.frequency().as_hz() as u64;
-        let ticks = self.duration.as_micros() as u64 * clock_hz / 1_000_000u64;
-        // "alarm" time in slow rtc ticks
-        let now = rtc.time_since_boot_raw();
-        let time_in_ticks = now + ticks;
-        unsafe {
-            rtc_cntl
-                .slp_timer0()
-                .write(|w| w.slp_val_lo().bits((time_in_ticks & 0xffffffff) as u32));
-
-            rtc_cntl
-                .int_clr()
-                .write(|w| w.main_timer().clear_bit_by_one());
-
-            rtc_cntl.slp_timer1().write(|w| {
-                w.slp_val_hi().bits(((time_in_ticks >> 32) & 0xffff) as u16);
-                w.main_timer_alarm_en().set_bit()
-            });
-        }
-    }
-}
-
-impl RtcioWakeupSource<'_, '_> {
-    fn apply_pin(&self, pin: &mut dyn RtcPinWithResistors, level: WakeupLevel) {
-        // The pullup/pulldown part is like in gpio_deep_sleep_wakeup_prepare
-        let level = match level {
-            WakeupLevel::High => {
-                pin.rtcio_pullup(false);
-                pin.rtcio_pulldown(true);
-                GPIO_INTR_HIGH_LEVEL
-            }
-            WakeupLevel::Low => {
-                pin.rtcio_pullup(true);
-                pin.rtcio_pulldown(false);
-                GPIO_INTR_LOW_LEVEL
-            }
-        };
-        pin.rtcio_pad_hold(true);
-
-        // apply_wakeup does the same as idf's esp_deep_sleep_enable_gpio_wakeup
-        unsafe {
-            pin.apply_wakeup(true, level);
-        }
-    }
-}
-
-fn isolate_digital_gpio() {
-    // like esp_sleep_isolate_digital_gpio
-    let rtc_cntl = LPWR::regs();
-    let io_mux = IO_MUX::regs();
-    let gpio = GPIO::regs();
-
-    let dig_iso = &rtc_cntl.dig_iso().read();
-    let deep_sleep_hold_is_en =
-        !dig_iso.dg_pad_force_unhold().bit() && dig_iso.dg_pad_autohold_en().bit();
-    if !deep_sleep_hold_is_en {
-        return;
-    }
-
-    // TODO: assert that the task stack is not in external ram
-
-    for pin_num in 0..GPIO_NUM_MAX {
-        let pin_hold = rtc_cntl.dig_pad_hold().read().bits() & (1 << pin_num) != 0;
-        if !pin_hold {
-            // input disable, like gpio_ll_input_disable
-            io_mux.gpio(pin_num).modify(|_, w| w.fun_ie().clear_bit());
-            // output disable, like gpio_ll_output_disable
-            unsafe {
-                gpio.func_out_sel_cfg(pin_num)
-                    .modify(|_, w| w.bits(SIG_GPIO_OUT_IDX));
-            }
-
-            // disable pull-up and pull-down
-            io_mux.gpio(pin_num).modify(|_, w| w.fun_wpu().clear_bit());
-            io_mux.gpio(pin_num).modify(|_, w| w.fun_wpd().clear_bit());
-
-            // make pad work as gpio (otherwise, deep_sleep bottom current will rise)
-            io_mux
-                .gpio(pin_num)
-                .modify(|_, w| unsafe { w.mcu_sel().bits(RtcFunction::Digital as u8) });
-        }
-    }
-}
-
-impl WakeSource for RtcioWakeupSource<'_, '_> {
-    fn apply(
-        &self,
-        _rtc: &Rtc<'_>,
-        triggers: &mut WakeTriggers,
-        sleep_config: &mut RtcSleepConfig,
-    ) {
-        let mut pins = self.pins.borrow_mut();
-
-        if pins.is_empty() {
-            return;
-        }
-
-        triggers.set_gpio(true);
-
-        // If deep sleep is enabled, esp_start_sleep calls
-        // gpio_deep_sleep_wakeup_prepare which sets these pullup and
-        // pulldown values. But later in esp_start_sleep it calls
-        // esp_sleep_isolate_digital_gpio, which disables the pullup and pulldown (but
-        // only if it isn't held).
-        // But it looks like gpio_deep_sleep_wakeup_prepare enables hold for all pins
-        // in the wakeup mask.
-        //
-        // So: all pins in the wake mask should get this treatment here, and all pins
-        // not in the wake mask should get
-        // - pullup and pulldowns disabled
-        // - input and output disabled, and
-        // - their func should get set to GPIO.
-        // But this last block of things gets skipped if hold is disabled globally (see
-        // gpio_ll_deep_sleep_hold_is_en)
-
-        LPWR::regs()
-            .cntl_gpio_wakeup()
-            .modify(|_, w| w.gpio_pin_clk_gate().set_bit());
-
-        LPWR::regs()
-            .ext_wakeup_conf()
-            .modify(|_, w| w.gpio_wakeup_filter().set_bit());
-
-        if sleep_config.deep_slp() {
-            for (pin, level) in pins.iter_mut() {
-                self.apply_pin(*pin, *level);
-            }
-
-            isolate_digital_gpio();
-        }
-
-        // like rtc_cntl_ll_gpio_clear_wakeup_status, as called from
-        // gpio_deep_sleep_wakeup_prepare
-        LPWR::regs()
-            .cntl_gpio_wakeup()
-            .modify(|_, w| w.gpio_wakeup_status_clr().set_bit());
-        LPWR::regs()
-            .cntl_gpio_wakeup()
-            .modify(|_, w| w.gpio_wakeup_status_clr().clear_bit());
-    }
-}
-
-// impl Drop for RtcioWakeupSource<'_, '_> {
-// fn drop(&mut self) {
-// should we have saved the pin configuration first?
-// set pin back to IO_MUX (input_enable and func have no effect when pin is sent
-// to IO_MUX)
-// let mut pins = self.pins.borrow_mut();
-// for (pin, _level) in pins.iter_mut() {
-// pin.rtc_set_config(true, false, RtcFunction::Rtc);
-// }
-// }
-// }
-
 bitfield::bitfield! {
     #[derive(Clone, Copy)]
     /// RTC Configuration.
@@ -291,6 +124,7 @@ impl Default for RtcConfig {
         cfg.set_pwrctl_init(true);
         cfg.set_rtc_dboost_fpd(true);
         cfg.set_cpu_waiti_clk_gate(true);
+        cfg.set_bbpll_fpu(true);
         cfg
     }
 }
@@ -399,6 +233,14 @@ impl Default for RtcSleepConfig {
         cfg.set_light_slp_reject(true);
         cfg.set_rtc_dbias_slp(RTC_CNTL_DBIAS_1V10);
         cfg.set_dig_dbias_slp(RTC_CNTL_DBIAS_1V10);
+
+        // This is the light-sleep config. The main XTAL is powered down in sleep
+        // (`xtal_fpu` stays false), so the analog regulator/bias must use the
+        // same XTAL-down settings that `deep()` applies "because of xtal_fpu".
+        cfg.set_rtc_regulator_fpu(true);
+        cfg.set_bias_sleep_monitor(true);
+        cfg.set_bias_sleep_slp(true);
+        cfg.set_pd_cur_slp(true);
         cfg
     }
 }
@@ -441,12 +283,9 @@ fn rtc_sleep_pu(val: bool) {
         .modify(|_, w| w.lslp_mem_force_pu().bit(val));
 
     APB_CTRL::regs().front_end_mem_pd().modify(|_r, w| {
-        w.dc_mem_force_pu()
-            .bit(val)
-            .pbus_mem_force_pu()
-            .bit(val)
-            .agc_mem_force_pu()
-            .bit(val)
+        w.dc_mem_force_pu().bit(val);
+        w.pbus_mem_force_pu().bit(val);
+        w.agc_mem_force_pu().bit(val)
     });
 
     BB::regs()
@@ -508,6 +347,10 @@ impl RtcSleepConfig {
         cfg.set_pd_cur_slp(true);
 
         cfg
+    }
+
+    pub(crate) fn is_deep_sleep(&self) -> bool {
+        self.deep_slp()
     }
 
     pub(crate) fn base_settings(_rtc: &Rtc<'_>) {
@@ -722,13 +565,12 @@ impl RtcSleepConfig {
 
     pub(crate) fn start_sleep(&self, wakeup_triggers: WakeTriggers) {
         // set bits for what can wake us up
-        LPWR::regs()
-            .wakeup_state()
-            .modify(|_, w| unsafe { w.wakeup_ena().bits(wakeup_triggers.0.into()) });
+        LPWR::regs().wakeup_state().modify(|_, w| unsafe {
+            w.wakeup_ena()
+                .bits((wakeup_triggers.as_u32() as u16).into())
+        });
 
-        LPWR::regs()
-            .state0()
-            .write(|w| w.sleep_en().set_bit().slp_wakeup().set_bit());
+        LPWR::regs().state0().modify(|_, w| w.sleep_en().set_bit());
     }
 
     pub(crate) fn finish_sleep(&self) {

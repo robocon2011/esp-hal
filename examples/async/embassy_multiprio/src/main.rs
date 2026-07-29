@@ -9,7 +9,7 @@
 //!  - A high priority task that prints something every second. The example demonstrates that this
 //!    task will continue to run even while the low priority blocking task is running.
 
-// The thread-executor is created by the `#[esp_rtos::main]` macro and is used to spawn
+// The thread-executor is created by the `#[esp_hal::main]` macro and is used to spawn
 // `low_prio_async` and `low_prio_blocking`. The interrupt-executor is created in `main` and is used
 // to spawn `high_prio`.
 
@@ -66,7 +66,7 @@ async fn low_prio_async() {
     }
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(low_prio_spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     println!("Init!");
@@ -82,9 +82,9 @@ async fn main(low_prio_spawner: Spawner) {
     let executor = EXECUTOR.init(executor);
 
     let spawner = executor.start(Priority::Priority3);
-    spawner.must_spawn(high_prio());
+    spawner.spawn(high_prio().unwrap());
 
     println!("Spawning low-priority tasks");
-    low_prio_spawner.must_spawn(low_prio_async());
-    low_prio_spawner.must_spawn(low_prio_blocking());
+    low_prio_spawner.spawn(low_prio_async().unwrap());
+    low_prio_spawner.spawn(low_prio_blocking().unwrap());
 }

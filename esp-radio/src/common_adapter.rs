@@ -10,6 +10,12 @@ use crate::{
     time::blob_ticks_to_micros,
 };
 
+#[ram]
+#[cfg(any(feature = "coex", all(feature = "ble", bt_controller = "btdm")))]
+pub(crate) unsafe extern "C" fn is_in_isr() -> i32 {
+    !hal::interrupt::RunLevel::current().is_thread() as i32
+}
+
 /// **************************************************************************
 /// Name: esp_semphr_create
 ///
@@ -134,47 +140,28 @@ pub unsafe extern "C" fn random() -> c_ulong {
 /// *************************************************************************
 pub unsafe extern "C" fn read_mac(mac: *mut u8, type_: u32) -> c_int {
     trace!("read_mac {:?} {}", mac, type_);
+    use hal::efuse::InterfaceMacAddress;
 
-    let base_mac = hal::efuse::Efuse::mac_address();
-
-    for (i, &byte) in base_mac.iter().enumerate() {
-        unsafe {
-            mac.add(i).write_volatile(byte);
-        }
-    }
-
-    const ESP_MAC_WIFI_SOFTAP: u32 = 1;
-    const ESP_MAC_BT: u32 = 2;
-
-    unsafe {
-        if type_ == ESP_MAC_WIFI_SOFTAP {
-            let tmp = mac.offset(0).read_volatile();
-            for i in 0..64 {
-                mac.offset(0).write_volatile(tmp | 0x02);
-                mac.offset(0)
-                    .write_volatile(mac.offset(0).read_volatile() ^ (i << 2));
-
-                if mac.offset(0).read_volatile() != tmp {
-                    break;
-                }
-            }
-        } else if type_ == ESP_MAC_BT {
-            let tmp = mac.offset(0).read_volatile();
-            for i in 0..64 {
-                mac.offset(0).write_volatile(tmp | 0x02);
-                mac.offset(0)
-                    .write_volatile(mac.offset(0).read_volatile() ^ (i << 2));
-
-                if mac.offset(0).read_volatile() != tmp {
-                    break;
-                }
-            }
-
-            mac.offset(5)
-                .write_volatile(mac.offset(5).read_volatile() + 1);
-        } else {
+    let kind = match type_ {
+        #[cfg(soc_has_wifi)]
+        0 => InterfaceMacAddress::Station,
+        #[cfg(soc_has_wifi)]
+        1 => InterfaceMacAddress::AccessPoint,
+        #[cfg(soc_has_bt)]
+        2 => InterfaceMacAddress::Bluetooth,
+        _ => {
+            warn!(
+                "Invalid interface type: {} (expected 0=STA, 1=AP, 2=BT)",
+                type_
+            );
             return -1;
         }
+    };
+
+    let addr = hal::efuse::interface_mac_address(kind);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr.as_bytes().as_ptr(), mac, 6);
     }
 
     0
@@ -256,10 +243,11 @@ pub unsafe extern "C" fn __esp_radio_esp_timer_get_time() -> i64 {
     trace!("esp_timer_get_time");
     // Just using IEEE802.15.4 doesn't need the current time. If we don't use `preempt::now`, users
     // will not need to have a scheduler in their firmware.
-    cfg_if::cfg_if! {
-        if #[cfg(any(feature = "wifi", feature = "ble"))] {
+    cfg_select! {
+        any(feature = "wifi", feature = "ble") => {
             crate::preempt::now() as i64
-        } else {
+        }
+        _ => {
             // In this case we don't have a scheduler, we can return esp-hal's timestamp.
             esp_hal::time::Instant::now().duration_since_epoch().as_micros() as i64
         }
@@ -313,55 +301,39 @@ unsafe extern "C" fn __esp_radio_misc_nvs_restore() -> i32 {
     todo!("misc_nvs_restore")
 }
 
-// We're use either WIFI or BT here, since esp-radio also supports the ESP32-H2 as the only
-// chip, with BT but without WIFI.
-#[cfg(not(esp32h2))]
-type ModemClockControllerPeripheral = esp_hal::peripherals::WIFI<'static>;
-#[cfg(esp32h2)]
-type ModemClockControllerPeripheral = esp_hal::peripherals::BT<'static>;
-
-// Clock control is no-op because the wifi blobs don't symmetrically enable/disable the clock,
-// causing an eventual overflow. Currently we are holding onto a guard ourselves while Wi-Fi/BT is
-// active, so the blobs should not be able to disable the clock anyway.
-//
-// This might have some low-power issues, but we're not there yet anyway.
-#[allow(unused)]
+#[cfg_attr(not(any(esp32, esp32s2)), expect(unused))]
 pub(crate) unsafe fn phy_enable_clock() {
-    // Stealing the peripheral is safe here, as they must have been passed into the relevant
-    // initialization functions for the Wi-Fi or BLE controller, if this code gets executed.
-    // let clock_guard = unsafe { ModemClockControllerPeripheral::steal() }.enable_phy_clock();
-    // core::mem::forget(clock_guard);
+    let guard = esp_phy::enable_phy();
+    core::mem::forget(guard);
 }
 
-#[allow(unused)]
+#[cfg_attr(not(any(esp32, esp32s2)), expect(unused))]
 pub(crate) unsafe fn phy_disable_clock() {
-    // unsafe { ModemClockControllerPeripheral::steal() }.decrease_phy_clock_ref_count();
+    esp_phy::disable_phy();
 }
 
 pub(crate) fn enable_wifi_power_domain() {
     #[cfg(not(any(soc_has_pmu, esp32c2)))]
     {
-        cfg_if::cfg_if! {
-            if #[cfg(soc_has_lpwr)] {
-                let rtc_cntl = esp_hal::peripherals::LPWR::regs();
-            } else {
-                let rtc_cntl = esp_hal::peripherals::RTC_CNTL::regs();
-            }
-        }
+        // C5, C6 have `LP_CLKRST`, but they're cfg'd out with `not(soc_has_pmu)`
+        // TODO: revisit this code (https://github.com/esp-rs/esp-hal/pull/5066#discussion_r2858978902)
+        let rtc_cntl = regs!(RTC_CNTL);
 
         rtc_cntl
             .dig_pwc()
             .modify(|_, w| w.wifi_force_pd().clear_bit());
 
         #[cfg(not(esp32))]
-        unsafe {
-            cfg_if::cfg_if! {
-                if #[cfg(soc_has_apb_ctrl)] {
-                    let syscon = esp_hal::peripherals::APB_CTRL::regs();
-                } else {
-                    let syscon = esp_hal::peripherals::SYSCON::regs();
-                }
+        cfg_select! {
+            soc_has_apb_ctrl => {
+                let syscon = regs!(APB_CTRL);
             }
+            _ => { // S2
+                let syscon = regs!(SYSCON);
+            }
+        }
+        #[cfg(not(esp32))]
+        unsafe {
             const WIFIBB_RST: u32 = 1 << 0; // Wi-Fi baseband
             const FE_RST: u32 = 1 << 1; // RF Frontend RST
             const WIFIMAC_RST: u32 = 1 << 2; // Wi-Fi MAC
@@ -376,7 +348,7 @@ pub(crate) fn enable_wifi_power_domain() {
                 | FE_RST
                 | WIFIMAC_RST
                 | if cfg!(soc_has_bt) {
-                    BTBB_RST | BTMAC_RST | RW_BTMAC_RST | RW_BTMAC_REG_RST | BTBB_RST
+                    BTBB_RST | BTMAC_RST | RW_BTMAC_RST | RW_BTMAC_REG_RST | BTBB_REG_RST
                 } else {
                     0
                 };
@@ -392,6 +364,63 @@ pub(crate) fn enable_wifi_power_domain() {
         rtc_cntl
             .dig_iso()
             .modify(|_, w| w.wifi_force_iso().clear_bit());
+    }
+
+    // Pulse a reset over the shared modem subsystems (RF frontend, BT/Wi-Fi
+    // baseband and MAC). On PMU-based chips a system reset restarts the digital core
+    // but leaves the modem power domain untouched, so without this the radio
+    // would inherit whatever state the previously-used radio left.
+    cfg_select! {
+        not(wifi_mac_version = "1") => {
+            regs!(MODEM_SYSCON).modem_rst_conf().modify(|_, w| {
+                w.rst_fe().set_bit();
+                w.rst_btbb().set_bit();
+                w.rst_btbb_apb().set_bit();
+                w.rst_btmac().set_bit();
+                w.rst_btmac_apb().set_bit();
+                #[cfg(soc_has_ieee802154)]
+                w.rst_zbmac().set_bit();
+                #[cfg(soc_has_wifi)]
+                {
+                    w.rst_wifibb().set_bit();
+                    w.rst_wifimac().set_bit();
+                }
+                w
+            });
+            regs!(MODEM_SYSCON).modem_rst_conf().modify(|_, w| {
+                w.rst_fe().clear_bit();
+                w.rst_btbb().clear_bit();
+                w.rst_btbb_apb().clear_bit();
+                w.rst_btmac().clear_bit();
+                w.rst_btmac_apb().clear_bit();
+                #[cfg(soc_has_ieee802154)]
+                w.rst_zbmac().clear_bit();
+                #[cfg(soc_has_wifi)]
+                {
+                    w.rst_wifibb().clear_bit();
+                    w.rst_wifimac().clear_bit();
+                }
+                w
+            });
+        }
+        // ESP32-C2 has no separate modem power domain (RTC_CNTL lacks
+        // wifi_force_pd/iso), but a system reset still leaves the shared modem
+        // subsystems in their previous state.
+        esp32c2 => {
+            regs!(APB_CTRL).wifi_rst_en().modify(|_, w| {
+                w.wifibb_rst().set_bit();
+                w.fe_rst().set_bit();
+                w.mac_rst().set_bit();
+                w.ble_rpa_rst().set_bit()
+            });
+            regs!(APB_CTRL).wifi_rst_en().modify(|_, w| {
+                w.wifibb_rst().clear_bit();
+                w.fe_rst().clear_bit();
+                w.mac_rst().clear_bit();
+                w.ble_rpa_rst().clear_bit()
+            });
+        }
+        _ => {}
     }
 }
 

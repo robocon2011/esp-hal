@@ -145,9 +145,7 @@ pub(crate) struct RunQueue {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunSchedulerOn {
     DontRun,
-    CurrentCore,
-    #[cfg(multi_core)]
-    OtherCore,
+    RunOnCore(Cpu),
 }
 
 impl RunQueue {
@@ -179,14 +177,15 @@ impl RunQueue {
         }
         self.ready_tasks[priority_n].push(ready_task);
 
-        cfg_if::cfg_if! {
-            if #[cfg(multi_core)] {
+        cfg_select! {
+            multi_core => {
                 let run_on = if _state[1].initialized {
                     self.select_scheduler_trigger_multi_core(_state, ready_task)
                 } else {
                     self.select_scheduler_trigger_single_core(priority_n)
                 };
-            } else {
+            }
+            _ => {
                 let run_on = self.select_scheduler_trigger_single_core(priority_n);
             }
         }
@@ -218,29 +217,23 @@ impl RunQueue {
 
         let (target_cpu, target_cpu_prio) = if let Some(pinned_to) = task_ref.pinned_to {
             // Task is pinned, we have no choice in our target
-            let target_cpu = pinned_to as usize;
             (
-                target_cpu,
-                SchedulerState::priority_of_core(per_cpu, target_cpu),
+                pinned_to,
+                SchedulerState::priority_of_core(per_cpu, pinned_to as usize),
             )
         } else {
             // Task is not pinned, pick the core that runs the lower priority task.
-            let mut target = (0, SchedulerState::priority_of_core(per_cpu, 0));
-            for i in 1..Cpu::COUNT {
-                let core_prio = SchedulerState::priority_of_core(per_cpu, i);
-                if core_prio < target.1 {
-                    target = (i, core_prio);
-                }
-            }
-            target
+            Cpu::all()
+                .map(|cpu| {
+                    let core_prio = SchedulerState::priority_of_core(per_cpu, cpu as usize);
+                    (cpu, core_prio)
+                })
+                .min_by_key(|(_, prio)| *prio) // Get lowest priority
+                .unwrap()
         };
 
         if ready_task_prio >= target_cpu_prio {
-            if target_cpu == Cpu::current() as usize {
-                RunSchedulerOn::CurrentCore
-            } else {
-                RunSchedulerOn::OtherCore
-            }
+            RunSchedulerOn::RunOnCore(target_cpu)
         } else {
             RunSchedulerOn::DontRun
         }
@@ -251,7 +244,7 @@ impl RunQueue {
         // Run the scheduler if the new priority is >= current maximum priority. This will trigger a
         // run even if the new task's priority is equal, to make sure time slicing is set up.
         if priority >= self.ready_priority.ready() {
-            RunSchedulerOn::CurrentCore
+            RunSchedulerOn::RunOnCore(Cpu::ProCpu)
         } else {
             RunSchedulerOn::DontRun
         }
@@ -262,8 +255,8 @@ impl RunQueue {
         let current_prio = self.ready_priority.ready();
         trace!("pop - from level: {}", current_prio);
 
-        cfg_if::cfg_if! {
-            if #[cfg(multi_core)] {
+        cfg_select! {
+            multi_core => {
                 use esp_hal::system::Cpu;
 
                 let other = match Cpu::current() {
@@ -291,7 +284,8 @@ impl RunQueue {
                     break;
                 }
 
-            } else {
+            }
+            _ => {
                 let popped = self.ready_tasks[current_prio].pop();
             }
         }
@@ -306,6 +300,12 @@ impl RunQueue {
 
     pub(crate) fn is_level_empty(&self, level: Priority) -> bool {
         self.ready_tasks[level.get()].is_empty()
+    }
+
+    /// Returns `true` if any task is ready to run (queued at any priority level).
+    #[cfg(all(multi_core, sleep_light_sleep))]
+    pub(crate) fn has_ready_tasks(&self) -> bool {
+        self.ready_priority.mask != 0
     }
 
     pub(crate) fn remove(&mut self, to_delete: TaskPtr) {

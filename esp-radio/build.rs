@@ -7,18 +7,7 @@ use std::{
 };
 
 use esp_config::{Value, generate_config_from_yaml_definition};
-use esp_metadata_generated::Chip;
-
-#[macro_export]
-macro_rules! assert_unique_features {
-    ($($feature:literal),+ $(,)?) => {
-        assert!(
-            (0 $(+ cfg!(feature = $feature) as usize)+ ) <= 1,
-            "Exactly zero or one of the following features must be enabled: {}",
-            [$($feature),+].join(", ")
-        );
-    };
-}
+use esp_metadata_generated::{Chip, assert_unique_features};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // if using '"rust-analyzer.cargo.buildScripts.useRustcWrapper": true' we can detect this
@@ -57,15 +46,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         || cfg!(feature = "csi")
         || cfg!(feature = "esp-now")
         || cfg!(feature = "ieee802154")
-        || cfg!(feature = "smoltcp")
         || cfg!(feature = "sniffer")
         || cfg!(feature = "wifi-eap"))
         && !cfg!(feature = "unstable")
         && !suppress_panics
     {
         panic!(
-            "\n\nThe `unstable` feature was not provided, but is required for the following features: `ble`, `coex`, `csi`, `esp-now`, `ieee802154`, `smoltcp`, `sniffer`, `wifi-eap`.\n\n"
+            "\n\nThe `unstable` feature was not provided, but is required for the following features: `ble`, `coex`, `csi`, `esp-now`, `ieee802154`, `sniffer`, `wifi-eap`.\n\n"
         )
+    }
+
+    if cfg!(feature = "csi") && !chip.contains("wifi_csi_supported") {
+        panic!("\n\nCSI is not supported on this target.\n\n");
     }
 
     // Log and defmt are mutually exclusive features. The main technical reason is
@@ -73,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // implementation detail.
     assert_unique_features!("log-04", "defmt");
 
-    if cfg!(feature = "ble") && !chip.contains("bt") {
+    if cfg!(feature = "ble") && !chip.contains("soc_has_bt") {
         panic!(
             r#"
 
@@ -83,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    if cfg!(feature = "wifi") && !chip.contains("wifi") {
+    if cfg!(feature = "wifi") && !chip.contains("soc_has_wifi") {
         panic!(
             r#"
 
@@ -93,7 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    if cfg!(feature = "ieee802154") && !chip.contains("ieee802154") {
+    if cfg!(feature = "ieee802154") && !chip.contains("soc_has_ieee802154") {
         panic!(
             r#"
 
@@ -104,31 +96,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Ok(level) = std::env::var("OPT_LEVEL")
-        && level != "2"
-        && level != "3"
-        && level != "s"
+        && !["2", "3", "s", "z"].contains(&level.as_str())
     {
         let message = format!(
-            "esp-radio should be built with optimization level 2, 3 or s - yours is {level}.
+            "esp-radio should be built with optimization level 2, 3, s or z - yours is {level}.
                 See https://github.com/esp-rs/esp-hal/tree/main/esp-radio",
         );
         print_warning(message);
     }
 
-    println!("cargo:rustc-check-cfg=cfg(coex)");
     #[cfg(feature = "coex")]
     {
         assert!(
-            chip.contains("wifi") && chip.contains("bt"),
+            chip.contains("soc_has_wifi") && chip.contains("soc_has_bt"),
             r#"
 
             Wi-Fi/Bluetooth coexistence is not supported on this target.
 
             "#
         );
-
-        #[cfg(all(feature = "wifi", feature = "ble"))]
-        println!("cargo:rustc-cfg=coex");
 
         #[cfg(not(feature = "wifi"))]
         println!("cargo:warning=coex is enabled but wifi is not");

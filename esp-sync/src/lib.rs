@@ -2,7 +2,7 @@
 //!
 //! ## Feature Flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 #![cfg_attr(xtensa, feature(asm_experimental_arch))]
 #![deny(missing_docs, rust_2018_idioms, rustdoc::all)]
 // Don't trip up on broken/private links when running semver-checks
@@ -123,12 +123,14 @@ mod multi_core {
     #[inline]
     fn thread_id() -> usize {
         // This method must never return UNUSED_THREAD_ID_VALUE
-        cfg_if::cfg_if! {
-            if #[cfg(all(multi_core, riscv))] {
+        cfg_select! {
+            all(multi_core, riscv) => {
                 riscv::register::mhartid::read()
-            } else if #[cfg(all(multi_core, xtensa))] {
+            }
+            all(multi_core, xtensa) => {
                 (xtensa_lx::get_processor_id() & 0x2000) as usize
-            } else {
+            }
+            _ => {
                 0
             }
         }
@@ -366,6 +368,15 @@ unsafe impl embassy_sync_06::blocking_mutex::raw::RawMutex for RawMutex {
 }
 
 unsafe impl embassy_sync_07::blocking_mutex::raw::RawMutex for RawMutex {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: Self = Self::new();
+
+    fn lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.inner.lock(f)
+    }
+}
+
+unsafe impl embassy_sync_08::blocking_mutex::raw::RawMutex for RawMutex {
     #[allow(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self::new();
 

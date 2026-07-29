@@ -61,6 +61,8 @@ where
 
     let mut command = Command::new(get_cargo());
 
+    let ci = std::env::var("CI").is_ok();
+
     command
         .args(args)
         .current_dir(cwd)
@@ -70,7 +72,7 @@ where
         } else {
             Stdio::inherit()
         })
-        .stderr(if capture {
+        .stderr(if capture || ci {
             Stdio::piped()
         } else {
             Stdio::inherit()
@@ -81,20 +83,39 @@ where
         command.env_remove("CARGO");
     }
 
-    let output = command
-        .stdin(Stdio::inherit())
-        .output()
-        .with_context(|| format!("Couldn't get output for command {command:?}"))?;
+    // retrying - remove once we don't need this anymore
+    let mut retries = 50;
+    loop {
+        let output = command
+            .stdin(Stdio::inherit())
+            .output()
+            .with_context(|| format!("Couldn't get output for command {command:?}"))?;
 
-    // Make sure that we return an appropriate exit code here, as Github Actions
-    // requires this in order to function correctly:
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        bail!(
-            "Failed to execute cargo subcommand `cargo {}`",
-            args.join(" "),
-        )
+        // Make sure that we return an appropriate exit code here, as Github Actions
+        // requires this in order to function correctly:
+        if output.status.success() {
+            break Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        } else {
+            if ci {
+                let err_out = String::from_utf8_lossy(&output.stderr).to_string();
+                if !capture {
+                    eprintln!("{}", err_out);
+                }
+                if err_out.contains("SIGSEGV") {
+                    if !capture {
+                        eprintln!("Retry build ({retries})");
+                    }
+                    retries -= 1;
+                    if retries > 0 {
+                        continue;
+                    }
+                }
+            }
+            bail!(
+                "Failed to execute cargo subcommand `cargo {}`",
+                args.join(" "),
+            )
+        }
     }
 }
 
@@ -334,13 +355,51 @@ pub struct BuiltCommand {
     pub artifact_name: String,
     pub command: Vec<String>,
     pub env_vars: Vec<(String, String)>,
+    pub artifact_dir: Option<PathBuf>,
 }
 
 impl BuiltCommand {
     pub fn run(&self, capture: bool) -> Result<String> {
         let env_vars = self.env_vars.clone();
         let cwd = std::env::current_dir()?;
-        run_with_env(&self.command, &cwd, env_vars, capture)
+        let output = run_with_env(&self.command, &cwd, env_vars, capture)?;
+
+        if let Some(artifact_dir) = self.artifact_dir.as_deref() {
+            self.copy_artifacts(artifact_dir, &cwd).with_context(|| {
+                format!("Failed to copy artifacts to {}", artifact_dir.display())
+            })?;
+        }
+
+        Ok(output)
+    }
+
+    /// Copies the executables built by this command into `artifact_dir`.
+    ///
+    /// Re-runs the finished build with `--message-format=json` to look up the
+    /// executable paths. The second build is a no-op, so this is quick.
+    fn copy_artifacts(&self, artifact_dir: &Path, cwd: &Path) -> Result<()> {
+        let mut command = self.command.clone();
+        command.push("--message-format=json".to_string());
+
+        let output = run_with_env(&command, cwd, self.env_vars.clone(), true)?;
+
+        std::fs::create_dir_all(artifact_dir)?;
+
+        let mut copied = 0;
+        for line in output.lines() {
+            if let Ok(artifact) = serde_json::from_str::<Artifact>(line)
+                && let Some(file_name) = artifact.executable.file_name()
+            {
+                std::fs::copy(&artifact.executable, artifact_dir.join(file_name))?;
+                copied += 1;
+            }
+        }
+
+        if copied == 0 {
+            bail!("The build did not produce any executables");
+        }
+
+        Ok(())
     }
 }
 
@@ -408,6 +467,7 @@ impl CargoCommandBatcher {
                         artifact_name: String::from("batch"),
                         command: std::mem::take(&mut command),
                         env_vars: key.env_vars.clone(),
+                        artifact_dir: None,
                     });
                 }
 
@@ -445,6 +505,7 @@ impl CargoCommandBatcher {
                     artifact_name: String::from("batch"),
                     command,
                     env_vars: key.env_vars.clone(),
+                    artifact_dir: None,
                 });
             }
         }
@@ -465,22 +526,28 @@ impl CargoCommandBatcher {
     }
 
     pub fn build_one_for_cargo(item: &CargoArgsBuilder) -> BuiltCommand {
+        // `--artifact-dir` is unstable and would require `-Zunstable-options`,
+        // which stable cargo rejects. Strip it from the command and copy the
+        // artifacts after the build, instead.
+        let mut item = item.clone();
+        let artifact_dir = item
+            .args
+            .iter()
+            .position(|arg| arg == "--artifact-dir")
+            .map(|position| {
+                item.args.remove(position);
+                PathBuf::from(item.args.remove(position))
+            });
+
         BuiltCommand {
             artifact_name: item.artifact_name.clone(),
-            command: {
-                let mut args = item.build();
-
-                if item.args.iter().any(|arg| arg == "--artifact-dir") {
-                    args.push("-Zunstable-options".to_string());
-                }
-
-                args
-            },
+            command: item.build(),
             env_vars: item
                 .env_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            artifact_dir,
         }
     }
 
@@ -769,6 +836,14 @@ fn format_dependency_version(previous: &str, new: &semver::Version) -> String {
     let previous = semver::VersionReq::parse(previous).unwrap();
     let comp = &previous.comparators[0];
 
+    // Cargo's `VersionReq` parser rejects build metadata inside a requirement,
+    // so refuse to rewrite a dependency to a version that carries one rather
+    // than silently dropping it.
+    assert!(
+        new.build.is_empty(),
+        "refusing to rewrite dependency requirement to a version with build metadata: {new}"
+    );
+
     if previous.comparators.len() > 1 {
         log::info!(
             "We don't support more complex version specifiers. ({:?}). Just using the new version as is.",
@@ -781,22 +856,31 @@ fn format_dependency_version(previous: &str, new: &semver::Version) -> String {
         new: &semver::Version,
         prefix: &str,
     ) -> String {
-        if comp.patch.is_some() {
-            format!("{}{}.{}.{}", prefix, new.major, new.minor, new.patch)
+        // Cargo requires prerelease tags on a full MAJOR.MINOR.PATCH triple, so
+        // force patch-level precision whenever `new.pre` is non-empty. This is
+        // what makes `~1.1` + `1.1.0-rc.0` round-trip as `~1.1.0-rc.0` instead
+        // of silently dropping the prerelease tag (which cargo then refuses to
+        // match).
+        if comp.patch.is_some() || !new.pre.is_empty() {
+            if new.pre.is_empty() {
+                format!("{prefix}{}.{}.{}", new.major, new.minor, new.patch)
+            } else {
+                format!(
+                    "{prefix}{}.{}.{}-{}",
+                    new.major, new.minor, new.patch, new.pre
+                )
+            }
         } else if comp.minor.is_some() {
             format!("{}{}.{}", prefix, new.major, new.minor)
         } else {
             format!("{}{}", prefix, new.major)
         }
     }
-    eprintln!("{:?}", comp);
     if comp.op == semver::Op::Tilde {
         format_version_string(comp, new, "~")
     } else if comp.op == semver::Op::Exact {
-        eprintln!("here");
         format_version_string(comp, new, "=")
     } else if comp.op == semver::Op::Caret {
-        eprintln!("here");
         format_version_string(comp, new, "")
     } else {
         log::info!(
@@ -813,35 +897,33 @@ mod tests {
 
     #[test]
     fn test_format_dependency_version() {
-        assert_eq!(
-            format_dependency_version("0.1.0", &semver::Version::parse("0.2.0").unwrap()),
-            "0.2.0"
-        );
+        // (previous requirement, new version, expected rewrite)
+        //
+        // Prerelease cases exercise the invariant that tilde/exact/caret
+        // requirements must widen to a full MAJOR.MINOR.PATCH triple because
+        // cargo rejects prerelease tags on shorter forms like `~1.1`.
+        let cases = [
+            ("0.1.0", "0.2.0", "0.2.0"),
+            ("^0.1.0", "0.2.0", "0.2.0"),
+            ("~1.0", "1.2.3", "~1.2"),
+            ("~1", "2.5.1", "~2"),
+            ("=1.1.5", "1.1.8", "=1.1.8"),
+            ("~1.1", "1.1.0-rc.0", "~1.1.0-rc.0"),
+            ("~1.1.0-rc.0", "1.1.0-rc.1", "~1.1.0-rc.1"),
+            ("~1.1.0-rc.0", "1.1.0", "~1.1.0"),
+            ("=1.1.5", "1.2.0-beta.1", "=1.2.0-beta.1"),
+            ("^0.1.0", "0.2.0-alpha.0", "0.2.0-alpha.0"),
+            ("^1", "1.1.0-rc.0", "1.1.0-rc.0"),
+        ];
 
-        assert_eq!(
-            format_dependency_version("^0.1.0", &semver::Version::parse("0.2.0").unwrap()),
-            "0.2.0"
-        );
-
-        assert_eq!(
-            format_dependency_version("~1.0", &semver::Version::parse("1.2.3").unwrap()),
-            "~1.2"
-        );
-
-        assert_eq!(
-            format_dependency_version("~1", &semver::Version::parse("2.5.1").unwrap()),
-            "~2"
-        );
-
-        assert_eq!(
-            format_dependency_version("=1.1.5", &semver::Version::parse("1.1.8").unwrap()),
-            "=1.1.8"
-        );
-
-        assert_eq!(
-            format_dependency_version("=1.1.5", &semver::Version::parse("1.8.3").unwrap()),
-            "=1.8.3"
-        );
+        for (previous, new, expected) in cases {
+            let new_version = semver::Version::parse(new).unwrap();
+            assert_eq!(
+                format_dependency_version(previous, &new_version),
+                expected,
+                "previous={previous}, new={new}"
+            );
+        }
     }
 
     #[test]

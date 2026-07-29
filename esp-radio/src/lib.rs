@@ -5,30 +5,67 @@
 //! # Wireless support for Espressif ESP32 devices.
 //!
 //! This documentation is built for the
-#![cfg_attr(esp32, doc = "**ESP32**")]
-#![cfg_attr(esp32s2, doc = "**ESP32-S2**")]
-#![cfg_attr(esp32s3, doc = "**ESP32-S3**")]
-#![cfg_attr(esp32c2, doc = "**ESP32-C2**")]
-#![cfg_attr(esp32c3, doc = "**ESP32-C3**")]
-#![cfg_attr(esp32c6, doc = "**ESP32-C6**")]
-#![cfg_attr(esp32h2, doc = "**ESP32-H2**")]
-//! . Please ensure you are reading the correct documentation for your target
+#![doc = concat!("**", chip_pretty!(), "**")]
+//! . Please ensure you are reading the correct [documentation] for your target
 //! device.
 //!
-//! ## Usage
+//! ## Overview
 //!
-//! ### Importing
+//! esp-radio provides Wi-Fi, Bluetooth Low Energy (BLE), ESP-NOW and IEEE
+//! 802.15.4 drivers for Espressif microcontrollers. It builds on top of
+//! [esp-hal] and the vendor binary blobs to provide wireless connectivity in a
+//! `no_std` environment.
 //!
-//! Note that this crate currently requires you to enable the `unstable` feature
-//! on `esp-hal`.
+//! Wi-Fi and BLE require a dynamic memory allocator and a preemptive task
+//! scheduler at runtime. We recommend [`esp-alloc`] and [`esp-rtos`] for this,
+//! though any allocator or RTOS (such as Ariel OS) that implements the required
+//! interfaces will work.
+#![cfg_attr(
+    feature = "ieee802154",
+    doc = "<div class=\"warning\"><b>Hint:</b> The scheduler is not required for IEEE 802.15.4.</div>"
+)]
+//! Drivers that don't currently have a stable API are marked as `unstable` in
+//! the documentation. Enabling the `unstable` feature on `esp-radio` requires
+//! you to also enable the `unstable` feature on `esp-hal` in the final binary
+//! crate.
 //!
-//! Ensure that the right features are enabled for your chip. See [Examples](https://github.com/esp-rs/esp-hal/tree/main/examples#examples) for more examples.
+//! ### Quick start
 //!
-//! You will also need a dynamic memory allocator, and a preemptive task scheduler in your
-//! application. For the dynamic allocator, we recommend using `esp-alloc`. For the task scheduler,
-//! the simplest option that is supported by us is `esp-rtos`, but you may use Ariel
-//! OS or other operating systems as well.
+//! ```rust, no_run
+#![doc = esp_hal::before_snippet!()]
+//! use esp_hal::interrupt::software::SoftwareInterruptControl;
+//! use esp_hal::ram;
+//! use esp_hal::timer::timg::TimerGroup;
 //!
+//! esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+//! esp_alloc::heap_allocator!(size: 36 * 1024);
+//!
+//! let timg0 = TimerGroup::new(peripherals.TIMG0);
+//! let sw_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+//!
+//! // THIS IS IMPORTANT FOR WIFI AND BLE: You MUST start the scheduler
+//! // before initializing the radio!
+//! esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+#![cfg_attr(
+    wifi_driver_supported,
+    doc = r#"
+
+if let Ok(controller) = esp_radio::wifi::WifiController::new(
+    peripherals.WIFI,
+    Default::default(),
+) {}
+"#
+)]
+#![cfg_attr(
+    all(bt_driver_supported, not(wifi_driver_supported)),
+    doc = r#"
+
+# use esp_radio::ble::controller::BleConnector;
+if let Ok(controller) = BleConnector::new(peripherals.BT, Default::default()) {}
+"#
+)]
+#![doc = esp_hal::after_snippet!()]
+//! ```
 //! ```toml
 //! [dependencies.esp-radio]
 //! # A supported chip needs to be specified, as well as specific use-case features
@@ -39,43 +76,52 @@
 #![doc = concat!(r#"features = [""#, chip!(), r#""]"#)]
 //! ```
 //! 
-//! ### Optimization Level
+//! ## Examples
 //!
-//! It is necessary to build with optimization level 2 or 3 since otherwise, it
-//! might not even be able to connect or advertise.
+//! We have a number of [examples] in the esp-hal repository. We use
+//! an [xtask] to automate the building, running, and testing of code and
+//! examples within esp-hal.
 //!
-//! To make it work also for your debug builds add this to your `Cargo.toml`
+//! Invoke the following command in the root of the esp-hal repository to get
+//! started:
+//! ```bash
+//! cargo xtask help
+//! ```
+//! 
+//! We have a [book] that explains the full esp-hal ecosystem
+//! and how to get started, and a [training] that covers some common
+//! scenarios with examples.
+//!
+//! ## Optimization level
+//!
+//! The radio blobs require optimization level 2 or 3 to function correctly.
+//! Without it, Wi-Fi may fail to connect and BLE may fail to advertise.
+//!
+//! To apply this only to esp-radio in debug builds, add to your `Cargo.toml`:
 //! ```toml
 //! [profile.dev.package.esp-radio]
 //! opt-level = 3
 //! ```
-//! ## Globally disable logging
+//! 
+//! ## Disabling logging
 //!
-//! `esp-radio` contains a lot of trace-level logging statements.
-//! For maximum performance you might want to disable logging via
-//! a feature flag of the `log` crate. See [documentation](https://docs.rs/log/0.4.19/log/#compile-time-filters).
-//! You should set it to `release_max_level_off`.
+//! `esp-radio` contains trace-level logging statements that may impact
+//! performance. To disable them, use the `log` crate's compile-time
+//! [filters](https://docs.rs/log/latest/log/#compile-time-filters) and set
+//! `release_max_level_off`.
 //!
-//! ### Wi-Fi performance considerations
-//!
-//! The default configuration is quite conservative to reduce power and memory consumption.
-//!
-//! There are a number of settings which influence the general performance. Optimal settings are chip and applications specific.
-//! You can get inspiration from the [ESP-IDF examples](https://github.com/espressif/esp-idf/tree/release/v5.3/examples/wifi/iperf)
-//!
-//! Please note that the configuration keys are usually named slightly different and not all configuration keys apply.
-#![cfg_attr(
-    feature = "wifi",
-    doc = "By default the power-saving mode is [`PowerSaveMode::None`](crate::wifi::PowerSaveMode::None) and `ESP_PHY_CONFIG_PHY_ENABLE_USB` is enabled by default."
-)]
-//! In addition pay attention to these configuration keys:
-//! - `ESP_RADIO_CONFIG_RX_QUEUE_SIZE`
-//! - `ESP_RADIO_CONFIG_TX_QUEUE_SIZE`
-//! - `ESP_RADIO_CONFIG_MAX_BURST_SIZE`
+//! [documentation]: https://docs.espressif.com/projects/rust/esp-radio/latest/
+//! [esp-hal]: https://docs.espressif.com/projects/rust/esp-hal/latest/
+//! [`esp-alloc`]: https://docs.espressif.com/projects/rust/esp-alloc/latest/
+//! [`esp-rtos`]: https://docs.espressif.com/projects/rust/esp-rtos/latest/
+//! [examples]: https://github.com/esp-rs/esp-hal/tree/main/examples
+//! [xtask]: https://github.com/matklad/cargo-xtask
+//! [book]: https://docs.espressif.com/projects/rust/book/
+//! [training]: https://docs.espressif.com/projects/rust/no_std-training/
 #![cfg_attr(
     multi_core,
     doc = concat!(
-        "### Running on the Second Core",
+        "## Running on the second core",
         "\n\n",
         "BLE and Wi-Fi can also be run on the second core.",
         "\n\n",
@@ -106,16 +152,9 @@
 //! for this crate:
 #![doc = ""]
 #![doc = include_str!(concat!(env!("OUT_DIR"), "/esp_radio_config_table.md"))]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 #![no_std]
-#![cfg_attr(xtensa, feature(asm_experimental_arch))]
-#![cfg_attr(feature = "print-logs-from-driver", feature(c_variadic))]
-#![deny(rust_2018_idioms, rustdoc::all)]
-#![allow(rustdoc::bare_urls)]
-// allow until num-derive doesn't generate this warning anymore (unknown_lints because Xtensa
-// toolchain doesn't know about that lint, yet)
-#![allow(unknown_lints)]
-#![allow(non_local_definitions)]
+#![deny(missing_docs, rust_2018_idioms, rustdoc::all)]
 #![cfg_attr(
     not(any(feature = "wifi", feature = "ble")),
     allow(
@@ -133,32 +172,20 @@ extern crate esp_metadata_generated;
 
 extern crate alloc;
 
-// MUST be the first module
+// These modules rely on `#[macro_use]` so they must be the first ones declared
+mod coex_utils;
 mod fmt;
+pub(crate) mod reg_access;
 
-use docsplay::Display;
+use core::marker::PhantomData;
+
 use esp_hal as hal;
-#[cfg(feature = "unstable")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
+#[instability::unstable]
 pub use esp_phy::CalibrationResult;
-#[cfg(not(feature = "unstable"))]
-use esp_phy::CalibrationResult;
 use esp_radio_rtos_driver as preempt;
-use esp_sync::RawMutex;
-#[cfg(esp32)]
-use hal::analog::adc::{release_adc2, try_claim_adc2};
 #[cfg(feature = "wifi")]
 use hal::{after_snippet, before_snippet};
-use hal::{
-    clock::{Clocks, init_radio_clocks},
-    time::Rate,
-};
 use sys::include::esp_phy_calibration_data_t;
-
-#[cfg(feature = "ble")]
-pub use crate::private::InitializationError;
-#[cfg(not(feature = "ble"))]
-use crate::private::InitializationError;
 pub(crate) mod sys {
     #[cfg(esp32)]
     pub use esp_wifi_sys_esp32::*;
@@ -166,8 +193,12 @@ pub(crate) mod sys {
     pub use esp_wifi_sys_esp32c2::*;
     #[cfg(esp32c3)]
     pub use esp_wifi_sys_esp32c3::*;
+    #[cfg(esp32c5)]
+    pub use esp_wifi_sys_esp32c5::*;
     #[cfg(esp32c6)]
     pub use esp_wifi_sys_esp32c6::*;
+    #[cfg(esp32c61)]
+    pub use esp_wifi_sys_esp32c61::*;
     #[cfg(esp32h2)]
     pub use esp_wifi_sys_esp32h2::*;
     #[cfg(esp32s2)]
@@ -176,7 +207,7 @@ pub(crate) mod sys {
     pub use esp_wifi_sys_esp32s3::*;
 }
 
-use crate::radio::{setup_radio_isr, shutdown_radio_isr};
+use crate::refcount::Refcount;
 #[cfg(feature = "wifi")]
 use crate::wifi::WifiError;
 
@@ -202,9 +233,11 @@ macro_rules! unstable_module {
     };
 }
 
+mod asynch;
 mod compat;
-
-mod radio;
+mod interrupt_dispatch;
+mod radio_clocks;
+mod refcount;
 mod time;
 
 #[cfg(feature = "wifi")]
@@ -223,27 +256,23 @@ unstable_module! {
 }
 
 pub(crate) mod common_adapter;
-pub(crate) mod memory_fence;
 
-pub(crate) static ESP_RADIO_LOCK: RawMutex = RawMutex::new();
-
-static RADIO_REFCOUNT: critical_section::Mutex<core::cell::Cell<u32>> =
-    critical_section::Mutex::new(core::cell::Cell::new(0));
+#[cfg(all(feature = "ble", bt_controller = "npl"))]
+pub(crate) static ESP_RADIO_LOCK: esp_sync::RawMutex = esp_sync::RawMutex::new();
 
 // this is just to verify that we use the correct defaults in `build.rs`
 #[allow(clippy::assertions_on_constants)] // TODO: try assert_eq once it's usable in const context
 const _: () = {
-    cfg_if::cfg_if! {
-        if #[cfg(not(esp32h2))] {
-            core::assert!(sys::include::CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM == 10);
-            core::assert!(sys::include::CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM == 32);
-            core::assert!(sys::include::WIFI_STATIC_TX_BUFFER_NUM == 0);
-            core::assert!(sys::include::CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM == 32);
-            core::assert!(sys::include::CONFIG_ESP_WIFI_AMPDU_RX_ENABLED == 1);
-            core::assert!(sys::include::CONFIG_ESP_WIFI_AMPDU_TX_ENABLED == 1);
-            core::assert!(sys::include::WIFI_AMSDU_TX_ENABLED == 0);
-            core::assert!(sys::include::CONFIG_ESP32_WIFI_RX_BA_WIN == 6);
-        }
+    #[cfg(wifi_driver_supported)]
+    {
+        core::assert!(sys::include::CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM == 10);
+        core::assert!(sys::include::CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM == 32);
+        core::assert!(sys::include::WIFI_STATIC_TX_BUFFER_NUM == 0);
+        core::assert!(sys::include::CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM == 32);
+        core::assert!(sys::include::CONFIG_ESP_WIFI_AMPDU_RX_ENABLED == 1);
+        core::assert!(sys::include::CONFIG_ESP_WIFI_AMPDU_TX_ENABLED == 1);
+        core::assert!(sys::include::WIFI_AMSDU_TX_ENABLED == 0);
+        core::assert!(sys::include::CONFIG_ESP32_WIFI_RX_BA_WIN == 6);
     };
 };
 
@@ -269,54 +298,65 @@ const _: () = {
 )]
 /// - The function may return an error if interrupts are disabled.
 /// - The function may return an error if initializing the underlying driver fails.
-pub(crate) fn init() -> Result<(), InitializationError> {
-    #[cfg(esp32)]
-    if try_claim_adc2(unsafe { hal::Internal::conjure() }).is_err() {
-        return Err(InitializationError::Adc2IsUsed);
+pub(crate) fn init() {
+    esp_hal::if_unstable_hal! {
+        #[cfg(esp32)]
+        if hal::analog::adc::try_claim_adc2(unsafe { hal::Internal::conjure() }).is_err() {
+            panic!(
+                "ADC2 is currently in use by esp-hal, but esp-radio requires it for Wi-Fi operation."
+            );
+        }
+        esp_hal::rtc_cntl::WakeLock::acquire();
     }
 
     if !preempt::initialized() {
-        return Err(InitializationError::SchedulerNotInitialized);
+        panic!("The scheduler must be initialized before initializing the radio.");
     }
 
     // A minimum clock of 80MHz is required to operate Wi-Fi module.
-    const MIN_CLOCK: Rate = Rate::from_mhz(80);
-    let clocks = Clocks::get();
-    if clocks.cpu_clock < MIN_CLOCK {
-        return Err(InitializationError::WrongClockConfig);
+    const MIN_CLOCK: u32 = 80;
+    let cpu_clock = esp_hal::clock::cpu_clock().as_mhz();
+    if cpu_clock < MIN_CLOCK {
+        panic!(
+            "CPU clock {} MHz is too slow for Wi-Fi operation, minimum required is {} MHz",
+            cpu_clock, MIN_CLOCK
+        );
     }
 
     crate::common_adapter::enable_wifi_power_domain();
 
-    setup_radio_isr();
-
     wifi_set_log_verbose();
-    init_radio_clocks();
+    radio_clocks::init_radio_clocks();
 
-    #[cfg(coex)]
+    #[cfg(feature = "coex")]
     match crate::wifi::coex_initialize() {
         0 => {}
         error => panic!("Failed to initialize coexistence, error code: {}", error),
     }
 
     debug!("Radio initialized");
-
-    Ok(())
 }
 
 pub(crate) fn deinit() {
     // Disable coexistence
-    #[cfg(coex)]
+    #[cfg(feature = "coex")]
     {
         unsafe { crate::wifi::os_adapter::coex_disable() };
         unsafe { crate::wifi::os_adapter::coex_deinit() };
     }
 
-    shutdown_radio_isr();
+    #[cfg(feature = "wifi")]
+    wifi::shutdown_wifi_isr();
+    #[cfg(feature = "ble")]
+    ble::shutdown_ble_isr();
 
-    #[cfg(esp32)]
-    // Allow using `ADC2` again
-    release_adc2(unsafe { esp_hal::Internal::conjure() });
+    esp_hal::if_unstable_hal! {
+        // Allow using `ADC2` again
+        #[cfg(esp32)]
+        hal::analog::adc::release_adc2(unsafe { esp_hal::Internal::conjure() });
+
+        esp_hal::rtc_cntl::WakeLock::release();
+    }
 
     debug!("Radio deinitialized");
 }
@@ -324,59 +364,33 @@ pub(crate) fn deinit() {
 /// Management of the global reference count
 /// and conditional hardware initialization/deinitialization.
 #[derive(Debug)]
-pub(crate) struct RadioRefGuard;
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) struct RadioRefGuard {
+    _private: PhantomData<()>,
+}
+
+static RADIO_REFCOUNT: Refcount = Refcount::new();
 
 impl RadioRefGuard {
     /// Increments the refcount. If the old count was 0, it performs hardware init.
     /// If hardware init fails, it rolls back the refcount only once.
-    fn new() -> Result<Self, InitializationError> {
-        critical_section::with(|cs| {
-            debug!("Creating RadioRefGuard");
-            let rc = RADIO_REFCOUNT.borrow(cs);
+    fn new() -> Self {
+        debug!("Creating RadioRefGuard");
 
-            let prev = rc.get();
-            rc.set(prev + 1);
-
-            if prev == 0
-                && let Err(e) = init()
-            {
-                rc.set(prev);
-                return Err(e);
-            }
-
-            Ok(RadioRefGuard)
-        })
+        RADIO_REFCOUNT.increment(init);
+        RadioRefGuard {
+            _private: PhantomData,
+        }
     }
 }
 
 impl Drop for RadioRefGuard {
     /// Decrements the refcount. If the count drops to 0, it performs hardware de-init.
     fn drop(&mut self) {
-        critical_section::with(|cs| {
-            debug!("Dropping RadioRefGuard");
-            let rc = RADIO_REFCOUNT.borrow(cs);
+        debug!("Dropping RadioRefGuard");
 
-            let prev = rc.get();
-            rc.set(prev - 1);
-
-            if prev == 1 {
-                // Last user dropped, run de-initialization
-                deinit();
-            }
-        });
+        RADIO_REFCOUNT.decrement(deinit);
     }
-}
-
-/// Returns true if at least some interrupt levels are disabled.
-#[cfg(any(feature = "wifi", all(feature = "ble", bt_controller = "btdm")))]
-fn is_interrupts_disabled() -> bool {
-    #[cfg(target_arch = "xtensa")]
-    return hal::xtensa_lx::interrupt::get_level() != 0
-        || hal::xtensa_lx::interrupt::get_mask() == 0;
-
-    #[cfg(target_arch = "riscv32")]
-    return !hal::riscv::register::mstatus::read().mie()
-        || hal::interrupt::current_runlevel() >= hal::interrupt::Priority::Priority1;
 }
 
 /// Enable verbose logging within the Wi-Fi driver
@@ -422,35 +436,4 @@ pub fn set_phy_calibration_data(data: &[u8; core::mem::size_of::<esp_phy_calibra
 #[instability::unstable]
 pub fn last_calibration_result() -> Option<CalibrationResult> {
     esp_phy::last_calibration_result()
-}
-
-mod private {
-    use super::Display;
-    #[cfg(feature = "wifi")]
-    use crate::wifi::WifiError;
-    #[derive(Display, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    /// Error which can be returned during radio initialization.
-    #[non_exhaustive]
-    pub enum InitializationError {
-        /// An error from the Wi-Fi driver: {0}.
-        #[cfg(feature = "wifi")]
-        WifiError(WifiError),
-        /// The current CPU clock frequency is too low.
-        WrongClockConfig,
-        /// The scheduler is not initialized.
-        SchedulerNotInitialized,
-        #[cfg(esp32)]
-        /// ADC2 is required by esp-radio, but it is in use by esp-hal.
-        Adc2IsUsed,
-    }
-
-    impl core::error::Error for InitializationError {}
-
-    #[cfg(feature = "wifi")]
-    impl From<WifiError> for InitializationError {
-        fn from(value: WifiError) -> Self {
-            InitializationError::WifiError(value)
-        }
-    }
 }

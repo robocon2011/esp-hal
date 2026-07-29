@@ -11,13 +11,14 @@
 //! - Some of the SOC capabilities are not implemented: using external 32K oscillator instead of a
 //!   crystal, divider for CLK8M and possibly more.
 #![allow(dead_code, reason = "Some of this is bound to be unused")]
+#![allow(missing_docs, reason = "Experimental")]
 
 // TODO: This is a temporary place for this, should probably be moved into clocks_ll.
 
 use esp_rom_sys::rom::{ets_delay_us, ets_update_cpu_frequency_rom};
 
 use crate::{
-    peripherals::{LPWR, SYSCON, SYSTEM, TIMG0, TIMG1, UART0, UART1},
+    peripherals::{I2C_ANA_MST, LPWR, RMT, SYSCON, SYSTEM, TIMG0, TIMG1},
     soc::regi2c,
     time::Rate,
 };
@@ -50,31 +51,34 @@ impl CpuClock {
         xtal_clk: None,
         pll_clk: Some(PllClkConfig::_480),
         apll_clk: None,
-        cpu_pll_div: Some(CpuPllDivConfig::_6),
+        cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_6)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
+        timg_calibration_clock: None,
     };
     const PRESET_160: ClockConfig = ClockConfig {
         xtal_clk: None,
         pll_clk: Some(PllClkConfig::_480),
         apll_clk: None,
-        cpu_pll_div: Some(CpuPllDivConfig::_3),
+        cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_3)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
+        timg_calibration_clock: None,
     };
     const PRESET_240: ClockConfig = ClockConfig {
         xtal_clk: None,
         pll_clk: Some(PllClkConfig::_480),
         apll_clk: None,
-        cpu_pll_div: Some(CpuPllDivConfig::_2),
+        cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_2)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
+        timg_calibration_clock: None,
     };
 }
 
@@ -104,18 +108,27 @@ impl ClockConfig {
         }
     }
 
-    pub(crate) fn configure(mut self) {
+    pub(crate) fn configure(mut self, clocks: &mut ClockTree) {
         if self.xtal_clk.is_none() {
             self.xtal_clk = Some(XtalClkConfig::_40);
         }
 
-        self.apply();
+        // Switch CPU to XTAL before reconfiguring PLL.
+        configure_xtal_clk(clocks, XtalClkConfig::_40);
+        configure_system_pre_div(clocks, SystemPreDivConfig::new(0));
+        configure_cpu_clk(clocks, CpuClkConfig::Xtal);
+
+        self.apply(clocks);
     }
 }
 
 // XTAL_CLK
 
-fn configure_xtal_clk_impl(_clocks: &mut ClockTree, _config: XtalClkConfig) {
+fn configure_xtal_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<XtalClkConfig>,
+    _config: XtalClkConfig,
+) {
     // The stored configuration affects PLL settings instead.
 }
 
@@ -123,6 +136,14 @@ fn configure_xtal_clk_impl(_clocks: &mut ClockTree, _config: XtalClkConfig) {
 
 fn enable_pll_clk_impl(clocks: &mut ClockTree, en: bool) {
     let power_down = !en;
+
+    // regi2c_ctrl_ll_i2c_bbpll_enable
+    // regi2c_ctrl_ll_i2c_apll_enable
+    I2C_ANA_MST::regs().config1().modify(|_, w| {
+        w.bbpll().bit(power_down);
+        w.apll().bit(power_down)
+    });
+
     LPWR::regs().options0().modify(|_, w| {
         w.bb_i2c_force_pd().bit(power_down);
         w.bbpll_force_pd().bit(power_down);
@@ -197,7 +218,11 @@ fn enable_pll_clk_impl(clocks: &mut ClockTree, en: bool) {
     ensure_voltage_minimal(clocks);
 }
 
-fn configure_pll_clk_impl(_clocks: &mut ClockTree, _config: PllClkConfig) {
+fn configure_pll_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<PllClkConfig>,
+    _config: PllClkConfig,
+) {
     // Nothing to do. The PLL may still be powered down. We'll configure it in
     // `enable_pll_clk_impl`.
 }
@@ -216,7 +241,11 @@ fn enable_apll_clk_impl(_clocks: &mut ClockTree, en: bool) {
     }
 }
 
-fn configure_apll_clk_impl(_clocks: &mut ClockTree, _config: ApllClkConfig) {
+fn configure_apll_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<ApllClkConfig>,
+    _config: ApllClkConfig,
+) {
     // Nothing to do. The APLL may still be powered down. We'll configure it in
     // `enable_apll_clk_impl`.
 }
@@ -234,6 +263,9 @@ fn enable_rc_fast_clk_impl(_clocks: &mut ClockTree, en: bool) {
             CLK_LL_RC_FAST_WAIT_DEFAULT
         })
     });
+    if en {
+        ets_delay_us(50);
+    }
 }
 
 // CPU_PLL_DIV_IN
@@ -244,8 +276,8 @@ fn enable_cpu_pll_div_in_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_cpu_pll_div_in_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<CpuPllDivInConfig>,
-    _new_selector: CpuPllDivInConfig,
+    _old_config: Option<CpuPllDivInConfig>,
+    _new_config: CpuPllDivInConfig,
 ) {
     // Nothing to do.
 }
@@ -256,7 +288,11 @@ fn enable_cpu_pll_div_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do.
 }
 
-fn configure_cpu_pll_div_impl(_clocks: &mut ClockTree, _new_config: CpuPllDivConfig) {
+fn configure_cpu_pll_div_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<CpuPllDivConfig>,
+    _new_config: CpuPllDivConfig,
+) {
     // Nothing to do.
 }
 
@@ -268,8 +304,8 @@ fn enable_system_pre_div_in_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_system_pre_div_in_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<SystemPreDivInConfig>,
-    _new_selector: SystemPreDivInConfig,
+    _old_config: Option<SystemPreDivInConfig>,
+    _new_config: SystemPreDivInConfig,
 ) {
     // Nothing to do.
 }
@@ -280,10 +316,14 @@ fn enable_system_pre_div_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do.
 }
 
-fn configure_system_pre_div_impl(_clocks: &mut ClockTree, new_config: SystemPreDivConfig) {
+fn configure_system_pre_div_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<SystemPreDivConfig>,
+    new_config: SystemPreDivConfig,
+) {
     SYSTEM::regs()
         .sysclk_conf()
-        .modify(|_, w| unsafe { w.pre_div_cnt().bits(new_config.value() as u16 & 0x3FF) });
+        .modify(|_, w| unsafe { w.pre_div_cnt().bits(new_config.divisor() as u16 & 0x3FF) });
 }
 
 // APB_CLK
@@ -294,8 +334,8 @@ fn enable_apb_clk_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_apb_clk_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<ApbClkConfig>,
-    _new_selector: ApbClkConfig,
+    _old_config: Option<ApbClkConfig>,
+    _new_config: ApbClkConfig,
 ) {
     // Nothing to do.
 }
@@ -308,8 +348,8 @@ fn enable_ref_tick_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_ref_tick_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<RefTickConfig>,
-    _new_selector: RefTickConfig,
+    _old_config: Option<RefTickConfig>,
+    _new_config: RefTickConfig,
 ) {
     // Nothing to do.
 }
@@ -320,10 +360,14 @@ fn enable_ref_tick_xtal_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do.
 }
 
-fn configure_ref_tick_xtal_impl(_clocks: &mut ClockTree, new_config: RefTickXtalConfig) {
+fn configure_ref_tick_xtal_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<RefTickXtalConfig>,
+    new_config: RefTickXtalConfig,
+) {
     SYSCON::regs()
         .tick_conf()
-        .modify(|_, w| unsafe { w.xtal_tick_num().bits(new_config.value() as u8) });
+        .modify(|_, w| unsafe { w.xtal_tick_num().bits(new_config.divisor() as u8) });
 }
 
 // REF_TICK_CK8M
@@ -332,21 +376,25 @@ fn enable_ref_tick_ck8m_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do.
 }
 
-fn configure_ref_tick_ck8m_impl(_clocks: &mut ClockTree, new_config: RefTickCk8mConfig) {
+fn configure_ref_tick_ck8m_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<RefTickCk8mConfig>,
+    new_config: RefTickCk8mConfig,
+) {
     SYSCON::regs()
         .tick_conf()
-        .modify(|_, w| unsafe { w.ck8m_tick_num().bits(new_config.value() as u8) });
+        .modify(|_, w| unsafe { w.ck8m_tick_num().bits(new_config.divisor() as u8) });
 }
 
 // CPU_CLK
 
 fn configure_cpu_clk_impl(
     clocks: &mut ClockTree,
-    _old_selector: Option<CpuClkConfig>,
-    new_selector: CpuClkConfig,
+    _old_config: Option<CpuClkConfig>,
+    new_config: CpuClkConfig,
 ) {
     // Based on TRM Table 6.2-2
-    let clock_source_sel0_bit = match new_selector {
+    let clock_source_sel0_bit = match new_config {
         CpuClkConfig::Xtal => 0,
         CpuClkConfig::RcFast => 2,
         CpuClkConfig::Apll => 3,
@@ -354,13 +402,13 @@ fn configure_cpu_clk_impl(
     };
     let clock_source_sel1_bit = clocks.pll_clk == Some(PllClkConfig::_480);
     let clock_source_sel2_bit = match (clocks.pll_clk, clocks.cpu_pll_div) {
-        (Some(PllClkConfig::_480), Some(CpuPllDivConfig::_6)) => 0,
-        (Some(PllClkConfig::_480), Some(CpuPllDivConfig::_3)) => 1,
-        (Some(PllClkConfig::_480), Some(CpuPllDivConfig::_2)) => 2,
+        (Some(PllClkConfig::_480), Some(div)) if div.divisor() == 6 => 0,
+        (Some(PllClkConfig::_480), Some(div)) if div.divisor() == 3 => 1,
+        (Some(PllClkConfig::_480), Some(div)) if div.divisor() == 2 => 2,
 
         // 320 MHz or APLL
-        (_, Some(CpuPllDivConfig::_4)) => 0,
-        (_, Some(CpuPllDivConfig::_2)) => 1,
+        (_, Some(div)) if div.divisor() == 4 => 0,
+        (_, Some(div)) if div.divisor() == 2 => 1,
 
         // don't care
         _ => 0,
@@ -368,7 +416,7 @@ fn configure_cpu_clk_impl(
 
     ensure_voltage_raised(clocks);
 
-    if new_selector == CpuClkConfig::Pll {
+    if new_config == CpuClkConfig::Pll {
         SYSTEM::regs().cpu_per_conf().modify(|_, w| {
             unsafe { w.cpuperiod_sel().bits(clock_source_sel2_bit) };
             w.pll_freq_sel().bit(clock_source_sel1_bit)
@@ -380,10 +428,10 @@ fn configure_cpu_clk_impl(
         .modify(|_, w| unsafe { w.soc_clk_sel().bits(clock_source_sel0_bit) });
 
     // Store frequencies in expected places.
-    let cpu_freq = Rate::from_hz(cpu_clk_frequency(clocks));
+    let cpu_freq = Rate::from_hz(cpu_clk_frequency());
     ets_update_cpu_frequency_rom(cpu_freq.as_mhz());
 
-    let apb_freq = Rate::from_hz(apb_clk_frequency(clocks));
+    let apb_freq = Rate::from_hz(apb_clk_frequency());
     update_apb_frequency(apb_freq);
 
     ensure_voltage_minimal(clocks);
@@ -397,19 +445,26 @@ fn update_apb_frequency(freq: Rate) {
         .modify(|_, w| unsafe { w.data().bits(value) });
 }
 
-fn needs_high_voltage(clocks: &mut ClockTree) -> bool {
-    let flash_frequency_80m = true; // TODO
+fn uses_80mhz_flash() -> bool {
+    unsafe {
+        crate::soc::pac::SPI0::steal()
+            .clock()
+            .read()
+            .clk_equ_sysclk()
+            .bit_is_set()
+    }
+}
+fn is_max_cpu_speed(clocks: &mut ClockTree) -> bool {
     clocks.cpu_clk == Some(CpuClkConfig::Pll)
-        && (clocks.pll_clk, clocks.cpu_pll_div)
-            == (Some(PllClkConfig::_480), Some(CpuPllDivConfig::_2))
-        || flash_frequency_80m
+        && clocks.pll_clk == Some(PllClkConfig::_480)
+        && matches!(clocks.cpu_pll_div, Some(div) if div.divisor() == 2)
 }
 
 const RTC_CNTL_DBIAS_1V10: u8 = 4;
 const RTC_CNTL_DBIAS_1V25: u8 = 7;
 
 fn ensure_voltage_raised(clocks: &mut ClockTree) {
-    if needs_high_voltage(clocks) {
+    if is_max_cpu_speed(clocks) || uses_80mhz_flash() {
         LPWR::regs().reg().modify(|_, w| unsafe {
             w.dig_reg_dbias_wak().bits(RTC_CNTL_DBIAS_1V25);
             w.dbias_wak().bits(RTC_CNTL_DBIAS_1V25)
@@ -420,9 +475,13 @@ fn ensure_voltage_raised(clocks: &mut ClockTree) {
 }
 
 fn ensure_voltage_minimal(clocks: &mut ClockTree) {
-    if !needs_high_voltage(clocks) {
+    if !is_max_cpu_speed(clocks) {
         LPWR::regs().reg().modify(|_, w| unsafe {
-            w.dig_reg_dbias_wak().bits(RTC_CNTL_DBIAS_1V10);
+            if uses_80mhz_flash() {
+                w.dig_reg_dbias_wak().bits(RTC_CNTL_DBIAS_1V25);
+            } else {
+                w.dig_reg_dbias_wak().bits(RTC_CNTL_DBIAS_1V10);
+            }
             w.dbias_wak().bits(RTC_CNTL_DBIAS_1V10)
         });
         ets_delay_us(40);
@@ -498,7 +557,8 @@ fn enable_rc_slow_clk_impl(_clocks: &mut ClockTree, en: bool) {
 
 fn enable_rc_fast_div_clk_impl(_clocks: &mut ClockTree, en: bool) {
     LPWR::regs().clk_conf().modify(|_, w| {
-        w.enb_ck8m_div().bit(en);
+        // Active-low: clear to enable, set to disable.
+        w.enb_ck8m_div().bit(!en);
         unsafe { w.ck8m_div().bits(1) } // divide by 256
     });
 }
@@ -517,13 +577,13 @@ fn enable_rtc_slow_clk_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_rtc_slow_clk_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<RtcSlowClkConfig>,
-    new_selector: RtcSlowClkConfig,
+    _old_config: Option<RtcSlowClkConfig>,
+    new_config: RtcSlowClkConfig,
 ) {
     LPWR::regs().clk_conf().modify(|_, w| unsafe {
-        w.ana_clk_rtc_sel().bits(match new_selector {
+        w.ana_clk_rtc_sel().bits(match new_config {
             RtcSlowClkConfig::RcSlow => 0,
-            RtcSlowClkConfig::Xtal => 1,
+            RtcSlowClkConfig::Xtal32k => 1,
             RtcSlowClkConfig::RcFast => 2,
         })
     });
@@ -539,13 +599,12 @@ fn enable_rtc_fast_clk_impl(_clocks: &mut ClockTree, _en: bool) {
 
 fn configure_rtc_fast_clk_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<RtcFastClkConfig>,
-    new_selector: RtcFastClkConfig,
+    _old_config: Option<RtcFastClkConfig>,
+    new_config: RtcFastClkConfig,
 ) {
-    LPWR::regs().clk_conf().modify(|_, w| {
-        w.fast_clk_rtc_sel()
-            .bit(new_selector == RtcFastClkConfig::Rc)
-    });
+    LPWR::regs()
+        .clk_conf()
+        .modify(|_, w| w.fast_clk_rtc_sel().bit(new_config == RtcFastClkConfig::Rc));
 
     ets_delay_us(3);
 }
@@ -569,152 +628,76 @@ fn enable_uart_mem_clk_impl(_clocks: &mut ClockTree, en: bool) {
         .modify(|_, w| w.uart_mem_clk_en().bit(en));
 }
 
-// TIMG0_FUNCTION_CLOCK
+// TIMG_CALIBRATION_CLOCK
 
-// Note that the function clock is a pre-requisite of the timer, but does not enable the counter.
-
-fn enable_timg0_function_clock_impl(_clocks: &mut ClockTree, en: bool) {
-    TIMG0::regs().regclk().modify(|_, w| w.clk_en().bit(en));
+fn enable_timg_calibration_clock_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do, calibration clocks can only be selected. They are gated by the CALI_START
+    // bit, which is managed by the calibration process.
 }
 
-fn configure_timg0_function_clock_impl(
+fn configure_timg_calibration_clock_impl(
     _clocks: &mut ClockTree,
-    _old_selector: Option<Timg0FunctionClockConfig>,
-    new_selector: Timg0FunctionClockConfig,
+    _old_config: Option<TimgCalibrationClockConfig>,
+    new_config: TimgCalibrationClockConfig,
 ) {
-    TIMG0::regs().t(0).config().modify(|_, w| {
-        w.use_xtal()
-            .bit(new_selector == Timg0FunctionClockConfig::XtalClk)
-    });
-    TIMG0::regs().t(1).config().modify(|_, w| {
-        w.use_xtal()
-            .bit(new_selector == Timg0FunctionClockConfig::XtalClk)
+    TIMG0::regs().rtccalicfg().modify(|_, w| unsafe {
+        w.rtc_cali_clk_sel().bits(match new_config {
+            TimgCalibrationClockConfig::RtcClk => 0,
+            TimgCalibrationClockConfig::RcFastDivClk => 1,
+            TimgCalibrationClockConfig::Xtal32kClk => 2,
+        })
     });
 }
 
-// TIMG0_CALIBRATION_CLOCK
+impl TimgInstance {
+    // TIMG_FUNCTION_CLOCK
 
-fn enable_timg0_calibration_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do, calibration clocks can only be selected. They are gated by the CALI_START bit,
-    // which is managed by the calibration process.
-}
+    fn enable_function_clock_impl(self, _clocks: &mut ClockTree, en: bool) {
+        let regs = match self {
+            TimgInstance::Timg0 => TIMG0::regs(),
+            TimgInstance::Timg1 => TIMG1::regs(),
+        };
+        regs.regclk().modify(|_, w| w.clk_en().bit(en));
+    }
 
-impl Timg0CalibrationClockConfig {
-    fn cali_clk_sel_bits(self) -> u8 {
-        match self {
-            Timg0CalibrationClockConfig::RtcClk => 0,
-            Timg0CalibrationClockConfig::RcFastDivClk => 1,
-            Timg0CalibrationClockConfig::Xtal32kClk => 2,
-        }
+    fn configure_function_clock_impl(
+        self,
+        _clocks: &mut ClockTree,
+        _old_config: Option<TimgFunctionClockConfig>,
+        new_config: TimgFunctionClockConfig,
+    ) {
+        let regs = match self {
+            TimgInstance::Timg0 => TIMG0::regs(),
+            TimgInstance::Timg1 => TIMG1::regs(),
+        };
+        regs.t(0).config().modify(|_, w| {
+            w.use_xtal()
+                .bit(new_config == TimgFunctionClockConfig::XtalClk)
+        });
+        regs.t(1).config().modify(|_, w| {
+            w.use_xtal()
+                .bit(new_config == TimgFunctionClockConfig::XtalClk)
+        });
     }
 }
 
-fn configure_timg0_calibration_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Timg0CalibrationClockConfig>,
-    new_selector: Timg0CalibrationClockConfig,
-) {
-    TIMG0::regs()
-        .rtccalicfg()
-        .modify(|_, w| unsafe { w.rtc_cali_clk_sel().bits(new_selector.cali_clk_sel_bits()) });
-}
+impl RmtInstance {
+    // RMT_SCLK
 
-// TIMG1_FUNCTION_CLOCK
+    fn enable_sclk_impl(self, _clocks: &mut ClockTree, en: bool) {
+        RMT::regs().apb_conf().modify(|_, w| w.clk_en().bit(en));
+    }
 
-fn enable_timg1_function_clock_impl(_clocks: &mut ClockTree, en: bool) {
-    TIMG1::regs().regclk().modify(|_, w| w.clk_en().bit(en));
-}
-
-fn configure_timg1_function_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Timg0FunctionClockConfig>,
-    new_selector: Timg0FunctionClockConfig,
-) {
-    TIMG1::regs().t(0).config().modify(|_, w| {
-        w.use_xtal()
-            .bit(new_selector == Timg0FunctionClockConfig::XtalClk)
-    });
-    TIMG1::regs().t(1).config().modify(|_, w| {
-        w.use_xtal()
-            .bit(new_selector == Timg0FunctionClockConfig::XtalClk)
-    });
-}
-
-// TIMG1_CALIBRATION_CLOCK
-
-fn enable_timg1_calibration_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do, calibration clocks can only be selected. They are gated by the CALI_START bit,
-    // which is managed by the calibration process.
-}
-
-fn configure_timg1_calibration_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Timg0CalibrationClockConfig>,
-    new_selector: Timg0CalibrationClockConfig,
-) {
-    TIMG1::regs()
-        .rtccalicfg()
-        .modify(|_, w| unsafe { w.rtc_cali_clk_sel().bits(new_selector.cali_clk_sel_bits()) });
-}
-
-// UART0_MEM_CLOCK
-
-fn enable_uart0_mem_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do.
-}
-
-fn configure_uart0_mem_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Uart0MemClockConfig>,
-    _new_selector: Uart0MemClockConfig,
-) {
-    // Nothing to do.
-}
-
-// UART0_FUNCTION_CLOCK
-
-fn enable_uart0_function_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do
-}
-
-fn configure_uart0_function_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Uart0FunctionClockConfig>,
-    new_selector: Uart0FunctionClockConfig,
-) {
-    UART0::regs().conf0().modify(|_, w| {
-        w.tick_ref_always_on()
-            .bit(new_selector == Uart0FunctionClockConfig::Apb)
-    });
-}
-
-// UART1_MEM_CLOCK
-
-fn enable_uart1_mem_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do.
-}
-
-fn configure_uart1_mem_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Uart0MemClockConfig>,
-    _new_selector: Uart0MemClockConfig,
-) {
-    // Nothing to do.
-}
-
-// UART1_FUNCTION_CLOCK
-
-fn enable_uart1_function_clock_impl(_clocks: &mut ClockTree, _en: bool) {
-    // Nothing to do
-}
-
-fn configure_uart1_function_clock_impl(
-    _clocks: &mut ClockTree,
-    _old_selector: Option<Uart0FunctionClockConfig>,
-    new_selector: Uart0FunctionClockConfig,
-) {
-    UART1::regs().conf0().modify(|_, w| {
-        w.tick_ref_always_on()
-            .bit(new_selector == Uart0FunctionClockConfig::Apb)
-    });
+    fn configure_sclk_impl(
+        self,
+        _clocks: &mut ClockTree,
+        _old_config: Option<RmtSclkConfig>,
+        new_config: RmtSclkConfig,
+    ) {
+        for ch_num in 0..4 {
+            RMT::regs()
+                .chconf1(ch_num)
+                .modify(|_, w| w.ref_always_on().bit(new_config == RmtSclkConfig::ApbClk));
+        }
+    }
 }

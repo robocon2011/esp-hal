@@ -25,7 +25,7 @@
 //! | DEMP  | Gnd             |
 //! | XSMT  | +3V3            |
 
-//% CHIPS: esp32 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: i2s_driver_supported
 
 #![no_std]
 #![no_main]
@@ -33,8 +33,8 @@
 use embassy_executor::Spawner;
 use esp_backtrace as _;
 use esp_hal::{
-    dma_buffers,
-    i2s::master::{Channels, Config, DataFormat, I2s},
+    dma_tx_stream_buffer,
+    i2s::master::{Channels, DataFormat, I2s, TdmConfig},
     interrupt::software::SoftwareInterruptControl,
     time::Rate,
     timer::timg::TimerGroup,
@@ -51,7 +51,7 @@ const SINE: [i16; 64] = [
     -28897, -27244, -25329, -23169, -20787, -18204, -15446, -12539, -9511, -6392, -3211,
 ];
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_spawner: Spawner) {
     println!("Init!");
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -59,20 +59,17 @@ async fn main(_spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    cfg_if::cfg_if! {
-        if #[cfg(any(feature = "esp32", feature = "esp32s2"))] {
-            let dma_channel = peripherals.DMA_I2S0;
-        } else {
-            let dma_channel = peripherals.DMA_CH0;
-        }
-    }
+    let dma_channel = cfg_select! {
+        i2s_dma_engine = "I2S_DMA" => peripherals.DMA_I2S0,
+        _ => peripherals.DMA_CH0,
+    };
 
-    let (_, _, tx_buffer, tx_descriptors) = dma_buffers!(0, 32000);
+    let mut buffer = dma_tx_stream_buffer!(4092 * 4, 2048);
 
     let i2s = I2s::new(
         peripherals.I2S0,
         dma_channel,
-        Config::new_tdm_philips()
+        TdmConfig::new_tdm_philips()
             .with_sample_rate(Rate::from_hz(44100))
             .with_data_format(DataFormat::Data16Channel16)
             .with_channels(Channels::STEREO),
@@ -85,36 +82,41 @@ async fn main(_spawner: Spawner) {
         .with_bclk(peripherals.GPIO2)
         .with_ws(peripherals.GPIO4)
         .with_dout(peripherals.GPIO5)
-        .build(tx_descriptors);
+        .build();
 
     let data =
         unsafe { core::slice::from_raw_parts(&SINE as *const _ as *const u8, SINE.len() * 2) };
 
-    let buffer = tx_buffer;
     let mut idx = 0;
-    for i in 0..usize::min(data.len(), buffer.len()) {
-        buffer[i] = data[idx];
+    buffer.push_with(|buf| {
+        for b in buf.iter_mut() {
+            *b = data[idx];
+            idx += 1;
 
-        idx += 1;
-
-        if idx >= data.len() {
-            idx = 0;
+            if idx >= data.len() {
+                idx = 0;
+            }
         }
-    }
-
-    let mut filler = [0u8; 10000];
-    let mut idx = 32000 % data.len();
+        buf.len()
+    });
 
     println!("Start");
-    let mut transaction = i2s_tx.write_dma_circular_async(buffer).unwrap();
+    let mut transaction = i2s_tx.write(buffer).ok().unwrap();
     loop {
-        for i in 0..filler.len() {
-            filler[i] = data[(idx + i) % data.len()];
-        }
-        println!("Next");
+        transaction.wait_for_available_async().await.unwrap();
 
-        let written = transaction.push(&filler).await.unwrap();
-        idx = (idx + written) % data.len();
+        let written = transaction.push_with(|buf| {
+            for b in buf.iter_mut() {
+                *b = data[idx];
+                idx += 1;
+
+                if idx >= data.len() {
+                    idx = 0;
+                }
+            }
+            buf.len()
+        });
+
         println!("written {}", written);
     }
 }

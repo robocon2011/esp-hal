@@ -1,6 +1,7 @@
 //! UART Test
 
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+// FIXME: ESP32-P4's UART driver still needs some work.
+//% CHIP_FILTER: uart_driver_supported && !esp32p4
 //% FEATURES: unstable embassy
 
 #![no_std]
@@ -15,7 +16,7 @@ mod tests {
         delay::Delay,
         gpio::{AnyPin, Pin},
         time::Duration,
-        uart::{self, ClockSource, Uart},
+        uart::{self, BaudrateTolerance, ClockSource, Uart},
     };
 
     struct Context {
@@ -29,9 +30,11 @@ mod tests {
 
     #[init]
     fn init() -> Context {
-        let peripherals = esp_hal::init(
-            esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
-        );
+        let config = cfg_select! {
+            esp32s31 => esp_hal::Config::default(),
+            _ => esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+        };
+        let peripherals = esp_hal::init(config);
 
         let (rx, tx) = hil_test::common_test_pins!(peripherals);
         let rts = hil_test::unconnected_pin!(peripherals);
@@ -103,7 +106,8 @@ mod tests {
         ];
 
         for config in configs {
-            uart.apply_config(&config).unwrap();
+            uart.apply_config(&config)
+                .unwrap_or_else(|e| panic!("{:?}: {:?}", e, config));
 
             uart.write(&[0x42]).unwrap();
             let mut byte = [0u8; 1];
@@ -167,17 +171,12 @@ mod tests {
         // working as expected. We will also using different clock sources
         // while we're at it.
 
-        cfg_if::cfg_if! {
-            if #[cfg(esp32c2)] {
-                let fastest_clock_source = ClockSource::PllF40m;
-            } else  if #[cfg(esp32c6)] {
-                let fastest_clock_source = ClockSource::PllF80m;
-            } else if #[cfg(esp32h2)] {
-                let fastest_clock_source = ClockSource::PllF48m;
-            } else {
-                let fastest_clock_source = ClockSource::Apb;
-            }
-        }
+        let fastest_clock_source = cfg_select! {
+            esp32c2 => ClockSource::PllF40m,
+            any(esp32c5, esp32c6, esp32c61, esp32p4, esp32s31) => ClockSource::PllF80m,
+            esp32h2 => ClockSource::PllF48m,
+            _ => ClockSource::Apb,
+        };
 
         let configs = [
             #[cfg(not(soc_has_clock_node_ref_tick))]
@@ -192,16 +191,15 @@ mod tests {
             (5_000_000, fastest_clock_source),
         ];
 
-        // TODO: we need a way to verify these baud rates are actually what we want.
-
         let mut byte_to_write = 0xA5;
         for (baudrate, clock_source) in configs {
             uart.apply_config(
                 &uart::Config::default()
                     .with_baudrate(baudrate)
-                    .with_clock_source(clock_source),
+                    .with_clock_source(clock_source)
+                    .with_baudrate_tolerance(BaudrateTolerance::ErrorPercent(5)),
             )
-            .unwrap();
+            .unwrap_or_else(|e| panic!("{:?}: Failed to apply {:?}@{}", e, clock_source, baudrate));
             uart.write(&[byte_to_write]).unwrap();
             let mut byte = [0u8; 1];
             uart.read(&mut byte).unwrap();
@@ -260,7 +258,6 @@ mod tests {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
 
-        rx.enable_break_detection();
         tx.send_break(100);
         assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
     }
@@ -277,7 +274,6 @@ mod tests {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
 
-        rx.enable_break_detection();
         for _ in 0..3 {
             tx.send_break(100);
             assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
@@ -288,8 +284,6 @@ mod tests {
     fn test_break_detection_interleaved(ctx: Context) {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
-
-        rx.enable_break_detection();
 
         // Test 1: Send break, expect detection
         tx.send_break(100);
@@ -314,8 +308,6 @@ mod tests {
     fn test_break_detection_with_data(ctx: Context) {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
-
-        rx.enable_break_detection();
 
         // Test 1: Send break, expect detection
         tx.send_break(100);
@@ -355,8 +347,6 @@ mod tests {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
 
-        rx.enable_break_detection();
-
         // Send data, flush to ensure transmission, then send break
         tx.write(&[0x01, 0x02, 0x03, 0x04]).unwrap();
         tx.flush().unwrap();
@@ -384,6 +374,36 @@ mod tests {
         let mut buf = [0u8; 3];
         rx.read(&mut buf).unwrap();
         assert_eq!(buf, [0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_split_mut_send_receive_change_baud(ctx: Context) {
+        let mut uart0 = ctx.uart0.with_tx(ctx.tx);
+        let mut uart1 = ctx.uart1.with_rx(ctx.rx);
+
+        let bytes = [0x42, 0x43, 0x44];
+        let mut buf = [0u8; 3];
+
+        for i in 1..=2 {
+            let baudrate = 9600 * i;
+            let uart_cfg = uart::Config::default().with_baudrate(baudrate);
+            uart0.apply_config(&uart_cfg).unwrap_or_else(|e| {
+                panic!("{:?}: Failed to apply UART 0 baudrate: {}", e, baudrate)
+            });
+            uart1.apply_config(&uart_cfg).unwrap_or_else(|e| {
+                panic!("{:?}: Failed to apply UART 1 baudrate: {}", e, baudrate)
+            });
+
+            let (_, tx) = uart0.split_mut();
+            let (rx, _) = uart1.split_mut();
+
+            tx.flush().unwrap();
+            tx.write(&bytes).unwrap();
+
+            embedded_io::Read::read_exact(rx, &mut buf).unwrap();
+
+            assert_eq!(buf, bytes);
+        }
     }
 }
 
@@ -483,7 +503,7 @@ mod async_tests {
         let signal = &*mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
         let spawner = interrupt_executor.start(Priority::Priority3);
-        spawner.must_spawn(long_string_reader(rx, signal));
+        spawner.spawn(long_string_reader(rx, signal).unwrap());
 
         tx.write_str(LONG_TEST_STRING).unwrap();
 
@@ -534,19 +554,28 @@ mod async_tx_rx {
         join::join,
         select::{Either, select},
     };
-    use embassy_time::{Duration, Timer};
+    use embassy_time::{Delay, Duration, Timer};
     use embedded_io_async::Write;
     use esp_hal::{
         Async,
         interrupt::software::SoftwareInterruptControl,
         timer::timg::TimerGroup,
-        uart::{self, RxConfig, RxError, UartRx, UartTx},
+        uart::{self, RxConfig, RxError, RxErrorKind, UartRx, UartTx},
     };
+    use hil_test::{assert, assert_eq, assert_ne};
 
     struct Context {
         rx: UartRx<'static, Async>,
         tx: UartTx<'static, Async>,
     }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty()
+            || haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
     #[init]
     async fn init() -> Context {
         let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -579,6 +608,53 @@ mod async_tx_rx {
         let _ = ctx.rx.read_async(&mut read).await;
 
         assert_eq!(read, byte);
+    }
+
+    #[test]
+    async fn test_break_detection(mut ctx: Context) {
+        let mut delay = Delay;
+
+        join(ctx.rx.wait_for_break_async(), async {
+            ctx.tx.send_break_async(&mut delay, 100).await;
+        })
+        .await;
+    }
+
+    #[test]
+    async fn read_async_can_ignore_break_related_errors(ctx: Context) {
+        let mut rx = ctx.rx;
+        let mut tx = ctx.tx;
+        let mut delay = Delay;
+        const PAYLOAD: &[u8] = &[0x55, 0x12, 0x34];
+
+        rx.apply_config(
+            &uart::Config::default().with_rx(
+                RxConfig::default()
+                    .with_discard_erroneous_bytes(false)
+                    .with_reported_errors(RxErrorKind::FifoOverflowed),
+            ),
+        )
+        .unwrap();
+
+        let read = async {
+            let mut received = [0u8; 16];
+            let mut received_len = 0;
+
+            while !contains_subslice(&received[..received_len], PAYLOAD) {
+                assert!(received_len < received.len());
+                let read = rx.read_async(&mut received[received_len..]).await.unwrap();
+                received_len += read;
+            }
+        };
+
+        let write = async {
+            tx.flush_async().await.unwrap();
+            tx.send_break_async(&mut delay, 100).await;
+            tx.write_async(PAYLOAD).await.unwrap();
+            tx.flush_async().await.unwrap();
+        };
+
+        join(read, write).await;
     }
 
     #[test]
@@ -789,13 +865,134 @@ mod async_tx_rx {
         assert_eq!(read, Ok(3));
         assert_eq!(&data[..3], &[1, 2, 3]);
     }
+
+    #[test]
+    async fn async_rx_does_not_return_0(mut ctx: Context) {
+        // Ensure we read at least once, regardless of the implementation details of `read`.
+        ctx.rx
+            .apply_config(
+                &uart::Config::default().with_rx(RxConfig::default().with_fifo_full_threshold(30)),
+            )
+            .unwrap();
+
+        let mut read_success = false;
+        select(
+            async {
+                for _ in 0..5 {
+                    use embedded_io_async::Write;
+
+                    let _ = Write::write(&mut ctx.tx, b"hello world")
+                        .await
+                        .expect("Failed to write data");
+
+                    Timer::after_millis(50).await;
+                }
+                ctx.tx.flush_async().await.unwrap();
+            },
+            async {
+                let mut buf = [0; 128];
+                loop {
+                    use embedded_io_async::Read;
+
+                    let read_bytes = Read::read(&mut ctx.rx, &mut buf)
+                        .await
+                        .expect("Failed to read data");
+                    assert_ne!(read_bytes, 0, "read_async returned 0 bytes read");
+                    read_success = true;
+                }
+            },
+        )
+        .await;
+
+        assert!(read_success);
+    }
 }
-#[cfg(not(any(esp32, esp32c2, esp32s2)))]
+
+#[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
+mod async_tx_rx_split {
+    use embassy_futures::select::select;
+    use embassy_time::Timer;
+    use esp_hal::{
+        Async,
+        interrupt::software::SoftwareInterruptControl,
+        timer::timg::TimerGroup,
+        uart::{self, RxConfig, Uart, UartRx, UartTx},
+    };
+    use hil_test::assert_ne;
+
+    struct Context {
+        rx: UartRx<'static, Async>,
+        tx: UartTx<'static, Async>,
+    }
+    #[init]
+    async fn init() -> Context {
+        let peripherals = esp_hal::init(esp_hal::Config::default());
+
+        let (rx, tx) = hil_test::common_test_pins!(peripherals);
+
+        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+        let (rx, tx) = Uart::new(peripherals.UART0, uart::Config::default())
+            .unwrap()
+            .with_tx(tx)
+            .with_rx(rx)
+            .into_async()
+            .split();
+
+        Context { rx, tx }
+    }
+
+    #[test]
+    async fn async_rx_does_not_return_0(mut ctx: Context) {
+        // Ensure we read at least once, regardless of the implementation details of `read`.
+        ctx.rx
+            .apply_config(
+                &uart::Config::default().with_rx(RxConfig::default().with_fifo_full_threshold(30)),
+            )
+            .unwrap();
+
+        let mut read_success = false;
+        select(
+            async {
+                for _ in 0..5 {
+                    use embedded_io_async::Write;
+
+                    let _ = Write::write(&mut ctx.tx, b"hello world")
+                        .await
+                        .expect("Failed to write data");
+
+                    Timer::after_millis(50).await;
+                }
+                ctx.tx.flush_async().await.unwrap();
+            },
+            async {
+                let mut buf = [0; 128];
+                loop {
+                    use embedded_io_async::Read;
+
+                    let read_bytes = Read::read(&mut ctx.rx, &mut buf)
+                        .await
+                        .expect("Failed to read data");
+                    assert_ne!(read_bytes, 0, "read_async returned 0 bytes read");
+                    read_success = true;
+                }
+            },
+        )
+        .await;
+
+        assert!(read_success);
+    }
+}
+
+#[cfg(uhci_driver_supported)]
 #[embedded_test::tests(default_timeout = 5, executor = hil_test::Executor::new())]
 mod uhci {
     use esp_hal::{
         dma::{DmaRxBuf, DmaTxBuf},
-        dma_buffers,
+        dma_rx_buffer,
+        dma_tx_buffer,
         interrupt::software::SoftwareInterruptControl,
         peripherals::Peripherals,
         timer::timg::TimerGroup,
@@ -823,10 +1020,8 @@ mod uhci {
     async fn init() -> Context {
         let peripherals = esp_hal::init(esp_hal::Config::default());
 
-        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
-            dma_buffers!(DMA_BUFFER_SIZE as usize);
-        let dma_rx = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-        let dma_tx = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+        let dma_rx = dma_rx_buffer!(DMA_BUFFER_SIZE as usize).unwrap();
+        let dma_tx = dma_tx_buffer!(DMA_BUFFER_SIZE as usize).unwrap();
 
         Context {
             dma_rx,

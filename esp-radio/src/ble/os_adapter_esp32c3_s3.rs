@@ -6,14 +6,12 @@ use crate::hal::system::Cpu;
 use crate::{
     ble::InvalidConfigError,
     common_adapter::*,
-    hal::{interrupt, peripherals::Interrupt},
+    hal::{interrupt::Priority, peripherals::BT},
+    interrupt_dispatch::Handler,
 };
 
-pub(crate) static mut ISR_INTERRUPT_5: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
-
-pub(crate) static mut ISR_INTERRUPT_8: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
+static ISR_INTERRUPT_5: Handler = Handler::new();
+static ISR_INTERRUPT_8: Handler = Handler::new();
 
 #[repr(C)]
 pub(super) struct osi_funcs_s {
@@ -74,12 +72,12 @@ pub(super) struct osi_funcs_s {
     btdm_sleep_exit_phase3: Option<unsafe extern "C" fn()>,
     coex_wifi_sleep_set: Option<unsafe extern "C" fn(i32)>,
     coex_core_ble_conn_dyn_prio_get: Option<unsafe extern "C" fn(*mut i32, *mut i32) -> i32>,
-    coex_schm_register_btdm_callback: Option<unsafe extern "C" fn(*const ()) -> i32>,
+    coex_schm_register_btdm_callback: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
     coex_schm_status_bit_set: Option<unsafe extern "C" fn(i32, i32)>,
     coex_schm_status_bit_clear: Option<unsafe extern "C" fn(i32, i32)>,
-    coex_schm_interval_get: Option<unsafe extern "C" fn() -> i32>,
+    coex_schm_interval_get: Option<unsafe extern "C" fn() -> u32>,
     coex_schm_curr_period_get: Option<unsafe extern "C" fn() -> u8>,
-    coex_schm_curr_phase_get: Option<unsafe extern "C" fn() -> *const ()>,
+    coex_schm_curr_phase_get: Option<unsafe extern "C" fn() -> *mut c_void>,
     interrupt_on: Option<unsafe extern "C" fn(i32) -> i32>,
     interrupt_off: Option<unsafe extern "C" fn(i32) -> i32>,
     esp_hw_power_down: Option<unsafe extern "C" fn()>,
@@ -96,9 +94,9 @@ pub(super) struct osi_funcs_s {
 pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     magic: 0xfadebead,
     version: 0x0001000A,
-    interrupt_alloc: Some(ble_os_adapter_chip_specific::interrupt_set),
-    interrupt_free: Some(ble_os_adapter_chip_specific::interrupt_clear),
-    interrupt_handler_set: Some(ble_os_adapter_chip_specific::interrupt_handler_set),
+    interrupt_alloc: Some(interrupt_set),
+    interrupt_free: Some(interrupt_clear),
+    interrupt_handler_set: Some(interrupt_handler_set),
     interrupt_disable: Some(interrupt_disable),
     interrupt_restore: Some(interrupt_enable),
     task_yield: Some(task_yield),
@@ -137,21 +135,19 @@ pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     btdm_sleep_exit_phase1: Some(btdm_sleep_exit_phase1),
     btdm_sleep_exit_phase2: Some(btdm_sleep_exit_phase2),
     btdm_sleep_exit_phase3: Some(btdm_sleep_exit_phase3),
-    coex_wifi_sleep_set: Some(ble_os_adapter_chip_specific::coex_wifi_sleep_set),
-    coex_core_ble_conn_dyn_prio_get: Some(
-        ble_os_adapter_chip_specific::coex_core_ble_conn_dyn_prio_get,
-    ),
+    coex_wifi_sleep_set: Some(coex_wifi_sleep_set),
+    coex_core_ble_conn_dyn_prio_get: Some(coex_core_ble_conn_dyn_prio_get),
     coex_schm_register_btdm_callback: Some(coex_schm_register_btdm_callback),
     coex_schm_status_bit_set: Some(coex_schm_status_bit_set),
     coex_schm_status_bit_clear: Some(coex_schm_status_bit_clear),
     coex_schm_interval_get: Some(coex_schm_interval_get),
     coex_schm_curr_period_get: Some(coex_schm_curr_period_get),
     coex_schm_curr_phase_get: Some(coex_schm_curr_phase_get),
-    interrupt_on: Some(ble_os_adapter_chip_specific::interrupt_on),
-    interrupt_off: Some(ble_os_adapter_chip_specific::interrupt_off),
-    esp_hw_power_down: Some(ble_os_adapter_chip_specific::esp_hw_power_down),
-    esp_hw_power_up: Some(ble_os_adapter_chip_specific::esp_hw_power_up),
-    ets_backup_dma_copy: Some(ble_os_adapter_chip_specific::ets_backup_dma_copy),
+    interrupt_on: Some(interrupt_on),
+    interrupt_off: Some(interrupt_off),
+    esp_hw_power_down: Some(esp_hw_power_down),
+    esp_hw_power_up: Some(esp_hw_power_up),
+    ets_backup_dma_copy: Some(ets_backup_dma_copy),
     ets_delay_us: Some(ets_delay_us_wrapper),
     btdm_rom_table_ready: Some(btdm_rom_table_ready_wrapper),
     coex_bt_wakeup_request: Some(coex_bt_wakeup_request),
@@ -169,53 +165,30 @@ extern "C" fn assert_wrapper() {
     panic!("assert_wrapper called - inspect the logs");
 }
 
-extern "C" fn coex_schm_register_btdm_callback(_callback: *const ()) -> i32 {
+extern_coex_fns! {
+    fn coex_core_ble_conn_dyn_prio_get(low: *mut i32, high: *mut i32) -> i32;
+}
+
+coex_fns! {
+    fn coex_schm_interval_get() -> u32;
+    fn coex_schm_curr_period_get() -> u8;
+    fn coex_schm_curr_phase_get() -> *mut c_void;
+}
+
+extern "C" fn coex_schm_register_btdm_callback(_callback: *mut c_void) -> i32 {
     trace!("coex_schm_register_btdm_callback");
 
-    #[cfg(coex)]
-    unsafe {
-        // COEX_SCHM_CALLBACK_TYPE_BT
-        coex_schm_register_callback(1, _callback as *mut crate::sys::c_types::c_void)
+    cfg_select! {
+        feature = "coex" => {
+            unsafe {
+                const COEX_SCHM_CALLBACK_TYPE_BT: u32 = 1;
+                coex_schm_register_callback(COEX_SCHM_CALLBACK_TYPE_BT, _callback)
+            }
+        }
+        _ => {
+            0
+        }
     }
-
-    #[cfg(not(coex))]
-    0
-}
-
-extern "C" fn coex_schm_interval_get() -> i32 {
-    trace!("coex_schm_interval_get");
-
-    #[cfg(coex)]
-    unsafe {
-        crate::sys::include::coex_schm_interval_get() as i32
-    }
-
-    #[cfg(not(coex))]
-    0
-}
-
-extern "C" fn coex_schm_curr_period_get() -> u8 {
-    trace!("coex_schm_curr_period_get");
-
-    #[cfg(coex)]
-    unsafe {
-        crate::sys::include::coex_schm_curr_period_get()
-    }
-
-    #[cfg(not(coex))]
-    0
-}
-
-extern "C" fn coex_schm_curr_phase_get() -> *const () {
-    trace!("coex_schm_curr_phase_get");
-
-    #[cfg(coex)]
-    unsafe {
-        crate::sys::include::coex_schm_curr_phase_get().cast()
-    }
-
-    #[cfg(not(coex))]
-    core::ptr::null()
 }
 
 extern "C" fn coex_bt_wakeup_request() {
@@ -487,8 +460,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // same priority as the wifi task, when using esp-rtos (I'm assuming it's MAX_PRIO - 2)
-            task_priority: 29,
+            task_priority: crate::preempt::max_task_priority()
+                .saturating_sub(2)
+                .min(255) as u8,
             task_stack_size: 8192, // 4096?
             #[cfg(multi_core)]
             task_cpu: Cpu::ProCpu,
@@ -521,6 +495,12 @@ impl Default for Config {
 
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), InvalidConfigError> {
+        crate::ble::validate_range!(
+            self,
+            task_priority,
+            0,
+            crate::preempt::max_task_priority().min(255) as u8
+        );
         crate::ble::validate_range!(self, max_connections, 1, 10);
         crate::ble::validate_range!(self, scan_duplicate_list_count, 10, 1000);
         crate::ble::validate_range!(self, scan_duplicate_refresh_period, 0, 1000);
@@ -534,7 +514,7 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
     // keep them aligned with BT_CONTROLLER_INIT_CONFIG_DEFAULT in ESP-IDF
     // ideally _some_ of these values should be configurable
     esp_bt_controller_config_t {
-        version: 0x02505080,
+        version: 0x02509280,
         controller_task_stack_size: config.task_stack_size,
         controller_task_prio: config.task_priority,
         #[cfg(multi_core)]
@@ -597,16 +577,6 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         connect_en: config.connection,
         scan_en: config.scan,
         ble_aa_check: config.verify_access_address,
-        ble_log_mode_en: if cfg!(feature = "print-logs-from-driver") {
-            4095
-        } else {
-            0
-        },
-        ble_log_level: if cfg!(feature = "print-logs-from-driver") {
-            5
-        } else {
-            0
-        },
         adv_en: config.adv,
         magic: ESP_BT_CTRL_CONFIG_MAGIC_VAL,
     }
@@ -671,29 +641,19 @@ pub(crate) unsafe extern "C" fn interrupt_handler_set(
         "interrupt_handler_set {} {:?} {:?}",
         interrupt_no, func, arg
     );
-    unsafe {
-        match interrupt_no {
-            5 => {
-                ISR_INTERRUPT_5 = (func as *mut c_void, arg as *mut c_void);
-                #[cfg(esp32c3)]
-                unwrap!(interrupt::enable(
-                    Interrupt::RWBT,
-                    interrupt::Priority::Priority1
-                ));
-                unwrap!(interrupt::enable(
-                    Interrupt::BT_BB,
-                    interrupt::Priority::Priority1
-                ));
-            }
-            8 => {
-                ISR_INTERRUPT_8 = (func as *mut c_void, arg as *mut c_void);
-                unwrap!(interrupt::enable(
-                    Interrupt::RWBLE,
-                    interrupt::Priority::Priority1
-                ));
-            }
-            _ => panic!("Unsupported interrupt number {}", interrupt_no),
-        }
+
+    match interrupt_no {
+        5 => unsafe {
+            ISR_INTERRUPT_5.set(func as *const c_void, arg.cast());
+            #[cfg(esp32c3)]
+            BT::steal().enable_rwbt_interrupt(Priority::Priority1);
+            BT::steal().enable_bb_interrupt(Priority::Priority1);
+        },
+        8 => unsafe {
+            ISR_INTERRUPT_8.set(func as *const c_void, arg.cast());
+            BT::steal().enable_rwble_interrupt(Priority::Priority1);
+        },
+        _ => panic!("Unsupported interrupt number {}", interrupt_no),
     }
 }
 
@@ -702,23 +662,6 @@ pub(crate) unsafe extern "C" fn coex_wifi_sleep_set(sleep: i32) {
         "ignored coex_wifi_sleep_set {} - because original implementation does the same",
         sleep
     );
-}
-
-#[allow(unused_variables, dead_code)]
-pub(crate) unsafe extern "C" fn coex_core_ble_conn_dyn_prio_get(
-    low: *mut i32,
-    high: *mut i32,
-) -> i32 {
-    unsafe extern "C" {
-        fn coex_core_ble_conn_dyn_prio_get(low: *mut i32, high: *mut i32) -> i32;
-    }
-    trace!("coex_core_ble_conn_dyn_prio_get");
-
-    #[cfg(coex)]
-    return unsafe { coex_core_ble_conn_dyn_prio_get(low, high) };
-
-    #[cfg(not(coex))]
-    0
 }
 
 pub(crate) unsafe extern "C" fn esp_hw_power_down() {
@@ -736,4 +679,32 @@ pub(crate) unsafe extern "C" fn ets_backup_dma_copy(
     _to_rem: i32,
 ) {
     todo!();
+}
+
+#[cfg(esp32c3)]
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn RWBT() {
+    ISR_INTERRUPT_5.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn RWBLE() {
+    ISR_INTERRUPT_8.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn BT_BB() {
+    ISR_INTERRUPT_5.dispatch();
+}
+
+pub(crate) fn shutdown_ble_isr() {
+    unsafe {
+        #[cfg(esp32c3)]
+        BT::steal().disable_rwbt_interrupt_on_all_cores();
+        BT::steal().disable_rwble_interrupt_on_all_cores();
+        BT::steal().disable_bb_interrupt_on_all_cores();
+    }
 }

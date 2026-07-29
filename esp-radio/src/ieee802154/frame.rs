@@ -6,13 +6,20 @@ pub(crate) const FRAME_SIZE: usize = 129;
 pub(crate) const FRAME_VERSION_1: u8 = 0x10; // IEEE 802.15.4 - 2006 & 2011
 pub(crate) const FRAME_VERSION_2: u8 = 0x20; // IEEE 802.15.4 - 2015
 
-const FRAME_AR_OFFSET: usize = 1;
+// These offsets index the length-stripped PSDU that every caller passes in:
+// frames are built from a pointer one byte past the PHY length byte (`.add(1)`)
+// and the RX path reads `RX_BUFFER[1..]`, so byte 0 is the first FCF octet. The
+// IEEE 802.15.4 FCF carries the AR (ack-request) bit in FCF octet 0 and the
+// frame-version field in FCF octet 1.
+const FRAME_AR_OFFSET: usize = 0;
 const FRAME_AR_BIT: u8 = 0x20;
-const FRAME_VERSION_OFFSET: usize = 2;
+const FRAME_VERSION_OFFSET: usize = 1;
 const FRAME_VERSION_MASK: u8 = 0x30;
 
 /// IEEE 802.15.4 MAC frame
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[instability::unstable]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Frame {
     /// Header
     pub header: Header,
@@ -24,24 +31,10 @@ pub struct Frame {
     pub footer: [u8; 2],
 }
 
-// FIXME: Remove and use derive when defmt 1.0.2 is released (we need https://github.com/knurling-rs/defmt/pull/955)
-#[cfg(feature = "defmt")]
-impl defmt::Format for Frame {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(
-            f,
-            "Frame {{ header: {}, content: {}, payload: {:?}, footer: {:?} }}",
-            self.header,
-            self.content,
-            self.payload.as_slice(),
-            self.footer
-        );
-    }
-}
-
 /// IEEE 802.15.4 MAC frame which has been received
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
 pub struct ReceivedFrame {
     /// Frame
     pub frame: Frame,

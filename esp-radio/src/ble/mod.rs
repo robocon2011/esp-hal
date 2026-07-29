@@ -48,16 +48,6 @@ pub(crate) unsafe extern "C" fn free(ptr: *mut crate::sys::c_types::c_void) {
     unsafe { crate::compat::malloc::free(ptr.cast()) }
 }
 
-/// Gets the MAC address of the device.
-#[instability::unstable]
-pub fn mac() -> [u8; 6] {
-    let mut mac = [0u8; 6];
-    unsafe {
-        crate::common_adapter::read_mac(mac.as_mut_ptr(), 2);
-    }
-    mac
-}
-
 struct BleState {
     pub rx_queue: VecDeque<ReceivedPacket>,
     pub hci_read_data: Vec<u8>,
@@ -188,7 +178,7 @@ fn dump_packet_info(_buffer: &[u8]) {
 }
 
 macro_rules! validate_range {
-    ($this:ident, $field:ident, $min:literal, $max:literal) => {
+    ($this:ident, $field:ident, $min:expr, $max:expr) => {
         if !($min..=$max).contains(&$this.$field) {
             error!(
                 "{} must be between {} and {}, current value is {}",

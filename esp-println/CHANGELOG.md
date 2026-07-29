@@ -9,16 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Initial ESP32-P4 (chip revision v3.0+) support (#5400)
+- Add ESP32-S31 support (#5922)
 
 ### Changed
 
 
 ### Fixed
 
-- Fully resolved `Result` types in macros to avoid strange errors when users import the name elsewhere (#4719)
 
 ### Removed
 
+
+## [v0.17.0] - 2026-04-16
+
+### Added
+
+- Initial ESP32-C5 support (#4859)
+- Initial ESP32-C61 support (#5187)
+
+### Fixed
+
+- Fully resolved `Result` types in macros to avoid strange errors when users import the name elsewhere (#4719)
 
 ## [v0.16.1] - 2025-10-30
 
@@ -123,4 +135,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v0.15.0]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.14.0...esp-println-v0.15.0
 [v0.16.0]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.15.0...esp-println-v0.16.0
 [v0.16.1]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.16.0...esp-println-v0.16.1
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.16.1...HEAD
+[v0.17.0]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.16.1...esp-println-v0.17.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-println-v0.17.0...HEAD

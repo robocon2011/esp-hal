@@ -2,6 +2,8 @@
 //!
 //! Periodically transmits a beacon frame.
 
+//% CHIP_FILTER: wifi_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -13,13 +15,11 @@ use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     interrupt::software::SoftwareInterruptControl,
-    main,
     ram,
     time::Duration,
     timer::timg::TimerGroup,
 };
 use esp_println::println;
-use esp_radio::wifi;
 use ieee80211::{
     common::{CapabilitiesInformation, FCFFlags},
     element_chain,
@@ -35,8 +35,8 @@ const SSID: &str = "esp-radio 802.11 injection";
 /// This is an arbitrary MAC address, used for the fake beacon frames.
 const MAC_ADDRESS: [u8; 6] = [0x00, 0x80, 0x41, 0x13, 0x37, 0x42];
 
-#[main]
-fn main() -> ! {
+#[esp_hal::main]
+async fn main(_spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -50,16 +50,14 @@ fn main() -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // We must initialize some kind of interface and start it.
-    let (mut controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    // The sniffer borrows the controller, so we only need the controller here —
+    // no station/AP `Interface` is required for raw 802.11 transmit.
+    let controller =
+        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default()).unwrap();
 
-    controller.set_mode(wifi::WifiMode::Station).unwrap();
-    controller.start().unwrap();
+    let mut sniffer = controller.sniffer();
 
-    let mut sniffer = interfaces.sniffer;
-
-    // Create a buffer, which can hold the enitre serialized beacon frame.
+    // Create a buffer, which can hold the entire serialized beacon frame.
     let mut beacon = [0u8; 300];
     let length = beacon
         .pwrite(

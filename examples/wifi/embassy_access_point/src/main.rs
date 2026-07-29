@@ -8,6 +8,8 @@
 //! WiFi has no internet connection, Chrome might not want to load the URL - you
 //! can use a shell and try `curl` and `ping`
 
+//% CHIP_FILTER: wifi_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -34,8 +36,7 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println::{print, println};
-use esp_radio::wifi::{ModeConfig, WifiController, WifiDevice, WifiEvent, ap::AccessPointConfig};
-
+use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, ap::AccessPointConfig};
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
@@ -50,7 +51,7 @@ macro_rules! mk_static {
 
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -63,10 +64,17 @@ async fn main(spawner: Spawner) -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    let (controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    let access_point_config =
+        Config::AccessPoint(AccessPointConfig::default().with_ssid("esp-radio"));
 
-    let device = interfaces.access_point;
+    println!("Starting wifi");
+    let device = esp_radio::wifi::Interface::access_point();
+    let controller = esp_radio::wifi::WifiController::new(
+        peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(access_point_config),
+    )
+    .unwrap();
+    println!("Wifi started!");
 
     let gw_ip_addr_str = GW_IP_ADDR_ENV.unwrap_or("192.168.2.1");
     let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
@@ -88,26 +96,20 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
-    spawner.spawn(connection(controller)).ok();
-    spawner.spawn(net_task(runner)).ok();
-    spawner.spawn(run_dhcp(stack, gw_ip_addr_str)).ok();
+    spawner.spawn(connection(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(run_dhcp(stack, gw_ip_addr_str).unwrap());
 
     let mut rx_buffer = [0; 1536];
     let mut tx_buffer = [0; 1536];
 
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
     println!(
         "Connect to the AP `esp-radio` and point your browser to http://{gw_ip_addr_str}:8080/"
     );
     println!("DHCP is enabled so there's no need to configure a static IP, just in case:");
-    while !stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await
-    }
+
+    stack.wait_config_up().await;
+
     stack
         .config_v4()
         .inspect(|c| println!("ipv4 config: {c:?}"));
@@ -227,25 +229,26 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
 }
 
 #[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
+async fn connection(controller: WifiController<'static>) {
     println!("start connection task");
     loop {
-        if !matches!(controller.is_started(), Ok(true)) {
-            let station_config =
-                ModeConfig::AccessPoint(AccessPointConfig::default().with_ssid("esp-radio".into()));
-            controller.set_config(&station_config).unwrap();
-            println!("Starting wifi");
-            controller.start_async().await.unwrap();
-            println!("Wifi started!");
-        } else {
-            // wait until we're no longer connected
-            controller.wait_for_event(WifiEvent::AccessPointStop).await;
-            Timer::after(Duration::from_millis(5000)).await
+        let ev = controller
+            .wait_for_access_point_connected_event_async()
+            .await;
+        match ev {
+            Ok(esp_radio::wifi::ap::EventInfo::Connected(info)) => {
+                println!("Station connected: {:?}", info);
+            }
+            Ok(esp_radio::wifi::ap::EventInfo::Disconnected(info)) => {
+                println!("Station disconnected: {:?}", info);
+            }
+            _ => (),
         }
+        Timer::after(Duration::from_millis(5000)).await
     }
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }

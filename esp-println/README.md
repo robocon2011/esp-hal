@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/esp-println?labelColor=1C2C2E&color=C96329&logo=Rust&style=flat-square)](https://crates.io/crates/esp-println)
 [![docs.rs](https://img.shields.io/docsrs/esp-println?labelColor=1C2C2E&color=C96329&logo=rust&style=flat-square)](https://docs.espressif.com/projects/rust/esp-println/latest/)
-![MSRV](https://img.shields.io/badge/MSRV-1.86.0-blue?labelColor=1C2C2E&style=flat-square)
+![MSRV](https://img.shields.io/badge/MSRV-1.95.0-blue?labelColor=1C2C2E&style=flat-square)
 ![Crates.io](https://img.shields.io/crates/l/esp-println?labelColor=1C2C2E&style=flat-square)
 [![Matrix](https://img.shields.io/matrix/esp-rs:matrix.org?label=join%20matrix&labelColor=1C2C2E&color=BEC5C9&logo=matrix&style=flat-square)](https://matrix.to/#/#esp-rs:matrix.org)
 
@@ -12,7 +12,7 @@ logging capabilities for Espressif devices.
 - Supports all Espressif ESP32 family devices.
 - Supports different communication methods:
   - UART
-  - JTAG-Serial (Only available in ESP32-C3, ESP32-C6, ESP32-H2, ESP32-S3)
+  - JTAG-Serial (Only available in ESP32-C3, ESP32-C5, ESP32-C6, ESP32-C61, ESP32-H2, ESP32-S3)
   - No-op: Turns printing into a no-op
 - Supports [`defmt`] backend
 
@@ -54,7 +54,7 @@ In this case the following environment variables are used:
 
 - `ESP_LOG` log messages you want to show, similar to `RUST_LOG`. RegEx is not supported. e.g. `warn,test::foo=info,test::foo::bar=debug`
 
-If this simple logger implementation isn't sufficient for your needs, you can implement your own logger on top of `esp-println`. See [Implementing a Logger section log documentaion]
+If this simple logger implementation isn't sufficient for your needs, you can implement your own logger on top of `esp-println`. See [Implementing a Logger section log documentation]
 
 ## `defmt`
 
@@ -73,7 +73,7 @@ https://github.com/knurling-rs/defmt?tab=readme-ov-file#msrv
 [`log` crate]: https://github.com/rust-lang/log
 [rzCOBS]: https://github.com/Dirbaio/rzcobs
 [`espflash`]: https://github.com/esp-rs/espflash
-[Implementing a Logger section log documentaion]: https://docs.rs/log/0.4.17/log/#implementing-a-logger
+[Implementing a Logger section log documentation]: https://docs.rs/log/0.4.17/log/#implementing-a-logger
 [`defmt` book's setup instructions]: https://defmt.ferrous-systems.com/setup
 
 # Troubleshooting linker errors

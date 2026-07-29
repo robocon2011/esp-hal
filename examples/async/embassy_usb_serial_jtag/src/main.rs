@@ -2,6 +2,8 @@
 //! You need to connect via the Serial/JTAG interface to see any output.
 //! Most dev-kits use a USB-UART-bridge - in that case you won't see any output.
 
+//% CHIP_FILTER: usb_serial_jtag_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -12,7 +14,7 @@ use esp_hal::{
     Async,
     interrupt::software::SoftwareInterruptControl,
     timer::timg::TimerGroup,
-    usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
+    usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
 use static_cell::StaticCell;
 
@@ -60,7 +62,7 @@ async fn reader(
     }
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(spawner: Spawner) {
     esp_println::println!("Init!");
 
@@ -79,6 +81,6 @@ async fn main(spawner: Spawner) {
         StaticCell::new();
     let signal = &*SIGNAL.init(Signal::new());
 
-    spawner.spawn(reader(rx, &signal)).unwrap();
-    spawner.spawn(writer(tx, &signal)).unwrap();
+    spawner.spawn(reader(rx, &signal).unwrap());
+    spawner.spawn(writer(tx, &signal).unwrap());
 }

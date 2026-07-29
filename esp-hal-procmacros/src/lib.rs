@@ -22,31 +22,37 @@
 //!    sections, such as SRAM or RTC RAM (slow or fast) with different initialization options. See
 //!    its documentation for details.
 //!
-//!  - [`esp_rtos::main`](macro@rtos_main) - Creates a new instance of `esp_rtos::embassy::Executor`
-//!    and declares an application entry point spawning the corresponding function body as an async
-//!    task.
+//!  - [`main`](macro@main) - A unified entry point macro. For blocking functions it sets the
+//!    bare-metal entry point; for async functions it creates an `esp_rtos::embassy::Executor` and
+//!    spawns the function body as a task.
 //!
 //! ## Examples
 //!
-//! #### `main` macro
+//! #### Blocking entry point
 //!
-//! Requires the `embassy` feature to be enabled.
+//! ```rust,ignore
+//! #[main]
+//! fn main() -> ! {
+//!     loop { /* .. */ }
+//! }
+//! ```
+//!
+//! #### Async entry point (requires the `embassy` feature in `esp-rtos`)
 //!
 //! ```rust,ignore
 //! #[main]
 //! async fn main(spawner: Spawner) {
-//!     // Your application's entry point
+//!     // Your application's async entry point
 //! }
 //! ```
 //!
 //! ## Feature Flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 
 use proc_macro::TokenStream;
 
 mod alert;
-mod blocking;
 mod builder;
 mod doc_replace;
 mod interrupt;
@@ -58,7 +64,7 @@ mod interrupt;
 ))]
 mod lp_core;
 mod ram;
-mod rtos_main;
+mod unified_main;
 
 /// Sets which segment of RAM to use for a function or static and how it should
 /// be initialized.
@@ -123,10 +129,13 @@ pub fn ram(args: TokenStream, input: TokenStream) -> TokenStream {
 /// documentation of the annotated item.
 ///
 /// Replacements can be placed in the documentation as `# {placeholder}`. Each
-/// replacement must be its own line, it's not possible to place a placeholder in the middle of a
-/// line. The `before_snippet` and `after_snippet` placeholders are expanded to the
-/// `esp_hal::before_snippet!()` and `esp_hal::after_snippet!()` macros, and are expected to be
-/// used in example code blocks.
+/// replacement must be its own line. The `before_snippet` and `after_snippet` placeholders are
+/// expanded to the `esp_hal::before_snippet!()` and `esp_hal::after_snippet!()` macros, and are
+/// expected to be used in example code blocks.
+///
+/// In-line replacements can be placed in the middle of a line as `__placeholder__`. Currently,
+/// only literal strings can be substituted into in-line placeholders, and only one placeholder
+/// can be used per line.
 ///
 /// You can also define custom replacements in the attribute. A replacement can be
 /// an unconditional literal (i.e. a string that is always substituted into the doc comment),
@@ -153,6 +162,8 @@ pub fn ram(args: TokenStream, input: TokenStream) -> TokenStream {
 /// /// # {literal_placeholder}
 /// /// // here is some more code
 /// /// # {conditional_placeholder}
+/// ///
+/// /// The macro even supports __conditional_placeholder__ replacements in-line.
 /// /// ```
 /// fn my_function() {}
 /// ```
@@ -192,48 +203,17 @@ pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
     lp_core::entry(args.into(), input.into()).into()
 }
 
-/// Creates a new instance of `esp_rtos::embassy::Executor` and declares an application entry point
-/// spawning the corresponding function body as an async task.
+/// Attribute to declare the entry point of the program.
 ///
-/// The following restrictions apply:
+/// Accepts both **blocking** and **async** main functions:
 ///
-/// * The function must accept exactly 1 parameter, an `embassy_executor::Spawner` handle that it
-///   can use to spawn additional tasks.
-/// * The function must be declared `async`.
-/// * The function must not use generics.
-/// * Only a single `main` task may be declared.
+/// - A **blocking** function (`fn main() -> !`) is treated as a bare-metal entry point.
+/// - An **async** function (`async fn main(spawner: Spawner)`) is spawned inside an
+///   `esp_rtos::embassy::Executor`.
 ///
 /// ## Examples
-/// Spawning a task:
 ///
-/// ```rust,ignore
-/// #[esp_rtos::main]
-/// async fn main(_s: embassy_executor::Spawner) {
-///     // Function body
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn rtos_main(args: TokenStream, item: TokenStream) -> TokenStream {
-    rtos_main::main(args.into(), item.into()).into()
-}
-
-/// Attribute to declare the entry point of the program
-///
-/// The specified function will be called by the reset handler *after* RAM has
-/// been initialized. If present, the FPU will also be enabled before the
-/// function is called.
-///
-/// The type of the specified function must be `[unsafe] fn() -> !` (never
-/// ending function)
-///
-/// # Properties
-///
-/// The entry point will be called by the reset handler. The program can't
-/// reference to the entry point, much less invoke it.
-///
-/// # Examples
-///
-/// - Simple entry point
+/// ### Blocking (bare-metal)
 ///
 /// ```ignore
 /// #[main]
@@ -241,10 +221,18 @@ pub fn rtos_main(args: TokenStream, item: TokenStream) -> TokenStream {
 ///     loop { /* .. */ }
 /// }
 /// ```
+///
+/// ### Async (embassy executor)
+///
+/// ```ignore
+/// #[main]
+/// async fn main(spawner: Spawner) {
+///     // spawn tasks, await futures, …
+/// }
+/// ```
 #[proc_macro_attribute]
-pub fn blocking_main(args: TokenStream, input: TokenStream) -> TokenStream {
-    let f = syn::parse_macro_input!(input as syn::ItemFn);
-    blocking::main(args.into(), f).into()
+pub fn main(args: TokenStream, input: TokenStream) -> TokenStream {
+    unified_main::main(args.into(), input.into()).into()
 }
 
 /// Automatically implement the [Builder Lite] pattern for a struct.

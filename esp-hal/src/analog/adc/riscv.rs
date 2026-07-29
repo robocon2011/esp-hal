@@ -1,9 +1,10 @@
 use core::marker::PhantomData;
 
-cfg_if::cfg_if! {
-    if #[cfg(esp32c6)] {
+cfg_select! {
+    esp32c6 => {
         use Interrupt::APB_SARADC as InterruptSource;
-    } else {
+    }
+    _ => {
         use Interrupt::APB_ADC as InterruptSource;
     }
 }
@@ -20,14 +21,15 @@ use procmacros::handler;
 
 pub use self::calibration::*;
 use super::{AdcCalSource, AdcConfig, Attenuation};
-#[cfg(any(esp32c2, esp32c3, esp32c6, esp32h2))]
-use crate::efuse::{AdcCalibUnit, Efuse};
+#[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6, esp32h2))]
+use crate::efuse::AdcCalibUnit;
 use crate::{
     Async,
     Blocking,
     asynch::AtomicWaker,
     interrupt::{InterruptConfigurable, InterruptHandler},
     peripherals::{APB_SARADC, Interrupt},
+    rtc_cntl::WakeLock,
     soc::regi2c,
     system::{GenericPeripheralGuard, Peripheral},
 };
@@ -39,58 +41,63 @@ mod calibration;
 // https://github.com/espressif/esp-idf/blob/903af13e8/components/soc/esp32c3/include/soc/regi2c_saradc.h
 // https://github.com/espressif/esp-idf/blob/903af13e8/components/soc/esp32c6/include/soc/regi2c_saradc.h
 // https://github.com/espressif/esp-idf/blob/903af13e8/components/soc/esp32h2/include/soc/regi2c_saradc.h
-cfg_if::cfg_if! {
-    if #[cfg(adc_adc1)] {
+cfg_select! {
+    adc_adc1 => {
         const ADC_VAL_MASK: u16 = 0xfff;
         const ADC_CAL_CNT_MAX: u16 = 32;
         const ADC_CAL_CHANNEL: u16 = 15;
     }
+    _ => {}
 }
 
 // The number of analog IO pins, and in turn the number of attentuations,
 // depends on which chip is being used
-cfg_if::cfg_if! {
-    if #[cfg(esp32c6)] {
+cfg_select! {
+    esp32c6 => {
         pub(super) const NUM_ATTENS: usize = 7;
-    } else {
+    }
+    esp32c5 => {
+        pub(super) const NUM_ATTENS: usize = 6;
+    }
+    _ => {
         pub(super) const NUM_ATTENS: usize = 5;
     }
 }
 
-impl<ADCI> AdcConfig<ADCI>
+impl<ADCX> AdcConfig<ADCX>
 where
-    ADCI: RegisterAccess,
+    ADCX: RegisterAccess,
 {
     /// Calibrate ADC with specified attenuation and voltage source
     pub fn adc_calibrate(atten: Attenuation, source: AdcCalSource) -> u16
     where
-        ADCI: super::CalibrationAccess,
+        ADCX: super::CalibrationAccess,
     {
         let mut adc_max: u16 = 0;
         let mut adc_min: u16 = u16::MAX;
         let mut adc_sum: u32 = 0;
 
-        ADCI::enable_vdef(true);
+        ADCX::enable_vdef(true);
 
         // Start sampling
-        ADCI::config_onetime_sample(ADC_CAL_CHANNEL as u8, atten as u8);
+        ADCX::config_onetime_sample(ADC_CAL_CHANNEL as u8, atten as u8);
 
         // Connect calibration source
-        ADCI::connect_cal(source, true);
+        ADCX::connect_cal(source, true);
 
-        ADCI::calibration_init();
+        ADCX::calibration_init();
         for _ in 0..ADC_CAL_CNT_MAX {
-            ADCI::set_init_code(0);
+            ADCX::set_init_code(0);
 
             // Trigger ADC sampling
-            ADCI::start_onetime_sample();
+            ADCX::start_onetime_sample();
 
-            // Wait until ADC1 sampling is done
-            while !ADCI::is_done() {}
+            // Wait until ADC sampling is done
+            while !ADCX::is_done() {}
 
-            let adc = ADCI::read_data() & ADC_VAL_MASK;
+            let adc = ADCX::read_data() & ADC_VAL_MASK;
 
-            ADCI::reset();
+            ADCX::reset();
 
             adc_sum += adc as u32;
             adc_max = adc.max(adc_max);
@@ -100,7 +107,7 @@ where
         let cal_val = (adc_sum - adc_max as u32 - adc_min as u32) as u16 / (ADC_CAL_CNT_MAX - 2);
 
         // Disconnect calibration source
-        ADCI::connect_cal(source, false);
+        ADCX::connect_cal(source, false);
 
         cal_val
     }
@@ -174,11 +181,22 @@ impl RegisterAccess for crate::peripherals::ADC1<'_> {
     // Currently #[cfg] covers all supported RISC-V devices,
     // but, for example, esp32p4 uses the value 4 instead of 1,
     // so it is not standard across all RISC-V devices.
-    #[cfg(any(esp32c2, esp32c3, esp32c6, esp32h2))]
+    #[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6, esp32h2))]
     fn calibration_init() {
         // e.g.
         // https://github.com/espressif/esp-idf/blob/800f141f94c0f880c162de476512e183df671307/components/hal/esp32c3/include/hal/adc_ll.h#L702
         regi2c::ADC_SAR1_DREF.write_field(1);
+    }
+
+    // ESP32-P4 uses DREF value 4 (same as S2/S3) not 1.
+    //      REGI2C_SAR_I2C (0x69) reg 2, bits [6:4] = DREF
+    #[cfg(esp32p4)]
+    fn calibration_init() {
+        use crate::soc::regi2c;
+        // REG2 bits [6:4] = ADC_SAR1_DREF; clear then set to 4
+        let val = regi2c::regi2c_read(regi2c::REGI2C_SAR_I2C, 0, 2);
+        let new_val = (val & !(0x7 << 4)) | (4 << 4);
+        regi2c::regi2c_write(regi2c::REGI2C_SAR_I2C, 0, 2, new_val);
     }
 
     fn set_init_code(data: u16) {
@@ -258,6 +276,16 @@ impl RegisterAccess for crate::peripherals::ADC2<'_> {
         regi2c::ADC_SAR2_DREF.write_field(1);
     }
 
+    // ESP32-P4 uses DREF value 4 for ADC2 as well.
+    // REG5 bits [6:4] = ADC_SAR2_DREF
+    #[cfg(esp32p4)]
+    fn calibration_init() {
+        use crate::soc::regi2c;
+        let val = regi2c::regi2c_read(regi2c::REGI2C_SAR_I2C, 0, 5);
+        let new_val = (val & !(0x7 << 4)) | (4 << 4);
+        regi2c::regi2c_write(regi2c::REGI2C_SAR_I2C, 0, 5, new_val);
+    }
+
     fn set_init_code(data: u16) {
         let [msb, lsb] = data.to_be_bytes();
 
@@ -285,21 +313,21 @@ impl super::CalibrationAccess for crate::peripherals::ADC2<'_> {
 }
 
 /// Analog-to-Digital Converter peripheral driver.
-pub struct Adc<'d, ADCI, Dm: crate::DriverMode> {
-    _adc: ADCI,
+pub struct Adc<'d, ADCX, Dm: crate::DriverMode> {
+    _adc: ADCX,
     attenuations: [Option<Attenuation>; NUM_ATTENS],
     active_channel: Option<u8>,
     _guard: GenericPeripheralGuard<{ Peripheral::ApbSarAdc as u8 }>,
     _phantom: PhantomData<(Dm, &'d mut ())>,
 }
 
-impl<'d, ADCI> Adc<'d, ADCI, Blocking>
+impl<'d, ADCX> Adc<'d, ADCX, Blocking>
 where
-    ADCI: RegisterAccess + 'd,
+    ADCX: RegisterAccess + 'd,
 {
     /// Configure a given ADC instance using the provided configuration, and
     /// initialize the ADC for use
-    pub fn new(adc_instance: ADCI, config: AdcConfig<ADCI>) -> Self {
+    pub fn new(adc_instance: ADCX, config: AdcConfig<ADCX>) -> Self {
         let guard = GenericPeripheralGuard::new();
 
         APB_SARADC::regs().ctrl().modify(|_, w| unsafe {
@@ -319,14 +347,14 @@ where
     }
 
     /// Reconfigures the ADC driver to operate in asynchronous mode.
-    pub fn into_async(mut self) -> Adc<'d, ADCI, Async> {
+    pub fn into_async(mut self) -> Adc<'d, ADCX, Async> {
         acquire_async_adc();
         self.set_interrupt_handler(adc_interrupt_handler);
 
         // Reset interrupt flags and disable oneshot reading to normalize state before
         // entering async mode, otherwise there can be '0' readings, happening initially
         // using ADC2
-        ADCI::reset();
+        ADCX::reset();
 
         Adc {
             _adc: self._adc,
@@ -344,11 +372,11 @@ where
     /// underlies the pin.
     pub fn read_oneshot<PIN, CS>(
         &mut self,
-        pin: &mut super::AdcPin<PIN, ADCI, CS>,
+        pin: &mut super::AdcPin<PIN, ADCX, CS>,
     ) -> nb::Result<u16, ()>
     where
         PIN: super::AdcChannel,
-        CS: super::AdcCalScheme<ADCI>,
+        CS: super::AdcCalScheme<ADCX>,
     {
         if self.attenuations[pin.pin.adc_channel() as usize].is_none() {
             panic!(
@@ -369,32 +397,32 @@ where
             self.active_channel = Some(pin.pin.adc_channel());
 
             // Set ADC unit calibration according used scheme for pin
-            ADCI::calibration_init();
-            ADCI::set_init_code(pin.cal_scheme.adc_cal());
+            ADCX::calibration_init();
+            ADCX::set_init_code(pin.cal_scheme.adc_cal());
 
             let channel = self.active_channel.unwrap();
             let attenuation = self.attenuations[channel as usize].unwrap() as u8;
-            ADCI::config_onetime_sample(channel, attenuation);
-            ADCI::start_onetime_sample();
+            ADCX::config_onetime_sample(channel, attenuation);
+            ADCX::start_onetime_sample();
 
             // see https://github.com/espressif/esp-idf/blob/b4268c874a4cf8fcf7c0c4153cffb76ad2ddda4e/components/hal/adc_oneshot_hal.c#L105-L107
             // the delay might be a bit generous but longer delay seem to not cause problems
             #[cfg(esp32c6)]
             {
                 crate::rom::ets_delay_us(40);
-                ADCI::start_onetime_sample();
+                ADCX::start_onetime_sample();
             }
         }
 
         // Wait for ADC to finish conversion
-        let conversion_finished = ADCI::is_done();
+        let conversion_finished = ADCX::is_done();
         if !conversion_finished {
             return Err(nb::Error::WouldBlock);
         }
 
         // Get converted value
-        let converted_value = ADCI::read_data();
-        ADCI::reset();
+        let converted_value = ADCX::read_data();
+        ADCX::reset();
 
         // Postprocess converted value according to calibration scheme used for pin
         let converted_value = pin.cal_scheme.adc_val(converted_value);
@@ -416,57 +444,58 @@ where
     }
 }
 
-impl<ADCI> crate::private::Sealed for Adc<'_, ADCI, Blocking> {}
+impl<ADCX> crate::private::Sealed for Adc<'_, ADCX, Blocking> {}
 
-impl<ADCI> InterruptConfigurable for Adc<'_, ADCI, Blocking> {
+impl<ADCX> InterruptConfigurable for Adc<'_, ADCX, Blocking> {
     fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
         for core in crate::system::Cpu::other() {
             crate::interrupt::disable(core, InterruptSource);
         }
-        unsafe { crate::interrupt::bind_interrupt(InterruptSource, handler.handler()) };
-        unwrap!(crate::interrupt::enable(
-            InterruptSource,
-            handler.priority()
-        ));
+        crate::interrupt::bind_handler(InterruptSource, handler);
     }
 }
 
 #[cfg(adc_adc1)]
 impl super::AdcCalEfuse for crate::peripherals::ADC1<'_> {
     fn init_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_init_code(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_init_code(AdcCalibUnit::ADC1, atten)
     }
 
     fn cal_mv(atten: Attenuation) -> u16 {
-        Efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC1, atten)
     }
 
     fn cal_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_cal_code(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_cal_code(AdcCalibUnit::ADC1, atten)
+    }
+
+    #[cfg(esp32c5)]
+    fn cal_chan_compens(atten: Attenuation, channel: u16) -> Option<i32> {
+        crate::efuse::rtc_calib_get_chan_compens(AdcCalibUnit::ADC1, channel, atten)
     }
 }
 
 #[cfg(adc_adc2)]
 impl super::AdcCalEfuse for crate::peripherals::ADC2<'_> {
     fn init_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_init_code(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_init_code(AdcCalibUnit::ADC2, atten)
     }
 
     fn cal_mv(atten: Attenuation) -> u16 {
-        Efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC2, atten)
     }
 
     fn cal_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_cal_code(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_cal_code(AdcCalibUnit::ADC2, atten)
     }
 }
 
-impl<'d, ADCI> Adc<'d, ADCI, Async>
+impl<'d, ADCX> Adc<'d, ADCX, Async>
 where
-    ADCI: RegisterAccess + 'd,
+    ADCX: RegisterAccess + 'd,
 {
     /// Create a new instance in [crate::Blocking] mode.
-    pub fn into_blocking(self) -> Adc<'d, ADCI, Blocking> {
+    pub fn into_blocking(self) -> Adc<'d, ADCX, Blocking> {
         if release_async_adc() {
             // Disable ADC interrupt on all cores if the last async ADC instance is disabled
             for cpu in crate::system::Cpu::all() {
@@ -487,11 +516,11 @@ where
     /// This method takes an [AdcPin](super::AdcPin) reference, as it is
     /// expected that the ADC will be able to sample whatever channel
     /// underlies the pin.
-    pub async fn read_oneshot<PIN, CS>(&mut self, pin: &mut super::AdcPin<PIN, ADCI, CS>) -> u16
+    pub async fn read_oneshot<PIN, CS>(&mut self, pin: &mut super::AdcPin<PIN, ADCX, CS>) -> u16
     where
-        ADCI: Instance,
+        ADCX: Instance,
         PIN: super::AdcChannel,
-        CS: super::AdcCalScheme<ADCI>,
+        CS: super::AdcCalScheme<ADCX>,
     {
         let channel = pin.pin.adc_channel();
         if self.attenuations[channel as usize].is_none() {
@@ -499,17 +528,17 @@ where
         }
 
         // Set ADC unit calibration according used scheme for pin
-        ADCI::calibration_init();
-        ADCI::set_init_code(pin.cal_scheme.adc_cal());
+        ADCX::calibration_init();
+        ADCX::set_init_code(pin.cal_scheme.adc_cal());
 
         let attenuation = self.attenuations[channel as usize].unwrap() as u8;
-        ADCI::config_onetime_sample(channel, attenuation);
-        ADCI::start_onetime_sample();
+        ADCX::config_onetime_sample(channel, attenuation);
+        ADCX::start_onetime_sample();
 
         // Wait for ADC to finish conversion and get value
         let adc_ready_future = AdcFuture::new(self);
         adc_ready_future.await;
-        let converted_value = ADCI::read_data();
+        let converted_value = ADCX::read_data();
 
         // There is a hardware limitation. If the APB clock frequency is high, the step
         // of this reg signal: ``onetime_start`` may not be captured by the
@@ -521,7 +550,7 @@ where
         // We reset ``onetime_start`` in `reset` and assume enough time has passed until
         // the next sample is requested.
 
-        ADCI::reset();
+        ADCX::reset();
 
         // Postprocess converted value according to calibration scheme used for pin
         pin.cal_scheme.adc_val(converted_value)
@@ -537,10 +566,11 @@ pub(super) fn acquire_async_adc() {
 }
 
 pub(super) fn release_async_adc() -> bool {
-    cfg_if::cfg_if! {
-        if #[cfg(all(adc_adc1, adc_adc2))] {
+    cfg_select! {
+        all(adc_adc1, adc_adc2) => {
             ASYNC_ADC_COUNT.fetch_sub(1, Ordering::Relaxed) == 1
-        } else {
+        }
+        _ => {
             true
         }
     }
@@ -562,9 +592,9 @@ pub(crate) fn adc_interrupt_handler() {
     }
 }
 
-fn handle_async<ADCI: Instance>(_instance: ADCI) {
-    ADCI::waker().wake();
-    ADCI::unlisten();
+fn handle_async<ADCX: Instance>(_instance: ADCX) {
+    ADCX::waker().wake();
+    ADCX::unlisten();
 }
 
 /// Enable asynchronous access.
@@ -637,35 +667,37 @@ impl Instance for crate::peripherals::ADC2<'_> {
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub(crate) struct AdcFuture<ADCI: Instance> {
-    phantom: PhantomData<ADCI>,
+pub(crate) struct AdcFuture<ADCX: Instance> {
+    phantom: PhantomData<ADCX>,
+    _wake_lock: WakeLock,
 }
 
-impl<ADCI: Instance> AdcFuture<ADCI> {
-    pub fn new(_self: &super::Adc<'_, ADCI, Async>) -> Self {
+impl<ADCX: Instance> AdcFuture<ADCX> {
+    pub fn new(_self: &super::Adc<'_, ADCX, Async>) -> Self {
         Self {
             phantom: PhantomData,
+            _wake_lock: WakeLock::new(),
         }
     }
 }
 
-impl<ADCI: Instance + super::RegisterAccess> core::future::Future for AdcFuture<ADCI> {
+impl<ADCX: Instance + super::RegisterAccess> core::future::Future for AdcFuture<ADCX> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if ADCI::is_done() {
-            ADCI::clear_interrupt();
+        if ADCX::is_done() {
+            ADCX::clear_interrupt();
             Poll::Ready(())
         } else {
-            ADCI::waker().register(cx.waker());
-            ADCI::listen();
+            ADCX::waker().register(cx.waker());
+            ADCX::listen();
             Poll::Pending
         }
     }
 }
 
-impl<ADCI: Instance> Drop for AdcFuture<ADCI> {
+impl<ADCX: Instance> Drop for AdcFuture<ADCX> {
     fn drop(&mut self) {
-        ADCI::unlisten();
+        ADCX::unlisten();
     }
 }

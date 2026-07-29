@@ -5,9 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-defmt = "1"
+defmt = "1.1"
 
-embassy-executor = "0.9.0"
+embassy-executor = "0.10.0"
 embassy-time = "0.5.0"
 esp-backtrace = { path = "../../../esp-backtrace", features = [
     "panic-handler",
@@ -40,6 +40,13 @@ esp32c3 = [
     "esp-rtos/esp32c3",
     "esp-hal/esp32c3",
 ]
+esp32c5 = [
+    "esp-backtrace/esp32c5",
+    "esp-println/esp32c5",
+    "esp-bootloader-esp-idf/esp32c5",
+    "esp-rtos/esp32c5",
+    "esp-hal/esp32c5",
+]
 esp32c6 = [
     "esp-backtrace/esp32c6",
     "esp-println/esp32c6",
@@ -47,12 +54,26 @@ esp32c6 = [
     "esp-rtos/esp32c6",
     "esp-hal/esp32c6",
 ]
+esp32c61 = [
+    "esp-backtrace/esp32c61",
+    "esp-println/esp32c61",
+    "esp-bootloader-esp-idf/esp32c61",
+    "esp-rtos/esp32c61",
+    "esp-hal/esp32c61",
+]
 esp32h2 = [
     "esp-backtrace/esp32h2",
     "esp-println/esp32h2",
     "esp-bootloader-esp-idf/esp32h2",
     "esp-rtos/esp32h2",
     "esp-hal/esp32h2",
+]
+esp32p4 = [
+    "esp-backtrace/esp32p4",
+    "esp-println/esp32p4",
+    "esp-bootloader-esp-idf/esp32p4",
+    "esp-rtos/esp32p4",
+    "esp-hal/esp32p4",
 ]
 esp32s2 = [
     "esp-backtrace/esp32s2",

@@ -1,13 +1,13 @@
 #![cfg_attr(docsrs, procmacros::doc_replace(
-    "clock_cfg" => {
-        cfg(not(esp32h2)) => "let clock_cfg = PeripheralClockConfig::with_frequency(Rate::from_mhz(40))?;",
-        cfg(esp32h2) => "let clock_cfg = PeripheralClockConfig::with_frequency(Rate::from_mhz(32))?;"
+    "mcpwm_freq" => {
+        cfg(not(esp32h2)) => "40",
+        cfg(esp32h2) => "32"
     },
     "clock_src" => {
-        cfg(esp32) => "Clock source is PLL_F160M (160 MHz) by default.",
-        cfg(esp32s3) => "Clock source is CRYPTO_PWM_CLK (160 MHz) by default.",
-        cfg(esp32c6) => "Clock source is PLL_F160M (160 MHz) by default.",
-        cfg(esp32h2) => "Clock source is PLL_F96M_CLK (96 MHz) by default.",
+        cfg(esp32) => "PLL_F160M (160 MHz)",
+        cfg(esp32s3) => "CRYPTO_PWM_CLK (160 MHz)",
+        cfg(esp32c6) => "PLL_F160M (160 MHz)",
+        cfg(esp32h2) => "PLL_F96M_CLK (96 MHz)",
     }
 ))]
 //! # Motor Control Pulse Width Modulator (MCPWM)
@@ -46,7 +46,7 @@
 //! * Fault Detection Module (Not yet implemented)
 //! * Capture Module (Not yet implemented)
 //!
-//! # {clock_src}
+//! Clock source is __clock_src__ by default.
 //!
 //! ## Examples
 //!
@@ -62,11 +62,12 @@
 //! # let pin = peripherals.GPIO0;
 //!
 //! // initialize peripheral
-//! # {clock_cfg}
+//! let clock_cfg = PeripheralClockConfig::with_frequency(Rate::from_mhz(__mcpwm_freq__))?;
 //! let mut mcpwm = McPwm::new(peripherals.MCPWM0, clock_cfg);
 //!
 //! // connect operator0 to timer0
 //! mcpwm.operator0.set_timer(&mcpwm.timer0);
+//!
 //! // connect operator0 to pin
 //! let mut pwm_pin = mcpwm
 //!     .operator0
@@ -89,9 +90,9 @@ use timer::Timer;
 use crate::{
     gpio::OutputSignal,
     pac,
-    private::OnDrop,
+    private::DropGuard,
     soc::clocks::{self, ClockTree},
-    system::{self, Peripheral, PeripheralGuard},
+    system::{Peripheral, PeripheralGuard},
     time::Rate,
 };
 
@@ -103,24 +104,23 @@ pub mod timer;
 type RegisterBlock = pac::mcpwm0::RegisterBlock;
 
 #[allow(dead_code)] // Field is seemingly unused but we rely on its Drop impl
-struct PwmClockGuard(OnDrop<fn()>);
+struct PwmClockGuard(DropGuard<(), fn(())>);
 
 impl PwmClockGuard {
-    pub fn new<PWM: PwmPeripheral>() -> Self {
-        if PWM::peripheral() == Peripheral::Mcpwm0 {
-            ClockTree::with(clocks::request_mcpwm0_function_clock);
-        } else {
+    fn instance<PWM: PwmPeripheral>() -> clocks::McpwmInstance {
+        match PWM::peripheral() {
+            Peripheral::Mcpwm0 => clocks::McpwmInstance::Mcpwm0,
             #[cfg(soc_has_mcpwm1)]
-            ClockTree::with(clocks::request_mcpwm1_function_clock);
+            Peripheral::Mcpwm1 => clocks::McpwmInstance::Mcpwm1,
+            _ => unreachable!(),
         }
+    }
 
-        Self(OnDrop::new(|| {
-            if PWM::peripheral() == Peripheral::Mcpwm0 {
-                ClockTree::with(clocks::release_mcpwm0_function_clock);
-            } else {
-                #[cfg(soc_has_mcpwm1)]
-                ClockTree::with(clocks::release_mcpwm1_function_clock);
-            }
+    pub fn new<PWM: PwmPeripheral>() -> Self {
+        ClockTree::with(move |clocks| Self::instance::<PWM>().request_function_clock(clocks));
+
+        Self(DropGuard::new((), |_| {
+            ClockTree::with(move |clocks| Self::instance::<PWM>().release_function_clock(clocks));
         }))
     }
 }
@@ -181,7 +181,7 @@ impl PeripheralClockConfig {
     fn source_clock() -> Rate {
         // FIXME: this works right now because we configure the default clock source during startup.
         // Needs to be revisited when refactoring the MCPWM driver before stabilization.
-        ClockTree::with(|clocks| Rate::from_hz(clocks::mcpwm0_function_clock_frequency(clocks)))
+        Rate::from_hz(clocks::McpwmInstance::Mcpwm0.function_clock_frequency())
     }
 
     /// Get a clock configuration with the given prescaler.
@@ -287,7 +287,7 @@ pub trait PwmPeripheral: crate::private::Sealed {
     /// Get operator GPIO mux output signal
     fn output_signal<const OP: u8, const IS_A: bool>() -> OutputSignal;
     /// Peripheral
-    fn peripheral() -> system::Peripheral;
+    fn peripheral() -> Peripheral;
 }
 
 #[cfg(soc_has_mcpwm0)]
@@ -308,8 +308,8 @@ impl PwmPeripheral for crate::peripherals::MCPWM0<'_> {
         }
     }
 
-    fn peripheral() -> system::Peripheral {
-        system::Peripheral::Mcpwm0
+    fn peripheral() -> Peripheral {
+        Peripheral::Mcpwm0
     }
 }
 
@@ -331,7 +331,7 @@ impl PwmPeripheral for crate::peripherals::MCPWM1<'_> {
         }
     }
 
-    fn peripheral() -> system::Peripheral {
-        system::Peripheral::Mcpwm1
+    fn peripheral() -> Peripheral {
+        Peripheral::Mcpwm1
     }
 }

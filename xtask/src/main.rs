@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser};
+use esp_devtool as xtask;
 use esp_metadata::{Chip, Config};
 use object::{Object, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
 use rustc_demangle::try_demangle;
@@ -47,7 +48,11 @@ enum Cli {
     SemverCheck(SemverCheckArgs),
     /// Check the changelog for packages.
     CheckChangelog(CheckChangelogArgs),
-    /// Re-generate metadata and the chip support table in the esp-hal README.
+    /// Validate the changelog format of a PR description.
+    ///
+    /// Reads the body from stdin by default. Pass `--pr` to fetch from GitHub.
+    CheckPrChangelog(CheckPrChangelogArgs),
+    /// Re-generate metadata and tables in the esp-hal README.
     UpdateMetadata(UpdateMetadataArgs),
     /// Run host-tests in the workspace with `cargo test`
     HostTests(HostTestsArgs),
@@ -57,84 +62,23 @@ enum Cli {
     #[cfg(feature = "report")]
     /// Generate reports from CI data.
     GenerateReport(generate_report::ReportArgs),
+    /// Tasks for checking compile tests with a local registry.
+    #[cfg(feature = "rel-check")]
+    #[clap(subcommand)]
+    RelCheck(relcheck::RelCheckCmds),
+
+    /// Start the MCP server (stdio transport, for use with Claude Code).
+    #[cfg(feature = "mcp")]
+    Mcp,
 }
 
 #[derive(Debug, Args)]
-struct CiArgs {
-    /// Chip to target.
-    #[arg(value_enum)]
-    chip: Chip,
-
-    /// The toolchain used to run the lints
+struct CheckPrChangelogArgs {
+    /// GitHub pull-request number to fetch and validate.
+    ///
+    /// When omitted, the PR body is read from stdin.
     #[arg(long)]
-    toolchain: Option<String>,
-
-    /// Whether to skip running lints
-    #[arg(long)]
-    no_lint: bool,
-
-    /// Whether to skip building documentation
-    #[arg(long)]
-    no_docs: bool,
-}
-
-#[derive(Debug, Args)]
-struct FmtPackagesArgs {
-    /// Run in 'check' mode; exists with 0 if formatted correctly, 1 otherwise
-    #[arg(long)]
-    check: bool,
-
-    /// Package(s) to target.
-    #[arg(value_enum, default_values_t = Package::iter())]
-    packages: Vec<Package>,
-}
-
-#[derive(Debug, Args)]
-struct CleanArgs {
-    /// Package(s) to target.
-    #[arg(value_enum, default_values_t = Package::iter())]
-    packages: Vec<Package>,
-}
-
-#[derive(Debug, Args)]
-struct HostTestsArgs {
-    /// Package(s) to target.
-    #[arg(value_enum, default_values_t = Package::iter())]
-    packages: Vec<Package>,
-}
-
-#[derive(Debug, Args)]
-struct CheckPackagesArgs {
-    /// Package(s) to target.
-    #[arg(value_enum, default_values_t = Package::iter())]
-    packages: Vec<Package>,
-
-    /// Check for a specific chip
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = Chip::iter())]
-    chips: Vec<Chip>,
-
-    /// The toolchain used to run the checks
-    #[arg(long)]
-    toolchain: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct LintPackagesArgs {
-    /// Package(s) to target.
-    #[arg(value_enum, default_values_t = Package::iter())]
-    packages: Vec<Package>,
-
-    /// Lint for a specific chip
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = Chip::iter())]
-    chips: Vec<Chip>,
-
-    /// Automatically apply fixes
-    #[arg(long)]
-    fix: bool,
-
-    /// The toolchain used to run the lints
-    #[arg(long)]
-    toolchain: Option<String>,
+    pr: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -148,20 +92,25 @@ struct CheckChangelogArgs {
     normalize: bool,
 }
 
-#[derive(Debug, Args)]
-struct UpdateMetadataArgs {
-    /// Run in 'check' mode; exists with 0 if formatted correctly, 1 otherwise
-    #[arg(long)]
-    check: bool,
-}
-
 // ----------------------------------------------------------------------------
 // Application
 
 fn main() -> Result<()> {
+    // In MCP mode stdout is the JSON-RPC channel — log to stderr instead so
+    // we don't corrupt the protocol.  We detect MCP early (before clap parse)
+    // so the logger is set up correctly before anything else runs.
+    #[cfg(feature = "mcp")]
+    let is_mcp = std::env::args().any(|a| a == "mcp");
+    #[cfg(not(feature = "mcp"))]
+    let is_mcp = false;
+
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    builder.target(env_logger::Target::Stdout);
+    if is_mcp {
+        builder.target(env_logger::Target::Stderr);
+    } else {
+        builder.target(env_logger::Target::Stdout);
+    }
     builder.init();
 
     let workspace =
@@ -197,6 +146,7 @@ fn main() -> Result<()> {
 
         // Release-related subcommands:
         Cli::Release(release) => match release {
+            Release::ChangelogPreview(args) => changelog_preview(&workspace, args),
             Release::BumpVersion(args) => bump_version(&workspace, args),
             Release::TagReleases(args) => tag_releases(&workspace, args),
             Release::Publish(args) => publish(&workspace, args),
@@ -207,7 +157,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "release")]
             Release::PublishPlan(args) => publish_plan(&workspace, args),
             #[cfg(feature = "release")]
-            Release::PostRelease => post_release(&workspace),
+            Release::PostRelease(args) => post_release(&workspace, args),
             #[cfg(feature = "release")]
             Release::BumpMsrv(args) => bump_msrv::bump_msrv(&workspace, args),
         },
@@ -219,11 +169,20 @@ fn main() -> Result<()> {
         Cli::LintPackages(args) => lint_packages(&workspace, args),
         Cli::SemverCheck(args) => semver_checks(&workspace, args),
         Cli::CheckChangelog(args) => check_changelog(&workspace, &args.packages, args.normalize),
+        Cli::CheckPrChangelog(args) => check_pr_changelog(&workspace, args.pr),
         Cli::UpdateMetadata(args) => update_metadata(&workspace, args.check),
         Cli::HostTests(args) => host_tests(&workspace, args),
         Cli::CheckGlobalSymbols(args) => check_global_symbols(&args.chips),
         #[cfg(feature = "report")]
         Cli::GenerateReport(args) => generate_report::generate_report(&workspace, args),
+        #[cfg(feature = "rel-check")]
+        Cli::RelCheck(relcheck) => relcheck::run_rel_check(relcheck),
+
+        #[cfg(feature = "mcp")]
+        Cli::Mcp => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(xtask::commands::mcp::run_mcp_server()),
     }
 }
 
@@ -236,6 +195,13 @@ fn fmt_packages(workspace: &Path, args: FmtPackagesArgs) -> Result<()> {
 
     for package in packages {
         xtask::format_package(workspace, package, args.check, None)?;
+    }
+
+    // Keep formatting "helper" crates that are intentionally not in
+    // the Package enum.
+    for package_path in ["xtask", "xtask-mcp-macros"] {
+        log::info!("Formatting package: {}", package_path);
+        xtask::format_package_path(workspace, &workspace.join(package_path), args.check, None)?;
     }
 
     // format ymls in .github/
@@ -295,9 +261,9 @@ fn check_packages(workspace: &Path, args: CheckPackagesArgs) -> Result<()> {
                 continue;
             }
 
-            for mut features in package.check_feature_rules(device) {
+            for mut check_config in package.check_config_rules(device) {
                 if package.has_chip_features() {
-                    features.push(device.name())
+                    check_config.features.push(device.name());
                 }
 
                 commands.push(build_check_package_command(
@@ -305,7 +271,7 @@ fn check_packages(workspace: &Path, args: CheckPackagesArgs) -> Result<()> {
                     *package,
                     chip,
                     &["--no-default-features"],
-                    &features,
+                    &check_config,
                     args.toolchain.as_deref(),
                 )?);
             }
@@ -328,17 +294,19 @@ fn build_check_package_command(
     package: Package,
     chip: &Chip,
     args: &[&str],
-    features: &[String],
+    check_config: &xtask::CheckConfig,
     mut toolchain: Option<&str>,
 ) -> Result<CargoArgsBuilder> {
     log::info!(
-        "Linting package: {} ({}, features: {:?})",
+        "Checking package: {} ({}, features: {:?}, env: {:?})",
         package,
         chip,
-        features
+        check_config.features,
+        check_config.env
     );
 
     let path = workspace.join(package.to_string());
+    let features = &check_config.features;
 
     let mut builder = CargoArgsBuilder::default()
         .subcommand("check")
@@ -365,6 +333,9 @@ fn build_check_package_command(
         builder = builder.arg(format!("--features={}", features.join(",")));
     }
 
+    for (key, value) in &check_config.env {
+        builder.add_env_var(key, value);
+    }
     // TODO: these should come from the outside
     builder.add_env_var("CI", "1");
     builder.add_env_var("DEFMT_LOG", "trace");
@@ -391,9 +362,9 @@ fn lint_packages(workspace: &Path, args: LintPackagesArgs) -> Result<()> {
                 continue;
             }
 
-            for mut features in package.lint_feature_rules(device) {
+            for mut check_config in package.lint_config_rules(device) {
                 if package.has_chip_features() {
-                    features.push(device.name())
+                    check_config.features.push(device.name());
                 }
 
                 lint_package(
@@ -401,7 +372,7 @@ fn lint_packages(workspace: &Path, args: LintPackagesArgs) -> Result<()> {
                     *package,
                     chip,
                     &["--no-default-features"],
-                    &features,
+                    &check_config,
                     args.fix,
                     args.toolchain.as_deref(),
                 )?;
@@ -417,20 +388,24 @@ fn lint_package(
     package: Package,
     chip: &Chip,
     args: &[&str],
-    features: &[String],
+    check_config: &xtask::CheckConfig,
     fix: bool,
     mut toolchain: Option<&str>,
 ) -> Result<()> {
     log::info!(
-        "Linting package: {} ({}, features: {:?})",
+        "Linting package: {} ({}, features: {:?}, env: {:?})",
         package,
         chip,
-        features
+        check_config.features,
+        check_config.env
     );
 
     let path = workspace.join(package.to_string());
+    let features = &check_config.features;
 
-    let mut builder = CargoArgsBuilder::default().subcommand("clippy");
+    let mut builder = CargoArgsBuilder::default()
+        .subcommand("clippy")
+        .manifest_path(path.join("Cargo.toml"));
 
     if !package.build_on_host(features) {
         if chip.is_xtensa() {
@@ -455,26 +430,21 @@ fn lint_package(
         builder = builder.arg(format!("--features={}", features.join(",")));
     }
 
-    let builder = if fix {
+    let mut builder = if fix {
         builder.arg("--fix").arg("--lib").arg("--allow-dirty")
     } else {
         builder.arg("--").arg("-D").arg("warnings").arg("--no-deps")
     };
 
-    let cargo_args = builder.build();
+    for (key, value) in &check_config.env {
+        builder.add_env_var(key, value);
+    }
+    builder.add_env_var("CI", "1");
+    builder.add_env_var("DEFMT_LOG", "trace");
 
-    xtask::cargo::run_with_env(
-        &cargo_args,
-        &path,
-        [("CI", "1"), ("DEFMT_LOG", "trace")],
-        false,
-    )
-    .with_context(|| {
-        format!(
-            "Failed to run `cargo run` with {args:?} `CI, `1`, `DEFMT_LOG`, and `trace` envs in {}",
-            path.display()
-        )
-    })?;
+    let command = CargoCommandBatcher::build_one_for_cargo(&builder);
+    xtask::cargo::run_with_env(&command.command, &path, command.env_vars, false)
+        .with_context(|| format!("Failed to run `cargo clippy` in {}", path.display()))?;
 
     Ok(())
 }
@@ -482,22 +452,55 @@ fn lint_package(
 struct Runner {
     failed: Vec<&'static str>,
     started_at: Instant,
+    skip_steps: Vec<String>,
+    run_steps: Vec<String>,
+    steps_executed: usize,
 }
 
 impl Runner {
-    fn new() -> Self {
+    fn new(options: &CiArgs) -> Self {
         Self {
             failed: Vec::new(),
             started_at: Instant::now(),
+            skip_steps: {
+                let mut skip = vec![];
+                if options.no_lint {
+                    skip.push(String::from("lint"));
+                }
+                if options.no_docs {
+                    skip.push(String::from("docs"));
+                    skip.push(String::from("doc-tests"));
+                }
+                if options.no_check_crates {
+                    skip.push(String::from("check"));
+                }
+                skip
+            },
+            run_steps: options.steps.clone(),
+            steps_executed: 0,
         }
     }
 
-    fn run(&mut self, group: &'static str, op: impl FnOnce() -> Result<()>) {
+    fn run(&mut self, id: &str, group: &'static str, op: impl FnOnce() -> Result<()>) {
+        if self.skip_steps.iter().any(|s| s == id) {
+            log::debug!("{group} skipped by user request");
+            return;
+        }
+        if !self.run_steps.is_empty() && !self.run_steps.iter().any(|s| s == id) {
+            log::debug!("{group} skipped by user request");
+            return;
+        }
+
+        self.steps_executed += 1;
+
         // Output grouped logs
         // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#grouping-log-lines
         println!("::group::{group}");
-        if op().is_err() {
+        if let Err(e) = op() {
+            log::error!("{group} failed: {e:?}");
             self.failed.push(group);
+        } else {
+            log::debug!("{group} succeeded");
         }
         println!("::endgroup::");
     }
@@ -507,6 +510,19 @@ impl Runner {
             if let Some(summary_file) = std::env::var_os("GITHUB_STEP_SUMMARY") {
                 std::fs::write(summary_file, message).unwrap();
             }
+        }
+
+        let expected_to_run = self
+            .run_steps
+            .iter()
+            .filter(|s| !self.skip_steps.contains(s))
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.steps_executed == 0 && !expected_to_run.is_empty() {
+            bail!(
+                "The following steps were requested but not executed: {}. Perhaps they contain typos?",
+                expected_to_run.join(", ")
+            );
         }
 
         log::info!("CI checks completed in {:?}", self.started_at.elapsed());
@@ -530,13 +546,19 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
     log::info!("Running CI checks for chip: {}", args.chip);
     println!("::add-matcher::.github/rust-matchers.json");
 
-    let mut runner = Runner::new();
+    let run_locally = !std::env::var("CI").is_ok();
+
+    let mut runner = Runner::new(&args);
+
+    if !run_locally && args.steps.is_empty() {
+        runner.skip_steps.push(String::from("tests"));
+    }
 
     unsafe {
         std::env::set_var("CI", "true");
     }
 
-    runner.run("Check crates", || {
+    runner.run("check", "Check crates", || {
         check_packages(
             workspace,
             CheckPackagesArgs {
@@ -547,21 +569,19 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
         )
     });
 
-    if !args.no_lint {
-        runner.run("Lint", || {
-            lint_packages(
-                workspace,
-                LintPackagesArgs {
-                    packages: Package::iter().collect(),
-                    chips: vec![args.chip],
-                    fix: false,
-                    toolchain: args.toolchain.clone(),
-                },
-            )
-        });
-    }
+    runner.run("lint", "Lint", || {
+        lint_packages(
+            workspace,
+            LintPackagesArgs {
+                packages: Package::iter().collect(),
+                chips: vec![args.chip],
+                fix: false,
+                toolchain: args.toolchain.clone(),
+            },
+        )
+    });
 
-    runner.run("Run Doc Test", || {
+    runner.run("doc-tests", "Run Doc Test", || {
         run_doc_tests(
             workspace,
             DocTestArgs {
@@ -571,18 +591,16 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
         )
     });
 
-    if !args.no_docs {
-        runner.run("Build Docs", || {
-            build_documentation(
-                workspace,
-                BuildDocumentationArgs {
-                    packages: vec![Package::EspHal, Package::EspRadio, Package::EspRtos],
-                    chips: vec![args.chip],
-                    ..Default::default()
-                },
-            )
-        });
-    }
+    runner.run("docs", "Build Docs", || {
+        build_documentation(
+            workspace,
+            BuildDocumentationArgs {
+                packages: vec![Package::EspHal, Package::EspRadio, Package::EspRtos],
+                chips: vec![args.chip],
+                ..Default::default()
+            },
+        )
+    });
 
     // for chips with esp-lp-hal: Build all supported examples for the low-power
     // core first
@@ -591,7 +609,7 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
         // `examples` copies the examples to a folder with the chip name as the last
         // path element then we copy it to the place where the HP core example
         // expects it
-        runner.run("Build LP-HAL Examples", || {
+        runner.run("lp-examples", "Build LP-HAL Examples", || {
             // The LP examples aren't really that demanding, but they need to be at a certain place.
             // Instead of trying to figure out where the results are, let's just make sure the
             // target folder is set up as expected.
@@ -606,7 +624,7 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
             let result = examples(
                 workspace,
                 ExamplesArgs {
-                    package: Package::EspLpHal,
+                    package: ExamplesPackage::EspLpHal,
                     chip: Some(args.chip),
                     example: Some("all".to_string()),
                     debug: false,
@@ -628,32 +646,66 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
                 .with_context(|| format!("Failed to read examples directory: {}", dir.display()))?;
             for example in examples {
                 let example = example.context("Failed to read example")?;
+                let example_path = example.path();
                 if example
                     .file_type()
                     .with_context(|| {
                         format!(
                             "Failed to get file type for example: {}",
-                            example.path().display()
+                            example_path.display()
                         )
                     })?
                     .is_file()
-                    && example.path().extension().is_none()
+                    && example_path.extension().is_none()
                 {
                     let example_name = example.file_name().to_string_lossy().to_string();
-                    let without_fingerprint = example_name
-                        .rsplit_once('-')
-                        .map(|(a, _)| a)
-                        .unwrap_or(&example_name);
-                    // Copy so we don't trigger a rebuild unnecessarily by deleting the original
-                    std::fs::copy(example.path(), dir.join(without_fingerprint)).with_context(
-                        || {
+                    let Some((without_fingerprint, fingerprint)) = example_name.rsplit_once('-')
+                    else {
+                        // Skip non-fingerprinted files to avoid self-copying
+                        // artifacts (for example "blinky" -> "blinky").
+                        continue;
+                    };
+                    // Cargo fingerprints are hexadecimal, so only rewrite files
+                    // that actually look like fingerprinted artifacts.
+                    if !fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
+                        continue;
+                    }
+
+                    let dst = dir.join(without_fingerprint);
+
+                    if dst.exists() {
+                        std::fs::remove_file(&dst).with_context(|| {
                             format!(
-                                "Failed to copy example: {} to {}",
-                                example.path().display(),
-                                dir.join(without_fingerprint).display()
+                                "Failed to remove destination file {} before copying",
+                                dst.display()
                             )
-                        },
-                    )?;
+                        })?;
+                    }
+
+                    log::debug!("Copying {} to {}", example_path.display(), dst.display());
+
+                    // Copy so we don't trigger a rebuild unnecessarily by deleting the original
+                    std::fs::copy(&example_path, &dst).with_context(|| {
+                        format!(
+                            "Failed to copy example: {} to {}",
+                            example_path.display(),
+                            dst.display()
+                        )
+                    })?;
+                    // Check that the destination file matches the source file
+                    let dst_contents = std::fs::read(&dst).with_context(|| {
+                        format!("Failed to read destination file: {}", dst.display())
+                    })?;
+                    let src_contents = std::fs::read(&example_path).with_context(|| {
+                        format!("Failed to read source file: {}", example_path.display())
+                    })?;
+                    if dst_contents != src_contents {
+                        return Err(anyhow::anyhow!(
+                            "Destination file {} does not match source file {}",
+                            dst.display(),
+                            example_path.display()
+                        ));
+                    }
                 }
             }
 
@@ -669,22 +721,21 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
             result
         });
 
-        if !args.no_docs {
-            // Check documentation
-            runner.run("Build LP-HAL docs", || {
-                build_documentation(
-                    workspace,
-                    BuildDocumentationArgs {
-                        packages: vec![Package::EspLpHal],
-                        chips: vec![args.chip],
-                        ..Default::default()
-                    },
-                )
-            });
-        }
+        // Check documentation. Reuse the "docs" ID, as the docs build should include all applicable
+        // packages.
+        runner.run("docs", "Build LP-HAL docs", || {
+            build_documentation(
+                workspace,
+                BuildDocumentationArgs {
+                    packages: vec![Package::EspLpHal],
+                    chips: vec![args.chip],
+                    ..Default::default()
+                },
+            )
+        });
     }
 
-    runner.run("Build examples", || {
+    runner.run("examples", "Build examples", || {
         // The `ota_example` expects a file named `examples/target/ota_image` - it
         // doesn't care about the contents however
         std::fs::create_dir_all("./examples/target")
@@ -695,7 +746,7 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
         examples(
             workspace,
             ExamplesArgs {
-                package: Package::Examples,
+                package: ExamplesPackage::Examples,
                 chip: Some(args.chip),
                 example: Some("all".to_string()),
                 debug: true,
@@ -706,11 +757,11 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
         )
     });
 
-    runner.run("Build qa-test", || {
+    runner.run("qa-test", "Build qa-test", || {
         examples(
             workspace,
             ExamplesArgs {
-                package: Package::QaTest,
+                package: ExamplesPackage::QaTest,
                 chip: Some(args.chip),
                 example: Some("all".to_string()),
                 debug: true,
@@ -718,6 +769,37 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
                 timings: false,
             },
             CargoAction::Build(None),
+        )
+    });
+
+    // Try-build tests
+    runner.run("tests", "Build tests", || {
+        let target_path = workspace.join("target");
+
+        tests(
+            workspace,
+            TestsArgs {
+                chip: args.chip,
+                repeat: 1,
+                test: None,
+                toolchain: None,
+                timings: false,
+                package: "hil-test".to_string(),
+            },
+            CargoAction::Build(Some(target_path.join("tests"))),
+        )?;
+
+        tests(
+            workspace,
+            TestsArgs {
+                chip: args.chip,
+                repeat: 1,
+                test: None,
+                toolchain: None,
+                timings: false,
+                package: "hil-test-radio".to_string(),
+            },
+            CargoAction::Build(Some(target_path.join("tests"))),
         )
     });
 
@@ -773,7 +855,7 @@ fn build_rlib(package: &str, chip: &str, target: &str) -> Result<PathBuf> {
 /// specified chips. Reports any unmangled global symbols that may pollute the
 /// global namespace.
 fn check_global_symbols(chips: &[Chip]) -> Result<()> {
-    let mut total_problematic = 0;
+    let mut total_problematic = vec![];
 
     let package = Package::EspHal; // Only esp-hal for now
 
@@ -829,13 +911,21 @@ fn check_global_symbols(chips: &[Chip]) -> Result<()> {
                 println!("{:?} {}", kind, name);
             }
 
-            total_problematic += problematic_symbols.len();
+            total_problematic.extend(
+                problematic_symbols
+                    .into_iter()
+                    .map(|(name, kind, _)| (chip, name, kind)),
+            );
         }
     }
 
-    if total_problematic > 0 {
+    if !total_problematic.is_empty() {
+        for (chip, name, kind) in total_problematic.iter() {
+            println!("{}: {} ({:?})", chip, name, kind);
+        }
         Err(anyhow::anyhow!(
-            "Found {total_problematic} unmangled global symbols across all packages/chips"
+            "Found {count} unmangled global symbols across all packages/chips",
+            count = total_problematic.len()
         ))
     } else {
         Ok(())

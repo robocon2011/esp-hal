@@ -39,7 +39,7 @@
 //! ```rust, no_run
 //! # {before_snippet}
 //! # use esp_hal::dma::DmaTxBuf;
-//! # use esp_hal::dma_buffers;
+//! # use esp_hal::dma_tx_buffer;
 //! # use esp_hal::delay::Delay;
 //! # use esp_hal::i2s::parallel::{I2sParallel, TxEightBits};
 //!
@@ -61,11 +61,11 @@
 //!     peripherals.GPIO14,
 //! );
 //!
-//! let (_, _, tx_buffer, tx_descriptors) = dma_buffers!(0, BUFFER_SIZE);
 //! let mut parallel =
 //!     I2sParallel::new(i2s, dma_channel, Rate::from_mhz(1), pins, clock).into_async();
 //!
-//! for (i, data) in tx_buffer.chunks_mut(4).enumerate() {
+//! let mut tx_buf = dma_tx_buffer!(BUFFER_SIZE).unwrap();
+//! for (i, data) in tx_buf.as_mut_slice().chunks_mut(4).enumerate() {
 //!     let offset = i * 4;
 //!     // i2s parallel driver expects the buffer to be interleaved
 //!     data[0] = (offset + 2) as u8;
@@ -73,9 +73,6 @@
 //!     data[2] = offset as u8;
 //!     data[3] = (offset + 1) as u8;
 //! }
-//!
-//! let mut tx_buf: DmaTxBuf =
-//!     DmaTxBuf::new(tx_descriptors, tx_buffer).expect("DmaTxBuf::new failed");
 //!
 //! // Sending 256 bytes.
 //! loop {
@@ -99,16 +96,9 @@ use crate::{
     Async,
     Blocking,
     DriverMode,
-    dma::{
-        Channel,
-        ChannelTx,
-        DmaChannelFor,
-        DmaEligible,
-        DmaError,
-        DmaTxBuffer,
-        PeripheralTxChannel,
-        asynch::DmaTxFuture,
-    },
+    RegisterToggle,
+    clock::dividers::FractionalDivider,
+    dma::{ChannelTx, DmaEligiblePeripheral, DmaError, DmaTxBuffer, asynch::DmaTxFuture},
     gpio::{
         OutputConfig,
         OutputSignal,
@@ -247,23 +237,21 @@ where
     Dm: DriverMode,
 {
     instance: AnyI2s<'d>,
-    tx_channel: ChannelTx<Dm, PeripheralTxChannel<AnyI2s<'d>>>,
+    tx_channel: ChannelTx<Dm, I2sParallelTxErased<'d>>,
     _guard: PeripheralGuard,
 }
 
 impl<'d> I2sParallel<'d, Blocking> {
-    /// Create a new I2S Parallel Interface
-    pub fn new(
+    fn new_internal(
         i2s: impl Instance + 'd,
-        channel: impl DmaChannelFor<AnyI2s<'d>>,
+        channel: I2sParallelTxErased<'d>,
         frequency: Rate,
         mut pins: impl TxPins<'d>,
         clock_pin: impl PeripheralOutput<'d>,
     ) -> Self {
-        let channel = Channel::new(channel.degrade());
-        channel.runtime_ensure_compatible(&i2s);
-
+        let channel = ChannelTx::new(channel);
         let i2s = i2s.degrade();
+        channel.runtime_ensure_compatible(i2s.dma_peripheral());
 
         let guard = PeripheralGuard::new(i2s.peripheral());
 
@@ -280,7 +268,7 @@ impl<'d> I2sParallel<'d, Blocking> {
         pins.configure(&i2s);
         Self {
             instance: i2s,
-            tx_channel: channel.tx,
+            tx_channel: channel,
             _guard: guard,
         }
     }
@@ -430,87 +418,44 @@ pub struct I2sClockDividers {
 
 fn calculate_clock(sample_rate: Rate, data_bits: u8) -> I2sClockDividers {
     // this loosely corresponds to `i2s_std_calculate_clock` and
-    // `i2s_ll_tx_set_mclk` in esp-idf
-    //
-    // main difference is we are using fixed-point arithmetic here
-    // plus adjusted for parallel interface clocking
+    // `i2s_ll_tx_set_mclk` in esp-idf, adjusted for parallel interface clocking
 
-    let sclk = crate::soc::constants::I2S_SCLK; // for now it's fixed 160MHz and 96MHz (just H2)
-
-    let rate = sample_rate.as_hz();
-
-    let mclk = rate * 2;
+    let sclk = crate::soc::i2s_sclk_frequency();
+    let mclk = sample_rate.as_hz() * 2;
     let bclk_divider: u32 = if data_bits == 8 { 2 } else { 1 };
-    let mut mclk_divider = sclk / mclk;
 
-    let mut ma: u32;
-    let mut mb: u32;
-    let mut denominator: u32 = 0;
-    let mut numerator: u32 = 0;
-
-    let freq_diff = sclk.abs_diff(mclk * mclk_divider);
-
-    if freq_diff != 0 {
-        let decimal = freq_diff as u64 * 10000 / mclk as u64;
-        // Carry bit if the decimal is greater than 1.0 - 1.0 / (63.0 * 2) = 125.0 /
-        // 126.0
-        if decimal > 1250000 / 126 {
-            mclk_divider += 1;
-        } else {
-            let mut min: u32 = !0;
-
-            for a in 2..=crate::i2s::master::I2S_LL_MCLK_DIVIDER_MAX {
-                let b = (a as u64) * (freq_diff as u64 * 10000u64 / mclk as u64) + 5000;
-                ma = ((freq_diff as u64 * 10000u64 * a as u64) / 10000) as u32;
-                mb = (mclk as u64 * (b / 10000)) as u32;
-
-                if ma == mb {
-                    denominator = a as u32;
-                    numerator = (b / 10000) as u32;
-                    break;
-                }
-
-                if mb.abs_diff(ma) < min {
-                    denominator = a as u32;
-                    numerator = b as u32;
-                    min = mb.abs_diff(ma);
-                }
-            }
-        }
-    }
+    let divider = FractionalDivider::new(
+        sclk,
+        mclk,
+        crate::i2s::master::I2S_LL_MCLK_DIVIDER_MAX as u32,
+    );
 
     I2sClockDividers {
-        mclk_divider,
+        mclk_divider: divider.integer,
         bclk_divider,
-        denominator,
-        numerator,
+        denominator: divider.denominator,
+        numerator: divider.numerator,
     }
 }
 #[doc(hidden)]
-#[allow(private_bounds)]
-pub trait PrivateInstance: DmaEligible {
+pub trait PrivateInstance: crate::private::Sealed {
     fn regs(&self) -> &RegisterBlock;
     fn peripheral(&self) -> crate::system::Peripheral;
     fn ws_signal(&self) -> OutputSignal;
     fn data_out_signal(&self, i: usize, bits: u8) -> OutputSignal;
 
     fn rx_reset(&self) {
-        self.regs().conf().modify(|_, w| w.rx_reset().set_bit());
-        self.regs().conf().modify(|_, w| w.rx_reset().clear_bit());
+        self.regs().conf().toggle(|w, bit| w.rx_reset().bit(bit));
     }
 
     fn rx_dma_reset(&self) {
-        self.regs().lc_conf().modify(|_, w| w.in_rst().set_bit());
-        self.regs().lc_conf().modify(|_, w| w.in_rst().clear_bit());
+        self.regs().lc_conf().toggle(|w, bit| w.in_rst().bit(bit));
     }
 
     fn rx_fifo_reset(&self) {
         self.regs()
             .conf()
-            .modify(|_, w| w.rx_fifo_reset().set_bit());
-        self.regs()
-            .conf()
-            .modify(|_, w| w.rx_fifo_reset().clear_bit());
+            .toggle(|w, bit| w.rx_fifo_reset().bit(bit));
     }
 
     fn tx_reset(&self) {
@@ -523,17 +468,13 @@ pub trait PrivateInstance: DmaEligible {
     }
 
     fn tx_dma_reset(&self) {
-        self.regs().lc_conf().modify(|_, w| w.out_rst().set_bit());
-        self.regs().lc_conf().modify(|_, w| w.out_rst().clear_bit());
+        self.regs().lc_conf().toggle(|w, bit| w.out_rst().bit(bit));
     }
 
     fn tx_fifo_reset(&self) {
         self.regs()
             .conf()
-            .modify(|_, w| w.tx_fifo_reset().set_bit());
-        self.regs()
-            .conf()
-            .modify(|_, w| w.tx_fifo_reset().clear_bit());
+            .toggle(|w, bit| w.tx_fifo_reset().bit(bit));
     }
 
     fn tx_clear_interrupts(&self) {
@@ -581,7 +522,7 @@ pub trait PrivateInstance: DmaEligible {
 
     fn set_clock(&self, clock_settings: I2sClockDividers) {
         self.regs().clkm_conf().modify(|r, w| unsafe {
-            w.bits(r.bits() | (crate::soc::constants::I2S_DEFAULT_CLK_SRC << 21))
+            w.bits(r.bits() | (property!("i2s.default_clock_source") << 21))
             // select PLL_160M
         });
 
@@ -789,3 +730,52 @@ impl Instance for I2S0<'_> {}
 #[cfg(soc_has_i2s1)]
 impl Instance for I2S1<'_> {}
 impl Instance for AnyI2s<'_> {}
+
+/// DMA channel trait for I2S peripherals.
+#[diagnostic::on_unimplemented(
+    message = "The DMA channel cannot be used with this I2S peripheral",
+    label = "This DMA channel",
+    note = "Use a channel that matches the I2S instance."
+)]
+pub trait I2sParallelDmaChannel<'d, S>:
+    Into<I2sParallelTxErased<'d>> + crate::private::Sealed
+{
+}
+
+type I2sParallelTxErased<'d> = crate::dma::I2sDmaTxChannel<'d>;
+
+with_i2s_dma_engine! {
+    ($engine:tt, $any_channel:ident) => {
+        crate::macros::impl_dma_channel_trait! {
+            $engine,
+            any_peri = AnyI2s<'d>,
+            peris = for_each_i2s,
+            ($peri:path, $ch:path) => {
+                impl<'d> I2sParallelDmaChannel<'d, $peri> for $ch {}
+            }
+        }
+    };
+}
+
+// `impl_dma_channel_trait!` only covers full channels; the TX half must be
+// listed explicitly because the trait erases to `I2sDmaTxChannel`.
+impl<'d> I2sParallelDmaChannel<'d, AnyI2s<'d>> for crate::dma::I2sDmaTxChannel<'d> {}
+
+for_each_i2s! {
+    ($i2s:ident) => {
+        impl<'d> I2sParallelDmaChannel<'d, crate::peripherals::$i2s<'d>> for crate::dma::I2sDmaTxChannel<'d> {}
+    };
+}
+
+impl<'d> I2sParallel<'d, crate::Blocking> {
+    /// Create a new I2S Parallel Interface
+    pub fn new<I: Instance + 'd>(
+        i2s: I,
+        channel: impl I2sParallelDmaChannel<'d, I>,
+        frequency: Rate,
+        pins: impl TxPins<'d>,
+        clock_pin: impl PeripheralOutput<'d>,
+    ) -> Self {
+        Self::new_internal(i2s, channel.into(), frequency, pins, clock_pin)
+    }
+}

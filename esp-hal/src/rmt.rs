@@ -1,22 +1,18 @@
 #![cfg_attr(docsrs, procmacros::doc_replace(
     "freq" => {
-        cfg(esp32h2) => "let freq = Rate::from_mhz(32);",
-        _ => "let freq = Rate::from_mhz(80);"
+        cfg(esp32h2) => "32",
+        _ => "80"
     },
     "channel" => {
-        cfg(any(esp32, esp32s2)) => "let mut channel = rmt.channel0.configure_rx(&rx_config)?.with_pin(peripherals.GPIO4);",
-        cfg(esp32s3) => "let mut channel = rmt.channel7.configure_rx(&rx_config)?.with_pin(peripherals.GPIO4);",
-        _ => "let mut channel = rmt.channel2.configure_rx(&rx_config)?.with_pin(peripherals.GPIO4);"
+        cfg(any(esp32, esp32s2)) => "channel0",
+        cfg(esp32s3) => "channel7",
+        _ => "channel2"
     },
     "channels_desc" => {
-        cfg(esp32) => "8 channels, each of them can be either receiver or transmitter.",
-        cfg(esp32s2) => "4 channels, each of them can be either receiver or transmitter.",
-        cfg(esp32s3) => "8 channels, `Channel<0>`-`Channel<3>` hardcoded for transmitting signals and `Channel<4>`-`Channel<7>` hardcoded for receiving signals.",
-        cfg(any(esp32c3, esp32c6, esp32h2)) => "4 channels, `Channel<0>` and `Channel<1>` hardcoded for transmitting signals and `Channel<2>` and `Channel<3>` hardcoded for receiving signals.",
-    },
-    "rx_size_limit" => {
-        cfg(any(esp32, esp32s2)) => "The length of the received data cannot exceed the allocated RMT RAM.",
-        _ => ""
+        cfg(esp32) => "8 channels, each of them can be either receiver or transmitter",
+        cfg(esp32s2) => "4 channels, each of them can be either receiver or transmitter",
+        cfg(esp32s3) => "8 channels, `Channel<0>`-`Channel<3>` hardcoded for transmitting signals and `Channel<4>`-`Channel<7>` hardcoded for receiving signals",
+        cfg(any(esp32c3, esp32c5, esp32c6, esp32h2)) => "4 channels, `Channel<0>` and `Channel<1>` hardcoded for transmitting signals and `Channel<2>` and `Channel<3>` hardcoded for receiving signals",
     }
 ))]
 //! # Remote Control Peripheral (RMT)
@@ -38,8 +34,7 @@
 //!
 //! ### Channels
 //!
-//! There are
-//! # {channels_desc}
+//! There are __channels_desc__.
 //!
 //! For more information, please refer to the
 #![doc = concat!("[ESP-IDF documentation](https://docs.espressif.com/projects/esp-idf/en/latest/", chip!(), "/api-reference/peripherals/rmt.html)")]
@@ -60,8 +55,7 @@
 //! # use esp_hal::rmt::TxChannelConfig;
 //! # use esp_hal::rmt::Rmt;
 //! # use crate::esp_hal::rmt::TxChannelCreator;
-//! # {freq}
-//! let rmt = Rmt::new(peripherals.RMT, freq)?;
+//! let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(__freq__))?;
 //! let mut channel = rmt
 //!     .channel0
 //!     .configure_tx(
@@ -84,10 +78,9 @@
 //! # use esp_hal::delay::Delay;
 //! # use esp_hal::gpio::Level;
 //! # use esp_hal::rmt::{PulseCode, Rmt, TxChannelConfig, TxChannelCreator};
-//!
+//! #
 //! // Configure frequency based on chip type
-//! # {freq}
-//! let rmt = Rmt::new(peripherals.RMT, freq)?;
+//! let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(__freq__))?;
 //!
 //! let tx_config = TxChannelConfig::default().with_clk_divider(255);
 //!
@@ -116,19 +109,21 @@
 //! # use esp_hal::rmt::{PulseCode, Rmt, RxChannelConfig, RxChannelCreator};
 //! # use esp_hal::delay::Delay;
 //! # use esp_hal::gpio::{Level, Output, OutputConfig};
-//!
+//! #
 //! const WIDTH: usize = 80;
 //!
 //! let mut out = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
 //!
 //! // Configure frequency based on chip type
-//! # {freq}
-//! let rmt = Rmt::new(peripherals.RMT, freq)?;
+//! let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(__freq__))?;
 //!
 //! let rx_config = RxChannelConfig::default()
 //!     .with_clk_divider(1)
 //!     .with_idle_threshold(10000);
-//! # {channel}
+//! let mut channel = rmt
+//!     .__channel__
+//!     .configure_rx(&rx_config)?
+//!     .with_pin(peripherals.GPIO4);
 //! let delay = Delay::new();
 //! let mut data: [PulseCode; 48] = [PulseCode::default(); 48];
 //!
@@ -222,7 +217,6 @@ use crate::{
     Async,
     Blocking,
     asynch::AtomicWaker,
-    clock::Clocks,
     gpio::{
         self,
         InputConfig,
@@ -232,7 +226,8 @@ use crate::{
         interconnect::{PeripheralInput, PeripheralOutput},
     },
     peripherals::{Interrupt, RMT},
-    system::{self, GenericPeripheralGuard},
+    soc::clocks,
+    system::GenericPeripheralGuard,
     time::Rate,
 };
 
@@ -398,7 +393,7 @@ impl PulseCode {
         let (Ok(length1), Ok(length2)) = (length1.try_into(), length2.try_into()) else {
             return None;
         };
-        if length1 > Self::MAX_LEN || length2 >= Self::MAX_LEN {
+        if length1 > Self::MAX_LEN || length2 > Self::MAX_LEN {
             return None;
         }
 
@@ -660,11 +655,11 @@ impl<Dir: Direction> DynChannelAccess<Dir> {
 pub struct TxChannelConfig {
     /// Channel's clock divider
     clk_divider: u8,
-    /// Set the idle output level to low/high
+    /// Whether the idle output level is low/high
     idle_output_level: Level,
-    /// Enable idle output
+    /// Whether idle output is enabled
     idle_output: bool,
-    /// Enable carrier modulation
+    /// Whether carrier modulation is enabled
     carrier_modulation: bool,
     /// Carrier high phase in ticks
     carrier_high: u16,
@@ -697,7 +692,7 @@ impl Default for TxChannelConfig {
 pub struct RxChannelConfig {
     /// Channel's clock divider
     clk_divider: u8,
-    /// Enable carrier demodulation
+    /// Whether carrier demodulation is enabled
     carrier_modulation: bool,
     /// Carrier high phase in ticks
     carrier_high: u16,
@@ -740,6 +735,7 @@ for_each_rmt_channel!(
                 Dm: crate::DriverMode,
             {
                 peripheral: RMT<'rmt>,
+                frequency: Rate,
                 $(
                     #[doc = concat!("RMT Channel ", $num)]
                     pub [<channel $num>]: ChannelCreator<'rmt, Dm, $num>,
@@ -751,14 +747,25 @@ for_each_rmt_channel!(
             where
                 Dm: crate::DriverMode,
             {
-                fn create(peripheral: RMT<'rmt>) -> Self {
+                fn create(peripheral: RMT<'rmt>, frequency: Rate) -> Self {
                     Self {
                         peripheral,
+                        frequency,
                         $(
                             [<channel $num>]: ChannelCreator::conjure(),
                         )+
                         _mode: PhantomData,
                     }
+                }
+
+                /// Returns the configured RMT counter clock frequency.
+                ///
+                /// This is the actual frequency after the global RMT clock divider has been
+                /// configured. Pulse code lengths are expressed in cycles of
+                /// this clock divided by the channel divider configured with
+                /// [`TxChannelConfig::with_clk_divider`] or [`RxChannelConfig::with_clk_divider`].
+                pub fn frequency(&self) -> Rate {
+                    self.frequency
                 }
             }
 
@@ -769,6 +776,7 @@ for_each_rmt_channel!(
 
                     Rmt {
                         peripheral: self.peripheral,
+                        frequency: self.frequency,
                         $(
                             [<channel $num>]: unsafe { self.[<channel $num>].into_async() },
                         )+
@@ -906,7 +914,12 @@ impl ChannelIndex {
 }
 
 impl<'rmt> Rmt<'rmt, Blocking> {
-    /// Create a new RMT instance
+    /// Create a new RMT instance.
+    ///
+    /// The `frequency` parameter configures the global RMT counter clock. Use
+    /// [`Rmt::frequency`] to retrieve the actual configured frequency when
+    /// converting real-time pulse durations to [`PulseCode`] lengths; this is
+    /// not necessarily the APB clock frequency.
     ///
     /// ## Errors
     ///
@@ -914,11 +927,11 @@ impl<'rmt> Rmt<'rmt, Blocking> {
     /// - [`ConfigError::UnreachableTargetFrequency`].
     pub fn new(peripheral: RMT<'rmt>, frequency: Rate) -> Result<Self, ConfigError> {
         let clk_src = ClockSource::default();
-        let div = self::chip_specific::validate_clock(clk_src, frequency)?;
+        let (div, counter_frequency) = self::chip_specific::validate_clock(clk_src, frequency)?;
 
         // Only create the peripheral guards after validate_clock() to avoid that this function
         // contains lots of code to drop them again on error.
-        let this = Rmt::create(peripheral);
+        let this = Rmt::create(peripheral, counter_frequency);
 
         self::chip_specific::configure_clock(clk_src, div);
         Ok(this)
@@ -933,8 +946,7 @@ impl<'rmt> Rmt<'rmt, Blocking> {
         for core in crate::system::Cpu::other() {
             crate::interrupt::disable(core, Interrupt::RMT);
         }
-        unsafe { crate::interrupt::bind_interrupt(Interrupt::RMT, handler.handler()) };
-        unwrap!(crate::interrupt::enable(Interrupt::RMT, handler.priority()));
+        crate::interrupt::bind_handler(Interrupt::RMT, handler);
     }
 }
 
@@ -1113,6 +1125,48 @@ mod state {
 
 use state::RmtState;
 
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct RmtClockGuard;
+
+impl RmtClockGuard {
+    fn new() -> Self {
+        #[cfg(soc_has_clock_node_rmt_sclk)]
+        clocks::ClockTree::with(|clocks| {
+            if clocks::RmtInstance::Rmt.sclk_config(clocks).is_none() {
+                clocks::RmtInstance::Rmt.configure_sclk(clocks, ClockSource::default());
+            }
+
+            clocks::RmtInstance::Rmt.request_sclk(clocks);
+        });
+
+        Self
+    }
+}
+
+impl Drop for RmtClockGuard {
+    fn drop(&mut self) {
+        #[cfg(soc_has_clock_node_rmt_sclk)]
+        clocks::ClockTree::with(|clocks| clocks::RmtInstance::Rmt.release_sclk(clocks));
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct ChannelGuards {
+    _peripheral: GenericPeripheralGuard<{ crate::system::Peripheral::Rmt as u8 }>,
+    _clock: RmtClockGuard,
+}
+
+impl ChannelGuards {
+    fn new() -> Self {
+        Self {
+            _peripheral: GenericPeripheralGuard::new(),
+            _clock: RmtClockGuard::new(),
+        }
+    }
+}
+
 /// RMT Channel
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -1132,9 +1186,9 @@ where
 
     _mem_guard: MemoryGuard<Dir>,
 
-    // Only the "outermost" Channel/ChannelCreator holds the GenericPeripheralGuard, which avoids
-    // constant inc/dec of the reference count on reborrow and drop.
-    _guard: Option<GenericPeripheralGuard<{ system::Peripheral::Rmt as u8 }>>,
+    // Only the "outermost" Channel/ChannelCreator holds these guards, which avoids constant
+    // inc/dec of the reference counts on reborrow and drop.
+    _guard: Option<ChannelGuards>,
 }
 
 // The reborrowing API treats Channel similar to a smart pointer: Ensure that it's size is actually
@@ -1587,7 +1641,8 @@ where
     // the `Rmt` and obtaining a duplicate `ChannelCreator`.
     _rmt: PhantomData<Rmt<'ch, Dm>>,
 
-    // We need to keep the peripheral clocked since the following sequence of events is possible:
+    // We need to keep the peripheral and source clocks alive since the following sequence of
+    // events is possible:
     //
     // ```
     // let cc = {
@@ -1600,7 +1655,7 @@ where
     //
     // If there was no _guard in ChannelCreator, the peripheral would be disabled in step 3, and
     // re-enabled in step 4, losing the clock configuration that was set in step 1.
-    _guard: Option<GenericPeripheralGuard<{ crate::system::Peripheral::Rmt as u8 }>>,
+    _guard: Option<ChannelGuards>,
 }
 
 impl<'ch, Dm, const CHANNEL: u8> ChannelCreator<'ch, Dm, CHANNEL>
@@ -1610,7 +1665,7 @@ where
     fn conjure() -> Self {
         Self {
             _rmt: PhantomData,
-            _guard: Some(GenericPeripheralGuard::new()),
+            _guard: Some(ChannelGuards::new()),
         }
     }
 
@@ -1640,7 +1695,7 @@ where
     pub unsafe fn steal() -> Self {
         Self {
             _rmt: PhantomData,
-            _guard: Some(GenericPeripheralGuard::new()),
+            _guard: Some(ChannelGuards::new()),
         }
     }
 }
@@ -1808,7 +1863,9 @@ impl<'ch> RxTransaction<'ch, '_> {
 
                 // `RmtReader::read()` is safe to call even if `poll_internal` is called repeatedly
                 // after the receiver finished since it returns immediately if already done.
-                self.reader.read(&mut self.data, raw, true);
+                if !self.reader.read(&mut self.data, raw, true) {
+                    return Some(Event::Error);
+                }
             }
             #[cfg(rmt_has_rx_wrap)]
             Some(Event::Threshold) => {
@@ -1859,6 +1916,12 @@ impl<'ch> RxTransaction<'ch, '_> {
 
 /// Channel is RX mode
 impl<'ch> Channel<'ch, Blocking, Rx> {
+    #[procmacros::doc_replace(
+        "rx_size_limit" => {
+            cfg(any(esp32, esp32s2)) => "The length of the received data cannot exceed the allocated RMT RAM.",
+            _ => ""
+        }
+    )]
     /// Start receiving pulse codes into the given buffer.
     /// This returns a [RxTransaction] which can be used to wait for receive to
     /// complete and get back the channel for further use.
@@ -2016,11 +2079,13 @@ impl core::future::Future for RxFuture<'_> {
                 // might not be desired.
                 raw.stop_rx(false);
 
-                this.reader.read(&mut this.data, raw, true);
-
-                match ev {
-                    Event::Error => Err(Error::ReceiverError),
-                    _ => Ok(this.reader.total),
+                if !this.reader.read(&mut this.data, raw, true) {
+                    Err(Error::ReceiverError)
+                } else {
+                    match ev {
+                        Event::Error => Err(Error::ReceiverError),
+                        _ => Ok(this.reader.total),
+                    }
                 }
             }
             #[cfg(rmt_has_rx_wrap)]
@@ -2046,6 +2111,12 @@ impl core::future::Future for RxFuture<'_> {
 
 /// RX channel in async mode
 impl Channel<'_, Async, Rx> {
+    #[procmacros::doc_replace(
+        "rx_size_limit" => {
+            cfg(any(esp32, esp32s2)) => "The length of the received data cannot exceed the allocated RMT RAM.",
+            _ => ""
+        }
+    )]
     /// Start receiving a pulse code sequence.
     ///
     /// # {rx_size_limit}
@@ -2164,62 +2235,7 @@ impl DynChannelAccess<Rx> {
     }
 }
 
-for_each_rmt_clock_source!(
-    (all $(($name:ident, $bits:literal)),+) => {
-        #[derive(Clone, Copy, Debug)]
-        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-        #[repr(u8)]
-        enum ClockSource {
-            $(
-                #[allow(unused)]
-                $name = $bits,
-            )+
-        }
-    };
-
-    (is_boolean) => {
-        impl ClockSource {
-            fn bit(self) -> bool {
-                match (self as u8) {
-                    0 => false,
-                    1 => true,
-                    _ => unreachable!("should be removed by the compiler!"),
-                }
-            }
-        }
-    };
-
-    (default ($name:ident)) => {
-        impl ClockSource {
-            fn default() -> Self {
-                Self::$name
-            }
-
-            fn bits(self) -> u8 {
-                self as u8
-            }
-
-            fn freq(self) -> crate::time::Rate {
-                match self {
-                    #[cfg(rmt_supports_apb_clock)]
-                    ClockSource::Apb => Clocks::get().apb_clock,
-
-                    #[cfg(rmt_supports_rcfast_clock)]
-                    ClockSource::RcFast => todo!(),
-
-                    #[cfg(rmt_supports_xtal_clock)]
-                    ClockSource::Xtal => Clocks::get().xtal_clock,
-
-                    #[cfg(rmt_supports_pll80mhz_clock)]
-                    ClockSource::Pll80MHz => Rate::from_mhz(80),
-
-                    #[cfg(rmt_supports_reftick_clock)]
-                    ClockSource::RefTick => todo!(),
-                }
-            }
-        }
-    };
-);
+type ClockSource = clocks::RmtSclkConfig;
 
 // Obtain maximum value for a register field from the PAC's register spec.
 macro_rules! max_from_register_spec {
@@ -2258,10 +2274,13 @@ mod chip_specific {
         Tx,
         WAKER,
     };
-    use crate::{peripherals::RMT, time::Rate};
+    use crate::{peripherals::RMT, soc::clocks, time::Rate};
 
-    pub(super) fn validate_clock(source: ClockSource, frequency: Rate) -> Result<u8, ConfigError> {
-        let src_clock = source.freq();
+    pub(super) fn validate_clock(
+        source: ClockSource,
+        frequency: Rate,
+    ) -> Result<(u8, Rate), ConfigError> {
+        let src_clock = Rate::from_hz(clocks::RmtInstance::sclk_source_frequency(source));
 
         if frequency > src_clock {
             return Err(ConfigError::UnreachableTargetFrequency);
@@ -2272,37 +2291,34 @@ mod chip_specific {
             .checked_div(frequency.as_hz())
             .ok_or(ConfigError::UnreachableTargetFrequency)?;
 
-        u8::try_from(div - 1).map_err(|_| ConfigError::UnreachableTargetFrequency)
+        let div = u8::try_from(div - 1).map_err(|_| ConfigError::UnreachableTargetFrequency)?;
+        let actual_frequency = src_clock / (u32::from(div) + 1);
+
+        Ok((div, actual_frequency))
     }
 
     pub(super) fn configure_clock(source: ClockSource, div: u8) {
+        clocks::ClockTree::with(|clocks| {
+            clocks::RmtInstance::Rmt.configure_sclk(clocks, source);
+        });
+
         #[cfg(not(soc_has_pcr))]
-        {
-            RMT::regs().sys_conf().modify(|_, w| unsafe {
-                w.clk_en().clear_bit();
-                w.sclk_sel().bits(source.bits());
-                w.sclk_div_num().bits(div);
-                w.sclk_div_a().bits(0);
-                w.sclk_div_b().bits(0);
-                w.apb_fifo_mask().set_bit()
-            });
-        }
+        RMT::regs().sys_conf().modify(|_, w| unsafe {
+            w.sclk_div_num().bits(div);
+            w.sclk_div_a().bits(0);
+            w.sclk_div_b().bits(0);
+            w.apb_fifo_mask().set_bit()
+        });
 
         #[cfg(soc_has_pcr)]
         {
             use crate::peripherals::PCR;
 
             PCR::regs().rmt_sclk_conf().modify(|_, w| unsafe {
-                cfg_if::cfg_if!(
-                    if #[cfg(esp32c6)] {
-                        w.sclk_sel().bits(source.bits())
-                    } else {
-                        w.sclk_sel().bit(source.bit())
-                    }
-                );
                 w.sclk_div_num().bits(div);
                 w.sclk_div_a().bits(0);
-                w.sclk_div_b().bits(0)
+                w.sclk_div_b().bits(0);
+                w
             });
 
             RMT::regs()
@@ -2403,6 +2419,18 @@ mod chip_specific {
             } else {
                 rmt.ch_rx_conf0(ch_idx)
                     .modify(|_, w| unsafe { w.mem_size().bits(blocks) });
+            }
+        }
+
+        #[inline(always)]
+        pub fn reset_channel_clock_divider(self) {
+            #[cfg(esp32c5)]
+            {
+                let mask = 1u32 << self.channel();
+                let rmt = RMT::regs();
+
+                rmt.ref_cnt_rst().write(|w| unsafe { w.bits(mask) });
+                rmt.ref_cnt_rst().write(|w| unsafe { w.bits(0) });
             }
         }
     }
@@ -2510,6 +2538,8 @@ mod chip_specific {
         pub fn start_tx(self) {
             let rmt = crate::peripherals::RMT::regs();
             let ch_idx = self.ch_idx as usize;
+
+            self.reset_channel_clock_divider();
 
             rmt.ch_tx_conf0(ch_idx).modify(|_, w| {
                 w.mem_rd_rst().set_bit();
@@ -2651,6 +2681,8 @@ mod chip_specific {
             let rmt = crate::peripherals::RMT::regs();
             let ch_idx = self.ch_idx as u8;
 
+            self.reset_channel_clock_divider();
+
             for i in 1..self.memsize().blocks() {
                 rmt.ch_rx_conf1((ch_idx + i).into())
                     .modify(|_, w| w.mem_owner().set_bit());
@@ -2771,34 +2803,34 @@ mod chip_specific {
         Event,
         Level,
         MemSize,
-        NUM_CHANNELS,
         RMT_LOCK,
         Rx,
         Tx,
         WAKER,
     };
-    use crate::{peripherals::RMT, time::Rate};
+    use crate::{peripherals::RMT, soc::clocks, time::Rate};
 
-    pub(super) fn validate_clock(source: ClockSource, frequency: Rate) -> Result<u8, ConfigError> {
-        if frequency != source.freq() {
+    pub(super) fn validate_clock(
+        source: ClockSource,
+        frequency: Rate,
+    ) -> Result<(u8, Rate), ConfigError> {
+        let source_frequency = Rate::from_hz(clocks::RmtInstance::sclk_source_frequency(source));
+
+        if frequency != source_frequency {
             return Err(ConfigError::UnreachableTargetFrequency);
         }
 
-        Ok(1)
+        Ok((1, frequency))
     }
 
     pub(super) fn configure_clock(source: ClockSource, _div: u8) {
         let rmt = RMT::regs();
 
-        for ch_num in 0..NUM_CHANNELS {
-            rmt.chconf1(ch_num)
-                .modify(|_, w| w.ref_always_on().bit(source.bit()));
-        }
+        clocks::ClockTree::with(|clocks| {
+            clocks::RmtInstance::Rmt.configure_sclk(clocks, source);
+        });
 
         rmt.apb_conf().modify(|_, w| w.apb_fifo_mask().set_bit());
-
-        #[cfg(not(esp32))]
-        rmt.apb_conf().modify(|_, w| w.clk_en().set_bit());
     }
 
     #[crate::handler]
@@ -3173,7 +3205,7 @@ mod chip_specific {
             // 1) setting the mem_owner to an invalid value. This doesn't seem to trigger an error
             //    immediately, so presumably the error only occurs when a new pulse code would be
             //    written.
-            // 2) lowering the idle treshold and change other settings to make exceeding the
+            // 2) lowering the idle threshold and change other settings to make exceeding the
             //    threshold more likely (lower clock divider, enable and set an input filter that is
             //    longer than the idle threshold). The latter should have the same effect as
             //    reconnecting the pin to a constant level, but that tricky to do since we'd also

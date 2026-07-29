@@ -32,13 +32,25 @@ pub unsafe fn spiflash_unlock() -> Result<(), i32> {
     }
 }
 
-/// Low-level SPI NOR Flash erase
+/// Low-level SPI NOR Flash sector erase
 ///
 /// # Safety
 ///
 /// The `sector_number` * sector_size should not exceeds the size of flash.
 pub unsafe fn spiflash_erase_sector(sector_number: u32) -> Result<(), i32> {
     match chip_specific::spiflash_erase_sector(sector_number) {
+        0 => Ok(()),
+        value => Err(value),
+    }
+}
+
+/// Low-level SPI NOR Flash block erase
+///
+/// # Safety
+///
+/// The `block_number` * block_size should not exceeds the size of flash.
+pub unsafe fn spiflash_erase_block(block_number: u32) -> Result<(), i32> {
+    match chip_specific::spiflash_erase_block(block_number) {
         0 => Ok(()),
         value => Err(value),
     }
@@ -53,6 +65,25 @@ pub unsafe fn spiflash_erase_sector(sector_number: u32) -> Result<(), i32> {
 /// equals to `len`.
 pub unsafe fn spiflash_write(dest_addr: u32, data: *const u32, len: u32) -> Result<(), i32> {
     match chip_specific::spiflash_write(dest_addr, data, len) {
+        0 => Ok(()),
+        value => Err(value),
+    }
+}
+
+/// Low-level SPI NOR Flash encrypted write
+///
+/// # Safety
+///
+/// The `dest_addr` + `len` should not exceed the size of flash.
+/// Both `dest_addr` and `len` must be 32-byte aligned.
+/// The target flash region must already be erased.
+/// The `data` pointer must be word-aligned.
+pub unsafe fn spiflash_write_encrypted(
+    dest_addr: u32,
+    data: *mut u32,
+    len: u32,
+) -> Result<(), i32> {
+    match chip_specific::spiflash_write_encrypted(dest_addr, data, len) {
         0 => Ok(()),
         value => Err(value),
     }

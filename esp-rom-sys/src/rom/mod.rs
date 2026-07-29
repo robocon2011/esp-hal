@@ -4,9 +4,9 @@
 //!
 //! For some selected ROM functions safe wrappers are provided for convenience.
 
-#[cfg(any(rom_crc_be, rom_crc_le))]
+#[cfg(any(rom_has_crc_be, rom_has_crc_le))]
 pub mod crc;
-#[cfg(any(rom_md5_bsd, rom_md5_mbedtls))]
+#[cfg(any(rom_has_md5_bsd, rom_has_md5_mbedtls))]
 pub mod md5;
 pub mod spiflash;
 
@@ -62,7 +62,7 @@ pub fn software_reset() -> ! {
 }
 
 /// Set App cpu Entry code, code can be called in PRO CPU.
-#[cfg(esp32s3)]
+#[cfg(any(esp32s3, esp32p4, esp32s31))]
 #[inline(always)]
 pub fn ets_set_appcpu_boot_addr(boot_addr: u32) {
     unsafe extern "C" {
@@ -76,28 +76,28 @@ pub fn ets_set_appcpu_boot_addr(boot_addr: u32) {
 // so that either ieee or esp-radio gets it for free without duplicating in both
 #[unsafe(no_mangle)]
 extern "C" fn rtc_clk_xtal_freq_get() -> i32 {
-    cfg_if::cfg_if! {
-        if #[cfg(any(esp32c6, esp32h2))] {
+    cfg_select! {
+        any(esp32c6, esp32h2, esp32p4, esp32s31) => {
             unsafe extern "C" {
                 fn ets_clk_get_xtal_freq() -> i32;
             }
             (unsafe { ets_clk_get_xtal_freq() }) / 1_000_000
-        } else if #[cfg(any(esp32s2, esp32s3, esp32c3))] {
+        }
+        any(esp32s2, esp32s3, esp32c3) => {
             unsafe extern "C" {
                 fn ets_get_xtal_freq() -> i32;
             }
             (unsafe { ets_get_xtal_freq() }) / 1_000_000
-        } else if #[cfg(esp32)] {
-            // the ROM function returns something close to 80_000_000
+        }
+        any(esp32, esp32c2) => {
             // just rely on RTC_CNTL_STORE4
-            let rtc_cntl_store4: *const u32 = 0x3FF480B0 as *const u32;
-            ((unsafe { rtc_cntl_store4.read_volatile() })  & 0xff) as i32
-        } else if #[cfg(esp32c2)] {
-            // the ROM function returns 40 also for a 26 MHz xtal
-            // just rely on RTC_CNTL_STORE4
-            let rtc_cntl_store4: *const u32 = 0x600080AC as *const u32;
-            ((unsafe { rtc_cntl_store4.read_volatile() }) & 0xff) as i32
-        } else {
+            (regs!(RTC_CNTL).store4().read().bits() & 0xff) as i32
+        }
+        any(esp32c5, esp32c61) => {
+            // PCR_CLK_XTAL_FREQ updates its value based on EFUSE_XTAL_48M_SEL.
+            regs!(PCR).sysclk_conf().read().clk_xtal_freq().bits() as i32
+        }
+        _ => {
             compile_error!("rtc_clk_xtal_freq_get not implemented for this chip");
         }
     }

@@ -3,10 +3,9 @@
 use alloc::string::String;
 use core::fmt;
 
-use enumset::EnumSet;
 use procmacros::BuilderLite;
 
-use super::{AuthenticationMethod, Protocol, scan::ScanMethod};
+use super::{AuthenticationMethod, DisconnectReason, Protocols, Ssid};
 use crate::WifiError;
 
 unstable_module!(
@@ -15,12 +14,25 @@ unstable_module!(
     pub mod eap;
 );
 
+/// Wi-Fi scan method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+#[repr(u8)]
+#[instability::unstable]
+pub enum ScanMethod {
+    /// Fast scan.
+    Fast,
+    /// Scan all channels.
+    AllChannels,
+}
+
 /// Station configuration for a Wi-Fi connection.
 #[derive(BuilderLite, Clone, Eq, PartialEq, Hash)]
 pub struct StationConfig {
     /// The SSID of the Wi-Fi network.
-    #[builder_lite(reference)]
-    pub(crate) ssid: String,
+    #[builder_lite(skip_setter)]
+    pub(crate) ssid: Ssid,
     /// The BSSID (MAC address) of the station.
     pub(crate) bssid: Option<[u8; 6]>,
     /// The authentication method for the Wi-Fi connection.
@@ -31,7 +43,7 @@ pub struct StationConfig {
     /// The Wi-Fi channel to connect to.
     pub(crate) channel: Option<u8>,
     /// The set of protocols supported by the access point.
-    pub(crate) protocols: EnumSet<Protocol>,
+    pub(crate) protocols: Protocols,
     /// Interval for station to listen to beacon from access point.
     ///
     /// The unit of listen interval is one beacon interval.
@@ -58,12 +70,18 @@ pub struct StationConfig {
 }
 
 impl StationConfig {
+    /// Set the SSID of the access point.
+    pub fn with_ssid(mut self, ssid: impl Into<Ssid>) -> Self {
+        self.ssid = ssid.into();
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), WifiError> {
         if self.ssid.len() > 32 {
             return Err(WifiError::InvalidArguments);
         }
 
-        if self.password.len() > 64 {
+        if self.password.len() >= 64 {
             return Err(WifiError::InvalidArguments);
         }
 
@@ -78,12 +96,12 @@ impl StationConfig {
 impl Default for StationConfig {
     fn default() -> Self {
         StationConfig {
-            ssid: String::new(),
+            ssid: Ssid::default(),
             bssid: None,
             auth_method: AuthenticationMethod::Wpa2Personal,
             password: String::new(),
             channel: None,
-            protocols: (Protocol::P802D11B | Protocol::P802D11BG | Protocol::P802D11BGN),
+            protocols: Protocols::default(),
             listen_interval: 3,
             beacon_timeout: 6,
             failure_retry_cnt: 1,
@@ -137,4 +155,36 @@ impl defmt::Format for StationConfig {
             self.scan_method
         )
     }
+}
+
+/// Information about the access point the station connected to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct ConnectedInfo {
+    /// The SSID of the access point.
+    pub ssid: Ssid,
+    /// The BSSID of the access point.
+    pub bssid: [u8; 6],
+    /// The channel of the access point.
+    pub channel: u8,
+    /// The authentication method used.
+    pub authmode: AuthenticationMethod,
+    /// The Association ID (AID) assigned by the access point.
+    pub aid: u16,
+}
+
+/// Information about the access point the station disconnected from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct DisconnectedInfo {
+    /// The SSID of the access point.
+    pub ssid: Ssid,
+    /// The BSSID of the access point.
+    pub bssid: [u8; 6],
+    /// The disconnect reason.
+    pub reason: DisconnectReason,
+    /// The RSSI.
+    pub rssi: i8,
 }

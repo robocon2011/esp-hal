@@ -11,10 +11,10 @@
 //!
 //! LEDC uses APB as clock source.
 
-#[cfg(esp32)]
+#[cfg(ledc_version = "1")]
 use super::HighSpeed;
-use super::{LowSpeed, Speed};
-use crate::{clock::Clocks, pac, time::Rate};
+use super::{LowSpeed, Speed, low_level};
+use crate::{pac, time::Rate};
 
 const LEDC_TIMER_DIV_NUM_MAX: u64 = 0x3FFFF;
 
@@ -28,7 +28,7 @@ pub enum Error {
     FrequencyUnset,
 }
 
-#[cfg(esp32)]
+#[cfg(ledc_version = "1")]
 /// Clock source for HS Timers
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -98,22 +98,22 @@ pub mod config {
         Duty13Bit,
         /// 14-bit resolution for duty cycle adjustment.
         Duty14Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 15-bit resolution for duty cycle adjustment.
         Duty15Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 16-bit resolution for duty cycle adjustment.
         Duty16Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 17-bit resolution for duty cycle adjustment.
         Duty17Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 18-bit resolution for duty cycle adjustment.
         Duty18Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 19-bit resolution for duty cycle adjustment.
         Duty19Bit,
-        #[cfg(esp32)]
+        #[cfg(ledc_version = "1")]
         /// 20-bit resolution for duty cycle adjustment.
         Duty20Bit,
     }
@@ -137,17 +137,17 @@ pub mod config {
                 12 => Self::Duty12Bit,
                 13 => Self::Duty13Bit,
                 14 => Self::Duty14Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 15 => Self::Duty15Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 16 => Self::Duty16Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 17 => Self::Duty17Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 18 => Self::Duty18Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 19 => Self::Duty19Bit,
-                #[cfg(esp32)]
+                #[cfg(ledc_version = "1")]
                 20 => Self::Duty20Bit,
                 _ => Err(())?,
             })
@@ -178,7 +178,7 @@ impl TimerSpeed for LowSpeed {
     type ClockSourceType = LSClockSource;
 }
 
-#[cfg(esp32)]
+#[cfg(ledc_version = "1")]
 /// Timer source type for HighSpeed timers
 impl TimerSpeed for HighSpeed {
     /// The clock source type for high-speed timers.
@@ -225,6 +225,7 @@ pub struct Timer<'a, S: TimerSpeed> {
     duty: Option<config::Duty>,
     frequency: u32,
     configured: bool,
+    #[cfg(soc_has_clock_node_ref_tick)]
     use_ref_tick: bool,
     clock_source: Option<S::ClockSourceType>,
 }
@@ -248,16 +249,18 @@ where
         let frequency: u32 = config.frequency.as_hz();
         self.frequency = frequency;
 
+        #[cfg_attr(not(soc_has_clock_node_ref_tick), expect(unused_mut))]
         let mut divisor = ((src_freq as u64) << 8) / frequency as u64 / precision as u64;
 
-        if divisor > LEDC_TIMER_DIV_NUM_MAX && cfg!(soc_ref_tick_hz_is_set) {
+        #[cfg(soc_has_clock_node_ref_tick)]
+        if divisor > LEDC_TIMER_DIV_NUM_MAX {
             // APB_CLK results in divisor which too high. Try using REF_TICK as clock
             // source.
             self.use_ref_tick = true;
             divisor = (1_000_000u64 << 8) / frequency as u64 / precision as u64;
         }
 
-        if !(256..LEDC_TIMER_DIV_NUM_MAX).contains(&divisor) {
+        if !(256..=LEDC_TIMER_DIV_NUM_MAX).contains(&divisor) {
             return Err(Error::Divisor);
         }
 
@@ -299,6 +302,7 @@ impl<'a, S: TimerSpeed> Timer<'a, S> {
             duty: None,
             frequency: 0u32,
             configured: false,
+            #[cfg(soc_has_clock_node_ref_tick)]
             use_ref_tick: false,
             clock_source: None,
         }
@@ -309,96 +313,47 @@ impl<'a, S: TimerSpeed> Timer<'a, S> {
 impl TimerHW<LowSpeed> for Timer<'_, LowSpeed> {
     /// Get the current source timer frequency from the HW
     fn freq_hw(&self) -> Option<Rate> {
-        self.clock_source.map(|source| match source {
-            LSClockSource::APBClk => {
-                let clocks = Clocks::get();
-                clocks.apb_clock
-            }
-        })
+        self.clock_source.map(low_level::ls_freq_hw)
     }
 
-    #[cfg(esp32)]
     /// Configure the HW for the timer
     fn configure_hw(&self, divisor: u32) {
         let duty = unwrap!(self.duty) as u8;
-        let use_apb = !self.use_ref_tick;
-
-        self.ledc
-            .lstimer(self.number as usize)
-            .conf()
-            .modify(|_, w| unsafe {
-                w.tick_sel().bit(use_apb);
-                w.rst().clear_bit();
-                w.pause().clear_bit();
-                w.div_num().bits(divisor);
-                w.duty_res().bits(duty)
-            });
-    }
-
-    #[cfg(not(esp32))]
-    /// Configure the HW for the timer
-    fn configure_hw(&self, divisor: u32) {
-        let duty = unwrap!(self.duty) as u8;
+        #[cfg(soc_has_clock_node_ref_tick)]
         let use_ref_tick = self.use_ref_tick;
-
-        self.ledc
-            .timer(self.number as usize)
-            .conf()
-            .modify(|_, w| unsafe {
-                w.tick_sel().bit(use_ref_tick);
-                w.rst().clear_bit();
-                w.pause().clear_bit();
-                w.clk_div().bits(divisor);
-                w.duty_res().bits(duty)
-            });
+        #[cfg(not(soc_has_clock_node_ref_tick))]
+        let use_ref_tick = false;
+        low_level::ls_configure_hw(self.ledc, self.number, divisor, duty, use_ref_tick);
     }
 
     /// Update the timer in HW
     fn update_hw(&self) {
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
-                let tmr = self.ledc.lstimer(self.number as usize);
-            } else {
-                let tmr = self.ledc.timer(self.number as usize);
-            }
-        }
-
-        tmr.conf().modify(|_, w| w.para_up().set_bit());
+        low_level::ls_update_hw(self.ledc, self.number);
     }
 }
 
-#[cfg(esp32)]
+#[cfg(ledc_version = "1")]
 /// Timer HW implementation for HighSpeed timers
 impl TimerHW<HighSpeed> for Timer<'_, HighSpeed> {
     /// Get the current source timer frequency from the HW
     fn freq_hw(&self) -> Option<Rate> {
-        self.clock_source.map(|source| match source {
-            HSClockSource::APBClk => {
-                let clocks = Clocks::get();
-                clocks.apb_clock
-            }
-        })
+        self.clock_source.map(low_level::hs_freq_hw)
     }
 
     /// Configure the HW for the timer
     fn configure_hw(&self, divisor: u32) {
         let duty = unwrap!(self.duty) as u8;
-        let sel_hstimer = self.clock_source == Some(HSClockSource::APBClk);
-
-        self.ledc
-            .hstimer(self.number as usize)
-            .conf()
-            .modify(|_, w| unsafe {
-                w.tick_sel().bit(sel_hstimer);
-                w.rst().clear_bit();
-                w.pause().clear_bit();
-                w.div_num().bits(divisor);
-                w.duty_res().bits(duty)
-            });
+        low_level::hs_configure_hw(
+            self.ledc,
+            self.number,
+            divisor,
+            duty,
+            unwrap!(self.clock_source),
+        );
     }
 
     /// Update the timer in HW
     fn update_hw(&self) {
-        // Nothing to do for HS timers
+        low_level::hs_update_hw();
     }
 }

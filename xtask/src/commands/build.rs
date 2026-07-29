@@ -36,6 +36,13 @@ pub enum Build {
 // Subcommand Arguments
 
 /// Arguments for building documentation.
+#[cfg_attr(
+    feature = "mcp",
+    xtask_mcp_macros::mcp_tool(
+        description = "Build documentation for the specified packages and chips",
+        command = "build documentation"
+    )
+)]
 #[derive(Debug, Default, Args)]
 pub struct BuildDocumentationArgs {
     /// Package(s) to document.
@@ -53,6 +60,13 @@ pub struct BuildDocumentationArgs {
 }
 
 /// Arguments for building a package.
+#[cfg_attr(
+    feature = "mcp",
+    xtask_mcp_macros::mcp_tool(
+        description = "Build the specified package with the given options",
+        command = "build package"
+    )
+)]
 #[derive(Debug, Args)]
 pub struct BuildPackageArgs {
     /// Package to build.
@@ -141,7 +155,7 @@ pub fn build_examples(
     let chip = args.chip.unwrap();
 
     // Determine the appropriate build target for the given package and chip:
-    let target = args.package.target_triple(&chip)?;
+    let target = args.package.as_package().target_triple(&chip)?;
 
     // Attempt to build each supported example, with all required features enabled:
 

@@ -105,13 +105,21 @@ include!("_generated_esp32.rs");
 include!("_generated_esp32c2.rs");
 #[cfg(feature = "esp32c3")]
 include!("_generated_esp32c3.rs");
+#[cfg(feature = "esp32c5")]
+include!("_generated_esp32c5.rs");
 #[cfg(feature = "esp32c6")]
 include!("_generated_esp32c6.rs");
+#[cfg(feature = "esp32c61")]
+include!("_generated_esp32c61.rs");
 #[cfg(feature = "esp32h2")]
 include!("_generated_esp32h2.rs");
+#[cfg(feature = "esp32p4")]
+include!("_generated_esp32p4.rs");
 #[cfg(feature = "esp32s2")]
 include!("_generated_esp32s2.rs");
 #[cfg(feature = "esp32s3")]
 include!("_generated_esp32s3.rs");
+#[cfg(feature = "esp32s31")]
+include!("_generated_esp32s31.rs");
 #[cfg(any(feature = "build-script", docsrs))]
 include!("_build_script_utils.rs");

@@ -4,7 +4,7 @@
 //! RNG Tests
 //! System Timer Tests
 //! TWAI Tests
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: gpio_driver_supported
 //% FEATURES: unstable embassy
 
 #![no_std]
@@ -12,7 +12,7 @@
 
 use hil_test as _;
 
-#[cfg(not(any(esp32c2, esp32c3)))]
+#[cfg(pcnt_driver_supported)]
 #[embedded_test::tests(default_timeout = 3)]
 mod pcnt {
     use esp_hal::{
@@ -48,7 +48,7 @@ mod pcnt {
     fn test_increment_on_pos_edge(ctx: Context<'static>) {
         let unit = ctx.pcnt.unit0;
 
-        // Setup channel 0 to increment the count when gpio2 does LOW -> HIGH
+        // Setup channel 0 to increment the count when input changes LOW -> HIGH
         unit.channel0.set_edge_signal(Input::new(
             ctx.input,
             InputConfig::default().with_pull(Pull::Down),
@@ -87,7 +87,7 @@ mod pcnt {
     fn test_increment_on_neg_edge(ctx: Context<'static>) {
         let unit = ctx.pcnt.unit1;
 
-        // Setup channel 0 to increment the count when gpio2 does LOW -> HIGH
+        // Setup channel 0 to increment the count when input changes HIGH -> LOW
         unit.channel0.set_edge_signal(Input::new(
             ctx.input,
             InputConfig::default().with_pull(Pull::Up),
@@ -356,61 +356,7 @@ mod pcnt {
     }
 }
 
-#[embedded_test::tests(default_timeout = 5)]
-mod rng {
-    use esp_hal::rng::{Rng, Trng, TrngSource};
-
-    #[test]
-    fn test_trng_without_source_is_error() {
-        assert!(Trng::try_new().is_err());
-
-        // Rng can be created anyway:
-        let _rng = Rng::new();
-    }
-
-    #[test]
-    fn test_trng_source_cannot_be_disabled_while_in_use() {
-        let p = esp_hal::init(Default::default());
-        let source = TrngSource::new(p.RNG, p.ADC1);
-
-        let trng = Trng::try_new().unwrap();
-
-        let _source = source.try_disable().unwrap_err();
-
-        // Need to drop trng first
-        core::mem::drop(trng);
-
-        // Rng will not prevent disabling the TrngSource
-        let _rng = Rng::new();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_trng_source_cannot_be_dropped_while_in_use() {
-        let p = esp_hal::init(Default::default());
-        let source = TrngSource::new(p.RNG, p.ADC1);
-
-        let _trng = Trng::try_new().unwrap();
-
-        core::mem::drop(source);
-    }
-
-    #[test]
-    fn test_trng_source_can_be_dropped_if_unsafely_enabled() {
-        let p = esp_hal::init(Default::default());
-
-        let source = TrngSource::new(p.RNG, p.ADC1);
-
-        // Unsafely increase the counter. Practically, this may be done in esp-radio.
-        unsafe { TrngSource::increase_entropy_source_counter() };
-
-        let _trng = Trng::try_new().unwrap();
-
-        core::mem::drop(source);
-    }
-}
-
-#[cfg(not(esp32))]
+#[cfg(systimer_driver_supported)]
 #[embedded_test::tests(default_timeout = 3)]
 mod systimer {
     use core::cell::RefCell;
@@ -425,7 +371,7 @@ mod systimer {
         timer::{
             OneShotTimer,
             PeriodicTimer,
-            systimer::{Alarm, SystemTimer},
+            systimer::{Alarm, SystemTimer, Unit},
         },
     };
     use portable_atomic::{AtomicUsize, Ordering};
@@ -560,9 +506,22 @@ mod systimer {
         // We'll end the test in the interrupt handler.
         loop {}
     }
+
+    #[test]
+    fn set_unit_count_does_not_mask_high_bits(_ctx: Context) {
+        unsafe {
+            SystemTimer::set_unit_value(Unit::Unit0, 1 << 32);
+            assert!(SystemTimer::unit_value(Unit::Unit0) >= 1 << 32);
+        }
+        #[cfg(not(esp32s2))]
+        unsafe {
+            SystemTimer::set_unit_value(Unit::Unit1, 1 << 32);
+            assert!(SystemTimer::unit_value(Unit::Unit1) >= 1 << 32);
+        }
+    }
 }
 
-#[cfg(any(esp32, esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+#[cfg(twai_driver_supported)]
 mod twai {
     use embedded_can::Frame;
     use esp_hal::{
@@ -628,6 +587,8 @@ mod twai {
 
     #[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
     mod async_tests {
+        use esp_hal::gpio::NoPin;
+
         use super::*;
 
         #[init]
@@ -703,12 +664,69 @@ mod twai {
                 block!(ctx.twai.transmit(&frame)).unwrap();
             }
 
-            let _ = interrupt::enable(TWAI0, Priority3);
+            interrupt::enable(TWAI0, Priority3);
 
             const NUM_ASYNC_SENT_FRAMES: usize = 20;
             transmit_frames(&mut ctx, &frame, NUM_ASYNC_SENT_FRAMES).await;
 
             receive_frames(&mut ctx, NUM_SENT_FRAMES + NUM_ASYNC_SENT_FRAMES).await;
         }
+
+        fn no_init() {}
+
+        #[test(init = no_init)]
+        #[ignore]
+        // Regression test for https://github.com/esp-rs/esp-hal/issues/5307
+        async fn test_write_into_the_void() {
+            let peripherals = esp_hal::init(esp_hal::Config::default());
+
+            let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+            let timg0 = TimerGroup::new(peripherals.TIMG0);
+            esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+            let config = twai::TwaiConfiguration::new(
+                peripherals.TWAI0,
+                NoPin,
+                NoPin,
+                twai::BaudRate::B1000K,
+                TwaiMode::Normal,
+            );
+
+            let mut twai = config.into_async().start();
+
+            let frame = EspTwaiFrame::new(StandardId::new(5).unwrap(), b"12345678").unwrap();
+
+            twai.transmit_async(&frame).await.unwrap();
+        }
+    }
+}
+
+#[cfg(lp_timer_driver_supported)]
+#[embedded_test::tests(default_timeout = 3)]
+mod lp_timekeeping {
+    use esp_hal::{
+        rtc_cntl::Rtc,
+        time::{Duration, Instant},
+    };
+
+    #[init]
+    fn init() -> Rtc<'static> {
+        let peripherals = esp_hal::init(esp_hal::Config::default());
+
+        Rtc::new(peripherals.RTC_TIMER)
+    }
+
+    #[test]
+    fn returns_correct_timestamp(rtc: Rtc<'static>) {
+        let start_rtc = rtc.time_since_power_up();
+        let start_instant = Instant::now();
+        while start_instant.elapsed() < Duration::from_millis(10) {}
+
+        let rtc_duration = rtc.time_since_power_up() - start_rtc;
+        assert!(
+            rtc_duration > Duration::from_millis(5),
+            "RTC only advanced by {:?}",
+            rtc_duration
+        );
     }
 }

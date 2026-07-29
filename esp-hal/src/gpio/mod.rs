@@ -1,6 +1,6 @@
 #![cfg_attr(docsrs, procmacros::doc_replace(
     "etm_availability" => {
-        cfg(soc_has_etm) => "The GPIO pins also provide tasks and events via the ETM interconnect system. For more information, see the [etm] module."
+        cfg(etm_driver_supported) => "The GPIO pins also provide tasks and events via the ETM interconnect system. For more information, see the [etm] module."
     }
 ))]
 //! # General Purpose Input/Output (GPIO)
@@ -55,16 +55,13 @@
 crate::unstable_module! {
     pub mod interconnect;
 
-    #[cfg(soc_has_etm)]
+    #[cfg(etm_driver_supported)]
     pub mod etm;
 
-    #[cfg(soc_has_lp_io)]
+    #[cfg(lp_io_driver_supported)]
     pub mod lp_io;
 
-    #[cfg(all(soc_has_rtc_io, not(esp32)))]
-    pub mod rtc_io;
-
-    #[cfg(dedicated_gpio)]
+    #[cfg(dedicated_gpio_driver_supported)]
     pub mod dedicated;
 }
 use interconnect::PeripheralOutput;
@@ -72,7 +69,10 @@ use interconnect::PeripheralOutput;
 mod asynch;
 mod embedded_hal_impls;
 pub(crate) mod interrupt;
+mod low_level;
 use interrupt::*;
+pub use low_level::GpioBank;
+use low_level::{gpio_intr_enable, is_int_enabled, set_int_enable};
 
 mod placeholder;
 
@@ -80,13 +80,11 @@ use core::fmt::Display;
 
 use esp_sync::RawMutex;
 pub use placeholder::NoPin;
-use portable_atomic::AtomicU32;
-use strum::EnumCount;
 
 use crate::{
     asynch::AtomicWaker,
     interrupt::{InterruptHandler, Priority},
-    peripherals::{GPIO, IO_MUX, Interrupt},
+    peripherals::{GPIO, IO_MUX},
     private::{self, Sealed},
 };
 
@@ -114,7 +112,7 @@ impl PinGuard {
         Self { pin: pin.number() }
     }
 
-    pub(crate) fn new_unconnected() -> Self {
+    pub(crate) const fn new_unconnected() -> Self {
         Self { pin: u8::MAX }
     }
 
@@ -265,6 +263,17 @@ impl Display for WakeConfigError {
 
 impl core::error::Error for WakeConfigError {}
 
+/// Options for [`Input::wait_for_with_options`] and
+/// [`Flex::wait_for_with_options`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, procmacros::BuilderLite)]
+#[non_exhaustive]
+#[instability::unstable]
+pub struct WaitForOptions {
+    /// Enable waking from light sleep on the configured event.
+    wake_enable: bool,
+}
+
 /// Pull setting for a GPIO.
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -351,7 +360,6 @@ impl TryFrom<usize> for AlternateFunction {
 #[instability::unstable]
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[cfg(not(esp32h2))]
 pub enum RtcFunction {
     /// RTC mode.
     Rtc     = 0,
@@ -364,13 +372,13 @@ pub enum RtcFunction {
 
 /// Trait implemented by RTC pins
 #[instability::unstable]
+#[cfg(lp_io_driver_supported)]
 pub trait RtcPin: Pin {
     /// RTC number of the pin
-    #[cfg(any(xtensa, esp32h2))]
     fn rtc_number(&self) -> u8;
 
     /// Configure the pin
-    #[cfg(any(xtensa, esp32c6))]
+    #[cfg(any(xtensa, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4))]
     #[doc(hidden)]
     fn rtc_set_config(&self, input_enable: bool, mux: bool, func: RtcFunction);
 
@@ -382,21 +390,20 @@ pub trait RtcPin: Pin {
     ///
     /// The `level` argument needs to be a valid setting for the
     /// `rtc_cntl.gpio_wakeup.gpio_pinX_int_type`.
-    #[cfg(any(esp32c3, esp32c2, esp32c6))]
+    #[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6, esp32c61, esp32p4))]
     #[doc(hidden)]
     unsafe fn apply_wakeup(&self, wakeup: bool, level: u8);
 }
 
-/// Trait implemented by RTC pins which supporting internal pull-up / pull-down
+/// Trait implemented by RTC pins which support internal pull-up / pull-down
 /// resistors.
 #[instability::unstable]
+#[cfg(lp_io_driver_supported)]
 pub trait RtcPinWithResistors: RtcPin {
     /// Enable/disable the internal pull-up resistor
-    #[cfg(not(esp32h2))]
     #[doc(hidden)]
     fn rtcio_pullup(&self, enable: bool);
     /// Enable/disable the internal pull-down resistor
-    #[cfg(not(esp32h2))]
     #[doc(hidden)]
     fn rtcio_pulldown(&self, enable: bool);
 }
@@ -472,7 +479,7 @@ pub trait AnalogPin: Pin {
 }
 
 /// Trait implemented by pins which can be used as Touchpad pins
-#[cfg(touch)]
+#[cfg(touch_driver_supported)]
 #[instability::unstable]
 pub trait TouchPin: Pin {
     /// Configure the pin for analog operation
@@ -490,123 +497,6 @@ pub trait TouchPin: Pin {
     /// Set a pins touch threshold for interrupts.
     #[doc(hidden)]
     fn set_threshold(&self, threshold: u16, _: private::Internal);
-}
-
-#[doc(hidden)]
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Hash, EnumCount)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum GpioBank {
-    _0,
-    #[cfg(gpio_has_bank_1)]
-    _1,
-}
-
-impl GpioBank {
-    fn async_operations(self) -> &'static AtomicU32 {
-        static FLAGS: [AtomicU32; GpioBank::COUNT] = [const { AtomicU32::new(0) }; GpioBank::COUNT];
-
-        &FLAGS[self as usize]
-    }
-
-    fn offset(self) -> u8 {
-        match self {
-            Self::_0 => 0,
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => 32,
-        }
-    }
-
-    fn write_out_en(self, word: u32, enable: bool) {
-        if enable {
-            self.write_out_en_set(word);
-        } else {
-            self.write_out_en_clear(word);
-        }
-    }
-
-    fn write_out_en_clear(self, word: u32) {
-        match self {
-            Self::_0 => GPIO::regs()
-                .enable_w1tc()
-                .write(|w| unsafe { w.bits(word) }),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs()
-                .enable1_w1tc()
-                .write(|w| unsafe { w.bits(word) }),
-        };
-    }
-
-    fn write_out_en_set(self, word: u32) {
-        match self {
-            Self::_0 => GPIO::regs()
-                .enable_w1ts()
-                .write(|w| unsafe { w.bits(word) }),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs()
-                .enable1_w1ts()
-                .write(|w| unsafe { w.bits(word) }),
-        };
-    }
-
-    fn read_input(self) -> u32 {
-        match self {
-            Self::_0 => GPIO::regs().in_().read().bits(),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs().in1().read().bits(),
-        }
-    }
-
-    fn read_output(self) -> u32 {
-        match self {
-            Self::_0 => GPIO::regs().out().read().bits(),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs().out1().read().bits(),
-        }
-    }
-
-    fn read_interrupt_status(self) -> u32 {
-        match self {
-            Self::_0 => GPIO::regs().status().read().bits(),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs().status1().read().bits(),
-        }
-    }
-
-    fn write_interrupt_status_clear(self, word: u32) {
-        match self {
-            Self::_0 => GPIO::regs()
-                .status_w1tc()
-                .write(|w| unsafe { w.bits(word) }),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs()
-                .status1_w1tc()
-                .write(|w| unsafe { w.bits(word) }),
-        };
-    }
-
-    fn write_output(self, word: u32, set: bool) {
-        if set {
-            self.write_output_set(word);
-        } else {
-            self.write_output_clear(word);
-        }
-    }
-
-    fn write_output_set(self, word: u32) {
-        match self {
-            Self::_0 => GPIO::regs().out_w1ts().write(|w| unsafe { w.bits(word) }),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs().out1_w1ts().write(|w| unsafe { w.bits(word) }),
-        };
-    }
-
-    fn write_output_clear(self, word: u32) {
-        match self {
-            Self::_0 => GPIO::regs().out_w1tc().write(|w| unsafe { w.bits(word) }),
-            #[cfg(gpio_has_bank_1)]
-            Self::_1 => GPIO::regs().out1_w1tc().write(|w| unsafe { w.bits(word) }),
-        };
-    }
 }
 
 /// Any GPIO pin.
@@ -632,24 +522,18 @@ impl<'d> Io<'d> {
         Io { _io_mux }
     }
 
-    /// Set the interrupt priority for GPIO interrupts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if passed interrupt handler is invalid (e.g. has priority
-    /// `None`)
+    #[doc = cfg_select!(
+        any(single_core, esp32s3) => "Sets the the interrupt priority and enables GPIO interrupts.",
+        _ => "Sets the interrupt priority and enables GPIO interrupts on all cores.",
+    )]
     #[instability::unstable]
     pub fn set_interrupt_priority(&self, prio: Priority) {
-        interrupt::set_interrupt_priority(Interrupt::GPIO, prio);
+        low_level::set_interrupt_priority(prio);
     }
 
-    #[cfg_attr(
-        not(multi_core),
-        doc = "Registers an interrupt handler for all GPIO pins."
-    )]
-    #[cfg_attr(
-        multi_core,
-        doc = "Registers an interrupt handler for all GPIO pins on the current core."
+    #[doc = cfg_select!(
+        any(single_core, esp32s3) => "Registers an interrupt handler for all GPIO pins.",
+        _ => "Registers an interrupt handler for all GPIO pins. Enables interrupts on all cores.",
     )]
     #[doc = ""]
     /// Note that when using interrupt handlers registered by this function, or
@@ -667,24 +551,13 @@ impl<'d> Io<'d> {
     ///
     /// [`listen()`]: Input::listen
     /// [`is_interrupt_set()`]: Input::is_interrupt_set
-    ///
-    /// # Panics
-    ///
-    /// Panics if passed interrupt handler is invalid (e.g. has priority
-    /// `None`)
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
-        for core in crate::system::Cpu::other() {
-            crate::interrupt::disable(core, Interrupt::GPIO);
-        }
-        self.set_interrupt_priority(handler.priority());
-        unsafe {
-            crate::interrupt::bind_interrupt(
-                Interrupt::GPIO,
-                crate::interrupt::IsrCallback::new(user_gpio_interrupt_handler),
-            )
-        };
-        USER_INTERRUPT_HANDLER.store(handler.handler().aligned_ptr());
+        USER_INTERRUPT_HANDLER.store(handler.handler().callback());
+        low_level::enable_interrupt(InterruptHandler::new(
+            user_gpio_interrupt_handler,
+            handler.priority(),
+        ));
     }
 }
 
@@ -695,6 +568,33 @@ impl crate::interrupt::InterruptConfigurable for Io<'_> {
     fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
         self.set_interrupt_handler(handler);
     }
+}
+
+/// Drive the GPIO async API from a user-installed raw GPIO interrupt handler.
+///
+/// This is the entry point that lets users who bypass esp-hal's GPIO ISR
+/// dispatch (typically by defining their own `#[unsafe(no_mangle)]
+/// unsafe extern "C" fn GPIO()`, or by registering their own handler via
+/// [`crate::interrupt::bind_handler`]) keep the GPIO async API working.
+///
+/// # Safety
+///
+/// Must be called from a GPIO interrupt context.
+#[instability::unstable]
+pub unsafe fn handle_gpio_interrupt() {
+    unsafe { interrupt::handle_gpio_interrupt_impl() }
+}
+
+/// Complete any in-flight async wait on a single GPIO pin.
+///
+/// Per-pin counterpart of [`handle_gpio_interrupt`].
+///
+/// # Safety
+///
+/// Must be called from a GPIO interrupt context.
+#[instability::unstable]
+pub unsafe fn wake_pin(pin: u8) {
+    unsafe { interrupt::wake_pin_impl(pin) }
 }
 
 for_each_analog_function! {
@@ -1026,6 +926,26 @@ impl<'d> Output<'d> {
     }
 }
 
+/// Configures the clock edge used in one of the two input synchronization stages to synchronize the
+/// GPIO input signal to the system clock, reducing metastability.
+///
+/// See [`InputConfig::with_input_sync_stage1`] and
+/// [`InputConfig::with_input_sync_stage2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
+#[cfg(gpio_has_input_sync)]
+pub enum InputSync {
+    /// Stage is disabled; the signal passes through without latching (hardware
+    /// default).
+    #[default]
+    Disabled     = 0,
+    /// Stage latches on the falling edge of the GPIO clock.
+    NegativeEdge = 1,
+    /// Stage latches on the rising edge of the GPIO clock.
+    PositiveEdge = 2,
+}
+
 /// Input pin configuration.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, procmacros::BuilderLite)]
@@ -1033,11 +953,31 @@ impl<'d> Output<'d> {
 pub struct InputConfig {
     /// Initial pull of the pin.
     pull: Pull,
+
+    /// First input synchronization stage.
+    ///
+    /// Default value: [`InputSync::Disabled`].
+    #[cfg(gpio_has_input_sync)]
+    #[builder_lite(unstable)]
+    input_sync_stage1: InputSync,
+
+    /// Second input synchronization stage.
+    ///
+    /// Default value: [`InputSync::Disabled`].
+    #[cfg(gpio_has_input_sync)]
+    #[builder_lite(unstable)]
+    input_sync_stage2: InputSync,
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
-        Self { pull: Pull::None }
+        Self {
+            pull: Pull::None,
+            #[cfg(gpio_has_input_sync)]
+            input_sync_stage1: Default::default(),
+            #[cfg(gpio_has_input_sync)]
+            input_sync_stage2: Default::default(),
+        }
     }
 }
 
@@ -1251,7 +1191,7 @@ impl<'d> Input<'d> {
     /// // that the interrupt handler can access it.
     /// static BUTTON: Mutex<RefCell<Option<Input>>> = Mutex::new(RefCell::new(None));
     ///
-    /// #[handler]
+    /// #[esp_hal::handler]
     /// fn handler() {
     ///     critical_section::with(|cs| {
     ///         let mut button = BUTTON.borrow_ref_mut(cs);
@@ -1405,7 +1345,7 @@ impl<'d> Flex<'d> {
     pub fn listen(&mut self, event: Event) {
         // Unwrap can't fail currently as listen_with_options is only supposed to return
         // an error if wake_up_from_light_sleep is true.
-        unwrap!(self.pin.listen_with_options(event, true, false, false));
+        unwrap!(self.pin.listen_with_options(event, true, false));
     }
 
     /// Stop listening for interrupts.
@@ -1458,8 +1398,7 @@ impl<'d> Flex<'d> {
     #[inline]
     #[instability::unstable]
     pub fn wakeup_enable(&mut self, enable: bool, event: WakeEvent) -> Result<(), WakeConfigError> {
-        self.pin
-            .listen_with_options(event.into(), false, false, enable)
+        self.pin.listen_with_options(event.into(), false, enable)
     }
 
     // Output functions
@@ -1665,12 +1604,7 @@ impl private::Sealed for AnyPin<'_> {}
 
 impl<'lt> AnyPin<'lt> {
     fn bank(&self) -> GpioBank {
-        #[cfg(gpio_has_bank_1)]
-        if self.number() >= 32 {
-            return GpioBank::_1;
-        }
-
-        GpioBank::_0
+        low_level::bank(self.number())
     }
 
     pub(crate) fn disable_usb_pads(&self) {
@@ -1690,17 +1624,44 @@ impl<'lt> AnyPin<'lt> {
                     });
             }
 
-            macro_rules! disable_usb_pads {
+            #[cfg(esp32p4)]
+            fn disable_usb_fs_pads(_gpionum: u8) {
+                crate::peripherals::USB_WRAP::regs()
+                    .otg_conf()
+                    .modify(|_, w| {
+                        w.pad_pull_override().set_bit();
+                        w.dm_pullup().clear_bit();
+                        w.dm_pulldown().clear_bit();
+                        w.dp_pullup().clear_bit();
+                        w.dp_pulldown().clear_bit()
+                    });
+            }
+
+            #[cfg(soc_has_usb_fs)]
+            macro_rules! disable_usb_fs_pads {
                 ($gpio:ident) => {
                     if self.number() == crate::peripherals::$gpio::NUMBER {
+                        #[cfg(esp32p4)]
+                        disable_usb_fs_pads(crate::peripherals::$gpio::NUMBER);
+                        #[cfg(not(esp32p4))]
                         disable_usb_pads(crate::peripherals::$gpio::NUMBER);
                     }
                 };
             }
 
             for_each_analog_function! {
-                (USB_DM, $gpio:ident) => { disable_usb_pads!($gpio) };
-                (USB_DP, $gpio:ident) => { disable_usb_pads!($gpio) };
+                (USJ_DM, $gpio:ident) => {
+                    if self.number() == crate::peripherals::$gpio::NUMBER {
+                        disable_usb_pads(crate::peripherals::$gpio::NUMBER);
+                    }
+                };
+                (USJ_DP, $gpio:ident) => {
+                    if self.number() == crate::peripherals::$gpio::NUMBER {
+                        disable_usb_pads(crate::peripherals::$gpio::NUMBER);
+                    }
+                };
+                (USB_FS_DM, $gpio:ident) => { disable_usb_fs_pads!($gpio) };
+                (USB_FS_DP, $gpio:ident) => { disable_usb_fs_pads!($gpio) };
             }
         }
     }
@@ -1715,9 +1676,23 @@ impl<'lt> AnyPin<'lt> {
         self.set_output_enable(false);
         self.disable_usb_pads();
 
+        #[cfg(any(xtensa, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4))]
+        for_each_lp_function! {
+            (($_signal:ident, LP_GPIOn, $_lp_pin:literal), $gpio:ident) => {
+                if self.number() == crate::peripherals::$gpio::NUMBER {
+                    RtcPin::rtc_set_config(self, false, false, RtcFunction::Digital);
+                }
+            };
+            (($_signal:ident, RTC_GPIOn, $_lp_pin:literal), $gpio:ident) => {
+                if self.number() == crate::peripherals::$gpio::NUMBER {
+                    RtcPin::rtc_set_config(self, false, false, RtcFunction::Digital);
+                }
+            };
+        }
+
         GPIO::regs()
             .func_out_sel_cfg(self.number() as usize)
-            .modify(|_, w| unsafe { w.out_sel().bits(OutputSignal::GPIO as _) });
+            .write(|w| unsafe { w.out_sel().bits(OutputSignal::GPIO as _) });
 
         // Use RMW to not overwrite sleep configuration
         io_mux_reg(self.number()).modify(|_, w| unsafe {
@@ -1872,12 +1847,21 @@ impl<'lt> AnyPin<'lt> {
         let pull_up = config.pull == Pull::Up;
         let pull_down = config.pull == Pull::Down;
 
-        #[cfg(esp32)]
-        crate::soc::gpio::errata36(unsafe { self.clone_unchecked() }, pull_up, pull_down);
+        low_level::prepare_pin_pull(self, pull_up, pull_down);
 
         io_mux_reg(self.number()).modify(|_, w| {
             w.fun_wpd().bit(pull_down);
             w.fun_wpu().bit(pull_up)
+        });
+
+        #[cfg(gpio_has_input_sync)]
+        self.with_gpio_lock(|| {
+            GPIO::regs()
+                .pin(self.number() as usize)
+                .modify(|_, w| unsafe {
+                    w.sync1_bypass().bits(config.input_sync_stage1 as u8);
+                    w.sync2_bypass().bits(config.input_sync_stage2 as u8)
+                });
         });
     }
 
@@ -1902,24 +1886,8 @@ impl<'lt> AnyPin<'lt> {
         &self,
         event: Event,
         int_enable: bool,
-        nmi_enable: bool,
         wake_up_from_light_sleep: bool,
     ) -> Result<(), WakeConfigError> {
-        /// Assembles a valid value for the int_ena pin register field.
-        fn gpio_intr_enable(int_enable: bool, nmi_enable: bool) -> u8 {
-            cfg_if::cfg_if! {
-                if #[cfg(esp32)] {
-                    match crate::system::Cpu::current() {
-                        crate::system::Cpu::AppCpu => int_enable as u8 | ((nmi_enable as u8) << 1),
-                        crate::system::Cpu::ProCpu => ((int_enable as u8) << 2) | ((nmi_enable as u8) << 3),
-                    }
-                } else {
-                    // ESP32 and ESP32-C3 have separate bits for maskable and NMI interrupts.
-                    int_enable as u8 | ((nmi_enable as u8) << 1)
-                }
-            }
-        }
-
         if wake_up_from_light_sleep {
             match event {
                 Event::AnyEdge | Event::RisingEdge | Event::FallingEdge => {
@@ -1937,7 +1905,7 @@ impl<'lt> AnyPin<'lt> {
 
             set_int_enable(
                 self.number(),
-                Some(gpio_intr_enable(int_enable, nmi_enable)),
+                Some(gpio_intr_enable(int_enable)),
                 event as u8,
                 wake_up_from_light_sleep,
             );
@@ -1950,8 +1918,7 @@ impl<'lt> AnyPin<'lt> {
         let pull_up = config.pull == Pull::Up;
         let pull_down = config.pull == Pull::Down;
 
-        #[cfg(esp32)]
-        crate::soc::gpio::errata36(unsafe { self.clone_unchecked() }, pull_up, pull_down);
+        low_level::prepare_pin_pull(self, pull_up, pull_down);
 
         io_mux_reg(self.number()).modify(|_, w| {
             unsafe { w.fun_drv().bits(config.drive_strength as u8) };
@@ -2209,6 +2176,7 @@ fn pin_does_not_support_function(pin: u8, function: &str) {
     panic!("Pin {} is not an {}", pin, function)
 }
 
+#[cfg(lp_io_driver_supported)]
 macro_rules! for_each_rtcio_pin {
     (@impl $ident:ident, $target:ident, $gpio:ident, $code:tt) => {
         if $ident.number() == $crate::peripherals::$gpio::NUMBER {
@@ -2231,7 +2199,7 @@ macro_rules! for_each_rtcio_pin {
     };
 }
 
-#[cfg(not(esp32h2))]
+#[cfg(lp_io_driver_supported)]
 macro_rules! for_each_rtcio_output_pin {
     (@impl $ident:ident, $target:ident, $gpio:ident, $code:tt, $kind:literal) => {
         if $ident.number() == $crate::peripherals::$gpio::NUMBER {
@@ -2263,15 +2231,16 @@ macro_rules! for_each_rtcio_output_pin {
     };
 }
 
+#[cfg(lp_io_driver_supported)]
 impl RtcPin for AnyPin<'_> {
-    #[cfg(any(xtensa, esp32h2))]
     fn rtc_number(&self) -> u8 {
         for_each_rtcio_pin! {
             (self, target) => { RtcPin::rtc_number(&target) };
         }
     }
 
-    #[cfg(any(xtensa, esp32c6))]
+    // Keep device cfg aligned with init_gpio!
+    #[cfg(any(xtensa, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4))]
     fn rtc_set_config(&self, input_enable: bool, mux: bool, func: RtcFunction) {
         for_each_rtcio_pin! {
             (self, target) => { RtcPin::rtc_set_config(&target, input_enable, mux, func) };
@@ -2284,7 +2253,7 @@ impl RtcPin for AnyPin<'_> {
         }
     }
 
-    #[cfg(any(esp32c2, esp32c3, esp32c6))]
+    #[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6, esp32c61, esp32p4))]
     unsafe fn apply_wakeup(&self, wakeup: bool, level: u8) {
         for_each_rtcio_pin! {
             (self, target) => { unsafe { RtcPin::apply_wakeup(&target, wakeup, level) } };
@@ -2292,40 +2261,19 @@ impl RtcPin for AnyPin<'_> {
     }
 }
 
+#[cfg(lp_io_driver_supported)]
 impl RtcPinWithResistors for AnyPin<'_> {
-    #[cfg(not(esp32h2))]
     fn rtcio_pullup(&self, enable: bool) {
         for_each_rtcio_output_pin! {
             (self, target) => { RtcPinWithResistors::rtcio_pullup(&target, enable) };
         }
     }
 
-    #[cfg(not(esp32h2))]
     fn rtcio_pulldown(&self, enable: bool) {
         for_each_rtcio_output_pin! {
             (self, target) => { RtcPinWithResistors::rtcio_pulldown(&target, enable) };
         }
     }
-}
-
-/// Set GPIO event listening.
-///
-/// - `gpio_num`: the pin to configure
-/// - `int_ena`: maskable and non-maskable CPU interrupt bits. None to leave unchanged.
-/// - `int_type`: interrupt type, see [Event] (or 0 to disable)
-/// - `wake_up_from_light_sleep`: whether to wake up from light sleep
-fn set_int_enable(gpio_num: u8, int_ena: Option<u8>, int_type: u8, wake_up_from_light_sleep: bool) {
-    GPIO::regs().pin(gpio_num as usize).modify(|_, w| unsafe {
-        if let Some(int_ena) = int_ena {
-            w.int_ena().bits(int_ena);
-        }
-        w.int_type().bits(int_type);
-        w.wakeup_enable().bit(wake_up_from_light_sleep)
-    });
-}
-
-fn is_int_enabled(gpio_num: u8) -> bool {
-    GPIO::regs().pin(gpio_num as usize).read().int_ena().bits() != 0
 }
 
 for_each_gpio! {
@@ -2390,13 +2338,13 @@ for_each_gpio! {
 
             fn output_signals(&self, _: crate::private::Internal) -> &'static [(AlternateFunction, OutputSignal)] {
                 &[$(
-                        (AlternateFunction::$af_output_num, OutputSignal::$af_output_signal),
+                    (AlternateFunction::$af_output_num, OutputSignal::$af_output_signal),
                 )*]
             }
 
             fn input_signals(&self, _: crate::private::Internal) -> &'static [(AlternateFunction, InputSignal)] {
                 &[$(
-                        (AlternateFunction::$af_input_num, InputSignal::$af_input_signal),
+                    (AlternateFunction::$af_input_num, InputSignal::$af_input_signal),
                 )*]
             }
         }

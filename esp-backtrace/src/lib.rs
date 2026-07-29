@@ -26,7 +26,7 @@
 //! for this crate:
 #![doc = ""]
 #![doc = include_str!(concat!(env!("OUT_DIR"), "/esp_backtrace_config_table.md"))]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 #![no_std]
 
@@ -41,6 +41,7 @@ use esp_println as _;
 const MAX_BACKTRACE_ADDRESSES: usize =
     esp_config::esp_config_int!(usize, "ESP_BACKTRACE_CONFIG_BACKTRACE_FRAMES");
 
+#[derive(Clone)]
 pub struct Backtrace(pub(crate) heapless::Vec<BacktraceFrame, MAX_BACKTRACE_ADDRESSES>);
 
 impl Backtrace {
@@ -57,6 +58,7 @@ impl Backtrace {
     }
 }
 
+#[derive(Clone)]
 pub struct BacktraceFrame {
     pub(crate) pc: usize,
 }
@@ -113,9 +115,8 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
     println!("{}", info);
     set_color_code(RESET);
 
-    cfg_if::cfg_if! {
-        if #[cfg(not(stack_dump))]
-        {
+    cfg_select! {
+        not(stack_dump) => {
             println!("");
             println!("Backtrace:");
             println!("");
@@ -130,7 +131,8 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
             for frame in backtrace.frames() {
                 println!("0x{:x}", frame.program_counter());
             }
-        } else {
+        }
+        _ => {
             arch::dump_stack();
         }
     }
@@ -199,20 +201,23 @@ fn abort() -> ! {
     println!("");
     println!("");
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "semihosting")] {
+    cfg_select! {
+        feature = "semihosting" => {
             arch::interrupt_free(|| {
                 semihosting::process::abort();
             });
-        } else if #[cfg(feature = "halt-cores")] {
+        }
+        feature = "halt-cores" => {
             halt();
-        } else if #[cfg(feature = "custom-halt")] {
+        }
+        feature = "custom-halt" => {
             // call custom code
             unsafe extern "Rust" {
                 fn custom_halt() -> !;
             }
             unsafe { custom_halt() }
         }
+        _ => {}
     }
 
     #[allow(unreachable_code)]

@@ -26,7 +26,6 @@ use crate::{
     asynch::AtomicWaker,
     interrupt::{self, InterruptHandler},
     peripherals::{Interrupt, SYSTIMER},
-    soc::clocks::ClockTree,
     system::{Cpu, Peripheral as PeripheralEnable, PeripheralClockControl},
     time::{Duration, Instant},
 };
@@ -96,13 +95,14 @@ pub struct SystemTimer<'d> {
 }
 
 impl<'d> SystemTimer<'d> {
-    cfg_if::cfg_if! {
-        if #[cfg(esp32s2)] {
+    cfg_select! {
+        esp32s2 => {
             /// Bitmask to be applied to the raw register value.
             pub const BIT_MASK: u64 = u64::MAX;
             // Bitmask to be applied to the raw period register value.
             const PERIOD_MASK: u64 = 0x1FFF_FFFF;
-        } else {
+        }
+        _ => {
             /// Bitmask to be applied to the raw register value.
             pub const BIT_MASK: u64 = 0xF_FFFF_FFFF_FFFF;
             // Bitmask to be applied to the raw period register value.
@@ -167,7 +167,7 @@ impl<'d> SystemTimer<'d> {
     }
 
     #[inline]
-    fn us_to_ticks(us: u64) -> u64 {
+    pub(crate) fn us_to_ticks(us: u64) -> u64 {
         // Safety: we only ever write ESP_HAL_SYSTIMER_CORRECTION in `init_timestamp_scaler`, which
         // is called once and only once during startup.
         let correction = unsafe { ESP_HAL_SYSTIMER_CORRECTION };
@@ -196,29 +196,39 @@ impl<'d> SystemTimer<'d> {
     pub fn ticks_per_second() -> u64 {
         // FIXME: this requires a critical section. We can probably do better, if we can formulate
         // invariants well.
-        ClockTree::with(|clocks| {
-            cfg_if::cfg_if! {
-                if #[cfg(esp32s2)] {
-                    crate::soc::clocks::apb_clk_frequency(clocks) as u64
-                } else if #[cfg(esp32h2)] {
-                    // The counters and comparators are driven using `XTAL_CLK`.
-                    // The average clock frequency is fXTAL_CLK/2, (16 MHz for XTAL = 32 MHz)
-                    (crate::soc::clocks::xtal_clk_frequency(clocks) / 2) as u64
-                } else {
-                    // The counters and comparators are driven using `XTAL_CLK`.
-                    // The average clock frequency is fXTAL_CLK/2.5 (16 MHz for XTAL = 40 MHz)
-                    (crate::soc::clocks::xtal_clk_frequency(clocks) * 10 / 25) as u64
+        cfg_select! {
+            esp32c5 => {
+                // Assuming SYSTIMER runs from XTAL, the hardware always runs at 16 MHz.
+                16_000_000
+            }
+            _ => {
+                cfg_select! {
+                    esp32s2 => {
+                        crate::soc::clocks::apb_clk_frequency() as u64
+                    }
+                    esp32h2 => {
+                        (crate::soc::clocks::xtal_clk_frequency() / 2) as u64
+                    }
+                    _ => {
+                        (crate::soc::clocks::xtal_clk_frequency() * 10 / 25) as u64
+                    }
                 }
             }
-        })
+        }
     }
 
     /// Create a new instance.
     pub fn new(_systimer: SYSTIMER<'d>) -> Self {
         // Don't reset Systimer as it will break `time::Instant::now`, only enable it
-        PeripheralClockControl::enable(PeripheralEnable::Systimer);
+        if PeripheralClockControl::enable(PeripheralEnable::Systimer) {
+            PeripheralClockControl::reset(PeripheralEnable::Systimer);
+        } else {
+            // Refcount was more than 0. Decrement to avoid overflow because we don't handle
+            // dropping the driver.
+            PeripheralClockControl::disable(PeripheralEnable::Systimer);
+        }
 
-        #[cfg(soc_has_etm)]
+        #[cfg(etm_driver_supported)]
         etm::enable_etm();
 
         Self {
@@ -327,28 +337,26 @@ impl Unit {
 
     fn set_count(&self, value: u64) {
         let systimer = SYSTIMER::regs();
-        #[cfg(not(esp32s2))]
-        {
-            let unitload = systimer.unitload(self.channel() as _);
-            let unit_load = systimer.unit_load(self.channel() as _);
 
-            unitload.hi().write(|w| w.load_hi().set((value << 32) as _));
-            unitload
-                .lo()
-                .write(|w| w.load_lo().set((value & 0xFFFF_FFFF) as _));
+        let value_lo = (value & 0xFFFF_FFFF) as _;
+        let value_hi = (value >> 32) as _;
 
-            unit_load.write(|w| w.load().set_bit());
-        }
-        #[cfg(esp32s2)]
-        {
-            systimer
-                .load_hi()
-                .write(|w| w.load_hi().set((value << 32) as _));
-            systimer
-                .load_lo()
-                .write(|w| w.load_lo().set((value & 0xFFFF_FFFF) as _));
+        cfg_select! {
+            esp32s2 => {
+                systimer.load_hi().write(|w| w.load_hi().set(value_hi));
+                systimer.load_lo().write(|w| w.load_lo().set(value_lo));
 
-            systimer.load().write(|w| w.load().set_bit());
+                systimer.load().write(|w| w.load().set_bit());
+            }
+            _ => {
+                let unitload = systimer.unitload(self.channel() as _);
+                let unit_load = systimer.unit_load(self.channel() as _);
+
+                unitload.hi().write(|w| w.load_hi().set(value_hi));
+                unitload.lo().write(|w| w.load_lo().set(value_lo));
+
+                unit_load.write(|w| w.load().set_bit());
+            }
         }
     }
 
@@ -555,9 +563,7 @@ impl Alarm<'_> {
         }
 
         #[cfg(not(esp32s2))]
-        unsafe {
-            interrupt::bind_interrupt(interrupt, handler.handler());
-        }
+        interrupt::bind_handler(interrupt, handler);
 
         #[cfg(esp32s2)]
         {
@@ -574,23 +580,26 @@ impl Alarm<'_> {
                 if SYSTIMER::regs().int_raw().read().target(CH).bit_is_set() {
                     let handler = unsafe { HANDLERS[CH as usize] };
                     if let Some(handler) = handler {
-                        (handler.aligned_ptr())();
+                        (handler.callback())();
                     }
                 }
             }
 
+            let priority = handler.priority();
             unsafe {
                 HANDLERS[self.channel() as usize] = Some(handler.handler());
-                let handler = match self.channel() {
-                    0 => _handle_interrupt::<0>,
-                    1 => _handle_interrupt::<1>,
-                    2 => _handle_interrupt::<2>,
-                    _ => unreachable!(),
-                };
-                interrupt::bind_interrupt(interrupt, crate::interrupt::IsrCallback::new(handler));
             }
+            let handler = match self.channel() {
+                0 => _handle_interrupt::<0>,
+                1 => _handle_interrupt::<1>,
+                2 => _handle_interrupt::<2>,
+                _ => unreachable!(),
+            };
+            interrupt::bind_handler(
+                interrupt,
+                crate::interrupt::InterruptHandler::new(handler, priority),
+            );
         }
-        unwrap!(interrupt::enable(interrupt, handler.priority()));
     }
 }
 
@@ -792,7 +801,7 @@ mod asynch {
     }
 }
 
-#[cfg(soc_has_etm)]
+#[cfg(etm_driver_supported)]
 pub mod etm {
     #![cfg_attr(docsrs, procmacros::doc_replace)]
     //! # Event Task Matrix Function

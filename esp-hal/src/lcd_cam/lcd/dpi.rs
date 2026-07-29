@@ -96,7 +96,6 @@
 //! ```
 
 use core::{
-    marker::PhantomData,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
@@ -104,19 +103,17 @@ use core::{
 use crate::{
     Blocking,
     DriverMode,
-    dma::{ChannelTx, DmaError, DmaPeripheral, DmaTxBuffer, PeripheralTxChannel, TxChannelFor},
+    dma::{ChannelTx, DmaError, DmaPeripheral, DmaTxBuffer},
     gpio::{Level, OutputConfig, OutputSignal, interconnect::PeripheralOutput},
     lcd_cam::{
         BitOrder,
         ByteOrder,
         ClockError,
-        calculate_clkm,
-        lcd::{ClockMode, DelayMode, Lcd, Phase, Polarity},
+        ErasedTxChannel,
+        LcdDmaTxChannel,
+        lcd::{ClockConfig, ClockMode, DelayMode, Lcd},
     },
     pac,
-    peripherals::LCD_CAM,
-    soc::clocks::ClockTree,
-    system::{self, GenericPeripheralGuard},
     time::Rate,
 };
 
@@ -130,10 +127,8 @@ pub enum ConfigError {
 
 /// Represents the RGB LCD interface.
 pub struct Dpi<'d, Dm: DriverMode> {
-    lcd_cam: LCD_CAM<'d>,
-    tx_channel: ChannelTx<Blocking, PeripheralTxChannel<LCD_CAM<'d>>>,
-    _guard: GenericPeripheralGuard<{ system::Peripheral::LcdCam as u8 }>,
-    _mode: PhantomData<Dm>,
+    lcd: Lcd<'d, Dm>,
+    tx_channel: ChannelTx<Blocking, ErasedTxChannel<'d>>,
 }
 
 impl<'d, Dm> Dpi<'d, Dm>
@@ -143,17 +138,13 @@ where
     /// Create a new instance of the RGB/DPI driver.
     pub fn new(
         lcd: Lcd<'d, Dm>,
-        channel: impl TxChannelFor<LCD_CAM<'d>>,
+        channel: impl LcdDmaTxChannel<'d>,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let tx_channel = ChannelTx::new(channel.degrade());
+        let tx_channel = ChannelTx::new(channel.into());
+        tx_channel.runtime_ensure_compatible(DmaPeripheral::LCD_CAM);
 
-        let mut this = Self {
-            lcd_cam: lcd.lcd_cam,
-            tx_channel,
-            _guard: lcd._guard,
-            _mode: PhantomData,
-        };
+        let mut this = Self { lcd, tx_channel };
 
         this.apply_config(&config)?;
 
@@ -161,7 +152,7 @@ where
     }
 
     fn regs(&self) -> &pac::lcd_cam::RegisterBlock {
-        self.lcd_cam.register_block()
+        self.lcd.regs()
     }
 
     /// Applies the configuration to the peripheral.
@@ -171,35 +162,16 @@ where
     /// [`ConfigError::Clock`] variant will be returned if the frequency passed
     /// in `Config` is too low.
     pub fn apply_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-        // Due to https://www.espressif.com/sites/default/files/documentation/esp32-s3_errata_en.pdf
-        // the LCD_PCLK divider must be at least 2. To make up for this the user
-        // provided frequency is doubled to match.
-        let (i, divider) = ClockTree::with(|clocks| {
-            calculate_clkm(
-                (config.frequency.as_hz() * 2) as _,
-                &[
-                    crate::soc::clocks::xtal_clk_frequency(clocks) as usize,
-                    crate::soc::clocks::pll_d2_frequency(clocks) as usize,
-                    crate::soc::clocks::crypto_pwm_clk_frequency(clocks) as usize,
-                ],
-            )
-        })
-        .map_err(ConfigError::Clock)?;
+        self.lcd
+            .configure_clocks(&ClockConfig {
+                clock_mode: config.clock_mode,
+                // Due to https://www.espressif.com/sites/default/files/documentation/esp32-s3_errata_en.pdf
+                // the LCD_PCLK divider must be at least 2. To make up for this the user
+                // provided frequency is doubled to match.
+                frequency: config.frequency * 2,
+            })
+            .map_err(ConfigError::Clock)?;
 
-        self.regs().lcd_clock().write(|w| unsafe {
-            // Force enable the clock for all configuration registers.
-            w.clk_en().set_bit();
-            w.lcd_clk_sel().bits((i + 1) as _);
-            w.lcd_clkm_div_num().bits(divider.div_num as _);
-            w.lcd_clkm_div_b().bits(divider.div_b as _);
-            w.lcd_clkm_div_a().bits(divider.div_a as _); // LCD_PCLK = LCD_CLK / 2
-            w.lcd_clk_equ_sysclk().clear_bit();
-            w.lcd_clkcnt_n().bits(2 - 1); // Must not be 0.
-            w.lcd_ck_idle_edge()
-                .bit(config.clock_mode.polarity == Polarity::IdleHigh);
-            w.lcd_ck_out_edge()
-                .bit(config.clock_mode.phase == Phase::ShiftHigh)
-        });
         self.regs()
             .lcd_user()
             .modify(|_, w| w.lcd_reset().set_bit());
@@ -511,7 +483,7 @@ where
     ) -> Result<DpiTransfer<'d, TX, Dm>, (DmaError, Self, TX)> {
         let result = unsafe {
             self.tx_channel
-                .prepare_transfer(DmaPeripheral::LcdCam, &mut buf)
+                .prepare_transfer(DmaPeripheral::LCD_CAM, &mut buf)
         }
         .and_then(|_| self.tx_channel.start_transfer());
         if let Err(err) = result {

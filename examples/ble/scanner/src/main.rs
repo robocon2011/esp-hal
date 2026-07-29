@@ -1,5 +1,7 @@
 //! A bluetooth scanner built using Embassy and trouBLE.
 
+//% CHIP_FILTER: bt_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -23,7 +25,7 @@ use trouble_host::prelude::*;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_s: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
@@ -55,15 +57,13 @@ where
 
     info!("Our address = {:?}", address);
 
-    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+    let mut resources: HostResources<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
-
-    let Host {
-        central,
-        mut runner,
-        ..
-    } = stack.build();
+    let stack = trouble_host::new(controller, &mut resources)
+        .set_random_address(address)
+        .build();
+    let mut runner = stack.runner();
+    let central = stack.central();
 
     let printer = Printer {
         seen: RefCell::new(Deque::new()),

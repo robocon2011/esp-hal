@@ -4,7 +4,7 @@
 //! - SDA => GPIO4
 //! - SCL => GPIO5
 
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: i2c_master_driver_supported
 //% TAG: ssd1306
 
 #![no_std]

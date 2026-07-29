@@ -53,19 +53,22 @@
 //! [split](AnyPin::split) into signals. In this case you need to carefully
 //! ensure that only a single driver configures the split pin, by selectively
 //! [freezing](`InputSignal::freeze`) the signals.
-//!
-//! For example, if you want to route GPIO3 to both a Pulse Counter
-//! input and a [UART](crate::uart::Uart) RX line, you will need to make sure
-//! one of the signals is frozen, otherwise the driver that is configured later
-//! will overwrite the other driver's configuration. Configuring the signals on
-//! multiple cores is undefined behaviour unless you ensure the configuration
-//! does not happen at the same time.
-//!
+#![cfg_attr(
+    uart_driver_supported,
+    doc = "\n\nFor example, if you want to route GPIO3 to both a Pulse Counter
+ input and a [UART](crate::uart::Uart) RX line, you will need to make sure
+ one of the signals is frozen, otherwise the driver that is configured later
+ will overwrite the other driver's configuration. Configuring the signals on
+ multiple cores is undefined behaviour unless you ensure the configuration
+ does not happen at the same time."
+)]
 //! ### Using pins and signals
 //!
 //! A GPIO pin can be configured either with a GPIO driver such as [`Input`], or
 //! by a peripheral driver using a pin assignment method such as
-//! [`Spi::with_mosi`]. The peripheral drivers' preferences can be overridden by
+#![cfg_attr(spi_master_driver_supported, doc = "[`Spi::with_mosi`].")]
+#![cfg_attr(not(spi_master_driver_supported), doc = "`Spi::with_mosi`.")]
+//! The peripheral drivers' preferences can be overridden by
 //! passing a pin driver to the peripheral driver. When converting a driver to
 //! signals, the underlying signals will be initially
 //! [frozen](InputSignal::freeze) to support this use case.
@@ -93,7 +96,12 @@
 //! - A GPIO output can be driven by only one peripheral output.
 //!
 //! [`GPIO0`]: crate::peripherals::GPIO0
-//! [`Spi::with_mosi`]: crate::spi::master::Spi::with_mosi
+#![cfg_attr(
+    spi_master_driver_supported,
+    doc = "[`Spi::with_mosi`]: crate::spi::master::Spi::with_mosi"
+)]
+
+use enumset::{EnumSet, EnumSetType};
 
 #[cfg(feature = "unstable")]
 use crate::gpio::{Input, Output};
@@ -501,13 +509,19 @@ impl Signal<'_> {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy)]
-    struct InputFlags: u8 {
-        const ForceGpioMatrix = 1 << 0;
-        const Frozen          = 1 << 1;
-        const InvertInput     = 1 << 2;
+fn set_flag<T: EnumSetType>(flags: &mut EnumSet<T>, flag: T, value: bool) {
+    if value {
+        flags.insert(flag);
+    } else {
+        flags.remove(flag);
     }
+}
+
+#[derive(Debug, EnumSetType)]
+enum InputFlags {
+    ForceGpioMatrix,
+    Frozen,
+    InvertInput,
 }
 
 /// An input signal between a peripheral and a GPIO pin.
@@ -521,7 +535,7 @@ bitflags::bitflags! {
 #[instability::unstable]
 pub struct InputSignal<'d> {
     pin: Signal<'d>,
-    flags: InputFlags,
+    flags: EnumSet<InputFlags>,
 }
 
 impl From<Level> for InputSignal<'_> {
@@ -573,7 +587,7 @@ impl<'d> InputSignal<'d> {
     fn new_inner(inner: Signal<'d>) -> Self {
         Self {
             pin: inner,
-            flags: InputFlags::empty(),
+            flags: EnumSet::empty(),
         }
     }
 
@@ -642,14 +656,14 @@ impl<'d> InputSignal<'d> {
     /// Consumes the signal and returns a new one that inverts the peripheral's
     /// input signal.
     pub fn with_input_inverter(mut self, invert: bool) -> Self {
-        self.flags.set(InputFlags::InvertInput, invert);
+        set_flag(&mut self.flags, InputFlags::InvertInput, invert);
         self
     }
 
     /// Consumes the signal and returns a new one that forces the GPIO matrix
     /// to be used.
     pub fn with_gpio_matrix_forced(mut self, force: bool) -> Self {
-        self.flags.set(InputFlags::ForceGpioMatrix, force);
+        set_flag(&mut self.flags, InputFlags::ForceGpioMatrix, force);
         self
     }
 
@@ -684,14 +698,12 @@ impl<'d> InputSignal<'d> {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy)]
-    struct OutputFlags: u8 {
-        const ForceGpioMatrix = 1 << 0;
-        const Frozen          = 1 << 1;
-        const InvertInput     = 1 << 2;
-        const InvertOutput    = 1 << 3;
-    }
+#[derive(Debug, EnumSetType)]
+enum OutputFlags {
+    ForceGpioMatrix,
+    Frozen,
+    InvertInput,
+    InvertOutput,
 }
 
 /// An (input and) output signal between a peripheral and a GPIO pin.
@@ -708,7 +720,7 @@ bitflags::bitflags! {
 #[instability::unstable]
 pub struct OutputSignal<'d> {
     pin: Signal<'d>,
-    flags: OutputFlags,
+    flags: EnumSet<OutputFlags>,
 }
 
 impl Sealed for OutputSignal<'_> {}
@@ -751,7 +763,7 @@ impl<'d> OutputSignal<'d> {
     fn new_inner(inner: Signal<'d>) -> Self {
         Self {
             pin: inner,
-            flags: OutputFlags::empty(),
+            flags: EnumSet::empty(),
         }
     }
 
@@ -814,25 +826,25 @@ impl<'d> OutputSignal<'d> {
     /// Consumes the signal and returns a new one that inverts the peripheral's
     /// output signal.
     pub fn with_output_inverter(mut self, invert: bool) -> Self {
-        self.flags.set(OutputFlags::InvertOutput, invert);
+        set_flag(&mut self.flags, OutputFlags::InvertOutput, invert);
         self
     }
 
     /// Consumes the signal and returns a new one that inverts the peripheral's
     /// input signal.
     pub fn with_input_inverter(mut self, invert: bool) -> Self {
-        self.flags.set(OutputFlags::InvertInput, invert);
+        set_flag(&mut self.flags, OutputFlags::InvertInput, invert);
         self
     }
 
     /// Consumes the signal and returns a new one that forces the GPIO matrix
     /// to be used.
     pub fn with_gpio_matrix_forced(mut self, force: bool) -> Self {
-        self.flags.set(OutputFlags::ForceGpioMatrix, force);
+        set_flag(&mut self.flags, OutputFlags::ForceGpioMatrix, force);
         self
     }
 
-    /// Returns `true` if the input signal must be routed through the GPIO
+    /// Returns `true` if the output signal must be routed through the GPIO
     /// matrix.
     pub fn is_gpio_matrix_forced(&self) -> bool {
         self.flags.contains(OutputFlags::ForceGpioMatrix)
@@ -855,6 +867,14 @@ impl<'d> OutputSignal<'d> {
 
     #[doc(hidden)]
     #[instability::unstable]
+    #[cfg_attr(
+        not(any(
+            i2c_master_driver_supported,
+            spi_master_driver_supported,
+            uart_driver_supported
+        )),
+        expect(unused)
+    )]
     pub(crate) fn connect_with_guard(self, signal: crate::gpio::OutputSignal) -> PinGuard {
         signal.connect_to(&self);
         match self.pin {

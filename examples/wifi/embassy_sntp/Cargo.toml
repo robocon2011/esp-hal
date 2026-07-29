@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-embassy-executor = "0.9.0"
-embassy-net = { version = "0.8.0", features = [
+embassy-executor = "0.10.0"
+embassy-net = { version = "0.8.0", features = [ # TODO: update once stnpc-net-embassy gets updated
     "dhcpv4",
     "medium-ethernet",
     "udp",
@@ -25,12 +25,11 @@ esp-rtos = { path = "../../../esp-rtos", features = ["esp-radio", "embassy", "lo
 log = "0.4.17"
 esp-radio = { path = "../../../esp-radio", features = [
     "log-04",
-    "wifi",
+    "wifi"
 ] }
 static_cell = "2.1.0"
-sntpc = { version = "0.6.0", default-features = false, features = [
-    "embassy-socket",
-] }
+sntpc = { version = "0.8", default-features = false }
+sntpc-net-embassy = { version = "0.8", default-features = false }
 jiff = { version = "0.2.10", default-features = false, features = ["static"] }
 
 [features]
@@ -75,6 +74,20 @@ esp32s3 = [
     "esp-hal/esp32s3",
     "esp-rtos/esp32s3",
     "esp-radio/esp32s3",
+]
+esp32c5 = [
+    "esp-backtrace/esp32c5",
+    "esp-bootloader-esp-idf/esp32c5",
+    "esp-hal/esp32c5",
+    "esp-rtos/esp32c5",
+    "esp-radio/esp32c5",
+]
+esp32c61 = [
+    "esp-backtrace/esp32c61",
+    "esp-bootloader-esp-idf/esp32c61",
+    "esp-hal/esp32c61",
+    "esp-rtos/esp32c61",
+    "esp-radio/esp32c61",
 ]
 
 [profile.release]

@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use proc_macro2::{TokenStream, TokenStream as TokenStream2};
+use quote::quote;
 use syn::{
     AttrStyle,
     Attribute,
     Expr,
+    ExprLit,
     Item,
     Lit,
     LitStr,
@@ -19,74 +21,141 @@ use syn::{
 };
 
 struct Replacements {
-    replacements: HashMap<String, Vec<TokenStream2>>,
+    // Placeholder => [attribute contents]
+    //
+    // Replaces `# {tag}` placeholders with the attribute contents. Replaces the entire line.
+    line_replacements: HashMap<String, Vec<TokenStream2>>,
+
+    // Placeholder => [(condition, string contents)], may be unconditional.
+    //
+    // Replaces `__tag__` placeholders with the string contents. Replaces only the placeholder
+    // inside the line, and applies the condition to the entire line if present.
+    inline_replacements: HashMap<String, Vec<(Option<TokenStream>, String)>>,
 }
 
 impl Replacements {
-    fn get(&self, line: &str, outer: bool) -> Option<Vec<Attribute>> {
-        let attributes = match line {
-            "# {before_snippet}" if outer => vec![syn::parse_quote! {
-                #[doc = crate::before_snippet!()]
-            }],
-            "# {before_snippet}" => vec![syn::parse_quote! {
-                #![doc = crate::before_snippet!()]
-            }],
-            "# {after_snippet}" if outer => vec![syn::parse_quote! {
-                #[doc = crate::after_snippet!()]
-            }],
-            "# {after_snippet}" => vec![syn::parse_quote! {
-                #![doc = crate::after_snippet!()]
-            }],
-            _ => {
-                let lines = self.replacements.get(line).cloned()?;
-
-                let mut attrs = vec![];
-
+    fn get(&self, lines: &str, outer: bool, span: proc_macro2::Span) -> Vec<Attribute> {
+        let mut attributes = vec![];
+        for line in lines.split('\n') {
+            let mut attrs = vec![];
+            let trimmed = line.trim();
+            if let Some(lines) = self.line_replacements.get(trimmed) {
                 for line in lines {
                     if outer {
-                        attrs.push(syn::parse_quote! { #[ #line ] });
+                        attrs.push(syn::parse_quote_spanned! { span => #[ #line ] });
                     } else {
-                        attrs.push(syn::parse_quote! { #![ #line ] });
+                        attrs.push(syn::parse_quote_spanned! { span => #![ #line ] });
                     }
                 }
-
-                attrs
+            } else if let Some((placeholder, replacements)) = self
+                .inline_replacements
+                .iter()
+                .find(|(k, _v)| trimmed.contains(k.as_str()))
+            {
+                for (cfg, replacement) in replacements.iter() {
+                    let line = line.replace(placeholder, replacement);
+                    let line = create_raw_string(&line);
+                    let attr_inner = if let Some(condition) = cfg {
+                        quote! { cfg_attr(#condition, doc = #line) }
+                    } else {
+                        quote! { doc = #line }
+                    };
+                    if outer {
+                        attrs.push(syn::parse_quote_spanned! { span => #[ #attr_inner ] });
+                    } else {
+                        attrs.push(syn::parse_quote_spanned! { span => #![ #attr_inner ] });
+                    }
+                }
+            } else {
+                // Just append the line, in the expected format (`doc = r" Foobar"`)
+                let line = create_raw_string(line);
+                if outer {
+                    attrs.push(syn::parse_quote_spanned! { span => #[doc = #line] });
+                } else {
+                    attrs.push(syn::parse_quote_spanned! { span => #![doc = #line] });
+                }
             }
-        };
+            attributes.extend(attrs);
+        }
 
-        Some(attributes)
+        attributes
     }
+}
+
+fn create_raw_string(line: &str) -> TokenStream2 {
+    let hash = if line.contains("#\"") {
+        "##"
+    } else if line.contains('"') {
+        "#"
+    } else {
+        ""
+    };
+
+    TokenStream2::from_str(&format!("r{hash}\"{line}\"{hash}")).unwrap()
 }
 
 impl Parse for Replacements {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let mut replacements = HashMap::new();
+        let mut line_replacements = HashMap::new();
+        let mut inline_replacements = HashMap::new();
+
+        let mut add_line_replacement = |placeholder: &str, replacement: Vec<TokenStream2>| {
+            line_replacements.insert(format!("# {{{placeholder}}}"), replacement);
+        };
+        let mut add_inline_replacement =
+            |placeholder: &str, replacement: Vec<(Option<TokenStream2>, String)>| {
+                // The placeholder must be a valid Rust identifier to keep rustfmt happy
+                inline_replacements.insert(format!("__{placeholder}__"), replacement);
+            };
+
         if !input.is_empty() {
             let args = Punctuated::<Replacement, Token![,]>::parse_terminated(input)?;
             for arg in args {
-                let replacement = match arg.replacement {
-                    ReplacementKind::Literal(expr) => vec![quote::quote! {
-                        doc = #expr
-                    }],
+                match arg.replacement {
+                    ReplacementKind::Literal(expr) => {
+                        if let Expr::Lit(ExprLit {
+                            lit: Lit::Str(ref lit_str),
+                            ..
+                        }) = expr
+                        {
+                            add_inline_replacement(&arg.placeholder, vec![(None, lit_str.value())]);
+                        }
+
+                        add_line_replacement(
+                            &arg.placeholder,
+                            vec![quote! {
+                                doc = #expr
+                            }],
+                        );
+                    }
                     ReplacementKind::Choice(items) => {
-                        let mut branches = vec![];
+                        let mut conditions = vec![];
+                        let mut bodies = vec![];
+                        let mut lit_strs = vec![];
                         let mut cfgs = vec![];
 
                         for branch in items {
                             let body = branch.body;
+
+                            if let Expr::Lit(ExprLit {
+                                lit: Lit::Str(ref lit_str),
+                                ..
+                            }) = body
+                            {
+                                lit_strs.push(lit_str.value());
+                            }
+
                             match branch.condition {
                                 Some(Meta::List(cfg)) if cfg.path.is_ident("cfg") => {
                                     let condition = cfg.tokens;
 
                                     cfgs.push(condition.clone());
-                                    branches.push(quote::quote! {
-                                        cfg_attr(#condition, doc = #body)
-                                    });
+                                    conditions.push(condition);
+                                    bodies.push(body);
                                 }
                                 None => {
-                                    branches.push(quote::quote! {
-                                        cfg_attr(not(any( #(#cfgs),*) ), doc = #body)
-                                    });
+                                    conditions.push(quote! { not(any( #(#cfgs),*) ) });
+                                    bodies.push(body);
                                 }
                                 _ => {
                                     return Err(syn::Error::new(
@@ -94,18 +163,37 @@ impl Parse for Replacements {
                                         "Expected a cfg condition or catch-all condition using `_`",
                                     ));
                                 }
-                            };
+                            }
                         }
 
-                        branches
-                    }
-                };
+                        let branches = conditions
+                            .iter()
+                            .zip(bodies.iter())
+                            .map(|(condition, body)| {
+                                quote! {
+                                    cfg_attr(#condition, doc = #body)
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        add_line_replacement(&arg.placeholder, branches);
 
-                replacements.insert(arg.placeholder, replacement);
+                        if lit_strs.len() == bodies.len() {
+                            let branches = conditions
+                                .into_iter()
+                                .map(Some)
+                                .zip(lit_strs)
+                                .collect::<Vec<_>>();
+                            add_inline_replacement(&arg.placeholder, branches);
+                        }
+                    }
+                }
             }
         }
 
-        Ok(Self { replacements })
+        Ok(Self {
+            line_replacements,
+            inline_replacements,
+        })
     }
 }
 
@@ -121,7 +209,7 @@ impl Parse for Replacement {
         let replacement: ReplacementKind = input.parse()?;
 
         Ok(Self {
-            placeholder: format!("# {{{}}}", placeholder.value()),
+            placeholder: placeholder.value(),
             replacement,
         })
     }
@@ -169,10 +257,19 @@ impl Parse for Branch {
 }
 
 pub(crate) fn replace(attr: TokenStream, input: TokenStream) -> TokenStream {
-    let replacements: Replacements = match syn::parse2(attr) {
+    let mut replacements: Replacements = match syn::parse2(attr) {
         Ok(replacements) => replacements,
         Err(e) => return e.into_compile_error(),
     };
+
+    replacements.line_replacements.insert(
+        "# {before_snippet}".to_string(),
+        vec![quote! { doc = crate::before_snippet!() }],
+    );
+    replacements.line_replacements.insert(
+        "# {after_snippet}".to_string(),
+        vec![quote! { doc = crate::after_snippet!() }],
+    );
 
     let mut item: Item = crate::unwrap_or_compile_error!(syn::parse2(input));
 
@@ -185,9 +282,12 @@ pub(crate) fn replace(attr: TokenStream, input: TokenStream) -> TokenStream {
             && ident == "doc"
             && let Expr::Lit(lit) = value
             && let Lit::Str(doc) = &lit.lit
-            && let Some(replacement) =
-                replacements.get(doc.value().trim(), attr.style == AttrStyle::Outer)
         {
+            let replacement = replacements.get(
+                doc.value().as_str(),
+                attr.style == AttrStyle::Outer,
+                attr.span(),
+            );
             replacement_attrs.extend(replacement);
         } else {
             replacement_attrs.push(attr.clone());
@@ -196,7 +296,7 @@ pub(crate) fn replace(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     *item.attrs_mut() = replacement_attrs;
 
-    quote::quote! { #item }
+    quote! { #item }
 }
 
 trait ItemLike {
@@ -224,117 +324,239 @@ mod tests {
     #[test]
     fn test_basic() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "# Configuration"]
-                #[doc = "## Overview"]
-                #[doc = "This module contains the initial configuration for the system."]
-                #[doc = "## Configuration"]
-                #[doc = "In the [`esp_hal::init()`][crate::init] method, we can configure different"]
-                #[doc = "parameters for the system:"]
-                #[doc = "- CPU clock configuration."]
-                #[doc = "- Watchdog configuration."]
-                #[doc = "## Examples"]
-                #[doc = "### Default initialization"]
-                #[doc = "```rust, no_run"]
-                #[doc = "# {before_snippet}"]
-                #[doc = "let peripherals = esp_hal::init(esp_hal::Config::default());"]
-                #[doc = "# {after_snippet}"]
-                #[doc = "```"]
+            quote! {}.into(),
+            quote! {
+                /// # Configuration
+                ///
+                /// ## Overview
+                ///
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                /// # {before_snippet}
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                /// # {after_snippet}
+                /// ```
                 struct Foo {
                 }
             }
             .into(),
         );
 
-        assert_eq!(result.to_string(), quote::quote! {
-            #[doc = "# Configuration"]
-            #[doc = "## Overview"]
-            #[doc = "This module contains the initial configuration for the system."]
-            #[doc = "## Configuration"]
-            #[doc = "In the [`esp_hal::init()`][crate::init] method, we can configure different"]
-            #[doc = "parameters for the system:"]
-            #[doc = "- CPU clock configuration."]
-            #[doc = "- Watchdog configuration."]
-            #[doc = "## Examples"]
-            #[doc = "### Default initialization"]
-            #[doc = "```rust, no_run"]
-            #[doc = crate::before_snippet!()]
-            #[doc = "let peripherals = esp_hal::init(esp_hal::Config::default());"]
-            #[doc = crate::after_snippet!()]
-            #[doc = "```"]
-            struct Foo {}
-        }.to_string());
+        assert_eq!(
+            result.to_string(),
+            quote! {
+                /// # Configuration
+                ///
+                /// ## Overview
+                ///
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                #[doc = crate::before_snippet!()]
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                #[doc = crate::after_snippet!()]
+                /// ```
+                struct Foo {}
+            }
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn test_one_doc_attr() {
+        let result = replace(
+            quote! {}.into(),
+            quote! {
+                #[doc = r#" # Configuration
+ ## Overview
+ This module contains the initial configuration for the system.
+ ## Configuration
+ In the [`esp_hal::init()`][crate::init] method, we can configure different
+ parameters for the system:
+ - CPU clock configuration.
+ - Watchdog configuration.
+ ## Examples
+ ### Default initialization
+ ```rust, no_run
+ # {before_snippet}
+ let peripherals = esp_hal::init(esp_hal::Config::default());
+ # {after_snippet}
+ ```"#]
+                struct Foo {
+                }
+            }
+            .into(),
+        );
+
+        assert_eq!(
+            result.to_string(),
+            quote! {
+                /// # Configuration
+                /// ## Overview
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                #[doc = crate::before_snippet!()]
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                #[doc = crate::after_snippet!()]
+                /// ```
+                struct Foo {}
+            }
+            .to_string()
+        );
     }
 
     #[test]
     fn test_custom_replacements() {
         let result = replace(
-            quote::quote! {
+            quote! {
                 "freq" => {
                     cfg(esp32h2) => "let freq = Rate::from_mhz(32);",
                     _ => "let freq = Rate::from_mhz(80);"
                 },
                 "other" => "replacement"
             }.into(),
-            quote::quote! {
-                #[doc = "# Configuration"]
-                #[doc = "## Overview"]
-                #[doc = "This module contains the initial configuration for the system."]
-                #[doc = "## Configuration"]
-                #[doc = "In the [`esp_hal::init()`][crate::init] method, we can configure different"]
-                #[doc = "parameters for the system:"]
-                #[doc = "- CPU clock configuration."]
-                #[doc = "- Watchdog configuration."]
-                #[doc = "## Examples"]
-                #[doc = "### Default initialization"]
-                #[doc = "```rust, no_run"]
-                #[doc = "# {freq}"]
-                #[doc = "# {before_snippet}"]
-                #[doc = "let peripherals = esp_hal::init(esp_hal::Config::default());"]
-                #[doc = "# {after_snippet}"]
-                #[doc = "```"]
+            quote! {
+                #[doc = " # Configuration"]
+                #[doc = " ## Overview"]
+                #[doc = " This module contains the initial configuration for the system."]
+                #[doc = " ## Configuration"]
+                #[doc = " In the [`esp_hal::init()`][crate::init] method, we can configure different"]
+                #[doc = " parameters for the system:"]
+                #[doc = " - CPU clock configuration."]
+                #[doc = " - Watchdog configuration."]
+                #[doc = " ## Examples"]
+                #[doc = " ### Default initialization"]
+                #[doc = " ```rust, no_run"]
+                #[doc = " # {freq}"]
+                #[doc = " # {before_snippet}"]
+                #[doc = " let peripherals = esp_hal::init(esp_hal::Config::default());"]
+                #[doc = " # {after_snippet}"]
+                #[doc = " ```"]
                 struct Foo {
                 }
             }
             .into(),
         );
 
-        assert_eq!(result.to_string(), quote::quote! {
-            #[doc = "# Configuration"]
-            #[doc = "## Overview"]
-            #[doc = "This module contains the initial configuration for the system."]
-            #[doc = "## Configuration"]
-            #[doc = "In the [`esp_hal::init()`][crate::init] method, we can configure different"]
-            #[doc = "parameters for the system:"]
-            #[doc = "- CPU clock configuration."]
-            #[doc = "- Watchdog configuration."]
-            #[doc = "## Examples"]
-            #[doc = "### Default initialization"]
-            #[doc = "```rust, no_run"]
-            #[cfg_attr (esp32h2 , doc = "let freq = Rate::from_mhz(32);")] 
-            #[cfg_attr (not (any (esp32h2)) , doc = "let freq = Rate::from_mhz(80);")]
-            #[doc = crate::before_snippet!()]
-            #[doc = "let peripherals = esp_hal::init(esp_hal::Config::default());"]
-            #[doc = crate::after_snippet!()]
-            #[doc = "```"]
-            struct Foo {}
-        }.to_string());
+        assert_eq!(
+            result.to_string(),
+            quote! {
+                /// # Configuration
+                /// ## Overview
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                #[cfg_attr (esp32h2 , doc = "let freq = Rate::from_mhz(32);")]
+                #[cfg_attr (not (any (esp32h2)) , doc = "let freq = Rate::from_mhz(80);")]
+                #[doc = crate::before_snippet!()]
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                #[doc = crate::after_snippet!()]
+                /// ```
+                struct Foo {}
+            }
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn test_custom_inline_replacements() {
+        let result = replace(
+            quote! {
+                "freq" => {
+                    cfg(esp32h2) => "32",
+                    _ => "80"
+                },
+                "other" => "Replacement"
+            }
+            .into(),
+            quote! {
+                /// # Configuration
+                /// ## Overview
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## __other__ Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                /// let freq = Rate::from_mhz(__freq__);
+                /// # {before_snippet}
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                /// # {after_snippet}
+                /// ```
+                struct Foo {
+                }
+            }
+            .into(),
+        );
+
+        assert_eq!(
+            result.to_string(),
+            quote! {
+                /// # Configuration
+                /// ## Overview
+                /// This module contains the initial configuration for the system.
+                /// ## Configuration
+                /// In the [`esp_hal::init()`][crate::init] method, we can configure different
+                /// parameters for the system:
+                /// - CPU clock configuration.
+                /// - Watchdog configuration.
+                /// ## Replacement Examples
+                /// ### Default initialization
+                /// ```rust, no_run
+                #[cfg_attr (esp32h2 , doc = r" let freq = Rate::from_mhz(32);")]
+                #[cfg_attr (not (any (esp32h2)) , doc = r" let freq = Rate::from_mhz(80);")]
+                #[doc = crate::before_snippet!()]
+                /// let peripherals = esp_hal::init(esp_hal::Config::default());
+                #[doc = crate::after_snippet!()]
+                /// ```
+                struct Foo {}
+            }
+            .to_string()
+        );
     }
 
     #[test]
     fn test_custom_fail() {
         let result = replace(
-            quote::quote! {
+            quote! {
                 "freq" => {
                     abc(esp32h2) => "let freq = Rate::from_mhz(32);",
                 },
             }
             .into(),
-            quote::quote! {}.into(),
+            quote! {}.into(),
         );
 
-        assert_eq!(result.to_string(), quote::quote! {
+        assert_eq!(result.to_string(), quote! {
             ::core::compile_error!{ "Expected a cfg condition or catch-all condition using `_`" }
         }.to_string());
     }
@@ -342,10 +564,10 @@ mod tests {
     #[test]
     fn test_basic_fn() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 fn foo() {
                 }
             }
@@ -354,8 +576,8 @@ mod tests {
 
         assert_eq!(
             result.to_string(),
-            quote::quote! {
-                #[doc = "docs"]
+            quote! {
+                /// docs
                 #[doc = crate::before_snippet!()]
                 fn foo () { }
             }
@@ -366,10 +588,10 @@ mod tests {
     #[test]
     fn test_basic_enum() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 enum Foo {
                 }
             }
@@ -378,8 +600,8 @@ mod tests {
 
         assert_eq!(
             result.to_string(),
-            quote::quote! {
-                #[doc = "docs"]
+            quote! {
+                /// docs
                 #[doc = crate::before_snippet!()]
                 enum Foo { }
             }
@@ -390,10 +612,10 @@ mod tests {
     #[test]
     fn test_basic_trait() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 trait Foo {
                 }
             }
@@ -402,8 +624,8 @@ mod tests {
 
         assert_eq!(
             result.to_string(),
-            quote::quote! {
-                #[doc = "docs"]
+            quote! {
+                /// docs
                 #[doc = crate::before_snippet!()]
                 trait Foo { }
             }
@@ -414,10 +636,10 @@ mod tests {
     #[test]
     fn test_basic_mod() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 mod foo {
                 }
             }
@@ -426,8 +648,8 @@ mod tests {
 
         assert_eq!(
             result.to_string(),
-            quote::quote! {
-                #[doc = "docs"]
+            quote! {
+                /// docs
                 #[doc = crate::before_snippet!()]
                 mod foo { }
             }
@@ -438,10 +660,10 @@ mod tests {
     #[test]
     fn test_basic_macro() {
         let result = replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 macro_rules! foo {
                     () => {
                     };
@@ -452,8 +674,8 @@ mod tests {
 
         assert_eq!(
             result.to_string(),
-            quote::quote! {
-                #[doc = "docs"]
+            quote! {
+                /// docs
                 #[doc = crate::before_snippet!()]
                 macro_rules! foo {
                     () => {
@@ -469,10 +691,10 @@ mod tests {
     #[should_panic]
     fn test_basic_fail_wrong_item() {
         replace(
-            quote::quote! {}.into(),
-            quote::quote! {
-                #[doc = "docs"]
-                #[doc = "# {before_snippet}"]
+            quote! {}.into(),
+            quote! {
+                #[doc = " docs"]
+                #[doc = " # {before_snippet}"]
                 static FOO: u32 = 0u32;
             }
             .into(),

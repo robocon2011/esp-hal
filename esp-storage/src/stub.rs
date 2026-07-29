@@ -1,14 +1,16 @@
 use core::{ptr, slice};
 
-use crate::maybe_with_critical_section;
+use crate::{FlashStorageError, maybe_with_critical_section};
 
 const SUCCESS_CODE: i32 = 0;
 const ERROR_CODE: i32 = 1;
 const ERASE_BYTE: u8 = 0xff;
 const WORD_SIZE: u32 = 4;
 const SECTOR_SIZE: u32 = 4 << 10;
-const NUM_SECTORS: u32 = 4;
-const FLASH_SIZE: u32 = SECTOR_SIZE * NUM_SECTORS;
+const BLOCK_SIZE: u32 = 4 << 14;
+const NUM_BLOCKS: u32 = 4;
+const FLASH_SIZE: u32 = BLOCK_SIZE * NUM_BLOCKS;
+const NUM_SECTORS: u32 = FLASH_SIZE / SECTOR_SIZE;
 
 static mut FLASH_LOCK: bool = true;
 static mut FLASH_DATA: [u8; FLASH_SIZE as usize] = [0u8; FLASH_SIZE as usize];
@@ -90,6 +92,19 @@ pub(crate) fn spiflash_erase_sector(sector_number: u32) -> i32 {
     }
 }
 
+pub(crate) fn spiflash_erase_block(block_number: u32) -> i32 {
+    if check::<1, NUM_BLOCKS, 1>(block_number, 1, ptr::null(), true) {
+        maybe_with_critical_section(|| {
+            let dst_addr = block_number * BLOCK_SIZE;
+            let len = BLOCK_SIZE;
+            unsafe { FLASH_DATA[dst_addr as usize..][..len as usize].fill(ERASE_BYTE) };
+        });
+        SUCCESS_CODE
+    } else {
+        ERROR_CODE
+    }
+}
+
 pub(crate) fn spiflash_write(dest_addr: u32, data: *const u32, len: u32) -> i32 {
     if check::<WORD_SIZE, FLASH_SIZE, SECTOR_SIZE>(dest_addr, len, data, true) {
         maybe_with_critical_section(|| {
@@ -105,4 +120,22 @@ pub(crate) fn spiflash_write(dest_addr: u32, data: *const u32, len: u32) -> i32 
     } else {
         ERROR_CODE
     }
+}
+
+pub(crate) fn spiflash_write_encrypted(dest_addr: u32, data: *mut u32, len: u32) -> i32 {
+    spiflash_write(dest_addr, data as *const u32, len)
+}
+
+pub(crate) fn read_flash_encrypted(offset: u32, bytes: &mut [u8]) -> Result<(), FlashStorageError> {
+    if offset as usize + bytes.len() > FLASH_SIZE as usize {
+        return Err(FlashStorageError::OutOfBounds);
+    }
+    maybe_with_critical_section(|| unsafe {
+        bytes.copy_from_slice(&FLASH_DATA[offset as usize..][..bytes.len()]);
+    });
+    Ok(())
+}
+
+pub(crate) fn get_flash_size() -> u32 {
+    FLASH_SIZE
 }

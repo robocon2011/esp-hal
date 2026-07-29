@@ -1,26 +1,4 @@
-#![allow(unused)]
-
-use alloc::{boxed::Box, vec::Vec};
-use core::{
-    cell::RefCell,
-    fmt::Write,
-    mem::size_of_val,
-    ptr::{self, addr_of, addr_of_mut},
-};
-
-use esp_hal::time::{Duration, Instant};
-use esp_sync::NonReentrantMutex;
-
-use super::{OSI_FUNCS_TIME_BLOCKING, malloc::free};
-use crate::{
-    ESP_RADIO_LOCK,
-    memory_fence::memory_fence,
-    preempt::{current_task, yield_task},
-    sys::{
-        c_types::{c_char, c_int, c_uint, c_void},
-        include::malloc,
-    },
-};
+use crate::sys::c_types::{c_char, c_int, c_uint, c_void};
 
 #[derive(Clone, Copy, Debug)]
 struct Mutex {
@@ -61,7 +39,11 @@ pub(crate) unsafe extern "C" fn __esp_radio_usleep(us: u32) -> c_int {
     crate::preempt::usleep(us);
 
     #[cfg(not(any(feature = "wifi", feature = "ble")))]
-    crate::hal::delay::Delay::new().delay_micros(us);
+    {
+        let start = esp_hal::time::Instant::now();
+        let duration = esp_hal::time::Duration::from_micros(us as u64);
+        while start.elapsed() < duration {}
+    }
 
     0
 }

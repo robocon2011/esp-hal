@@ -1,40 +1,45 @@
 use esp_sync::NonReentrantMutex;
 
-use crate::{clock::Clocks, peripherals::RNG};
+use crate::{peripherals::RNG, soc::clocks};
 
 // TODO: find a better place for these
 #[inline]
-#[cfg(soc_cpu_has_prv_mode)]
+#[cfg(all(soc_cpu_has_csr_pc, soc_cpu_csr_prv_mode_is_set))]
 fn tee_enabled() -> bool {
     false
 }
 
 #[inline]
 fn current_cpu_cycles() -> usize {
-    cfg_if::cfg_if! {
-        if #[cfg(xtensa)] {
+    cfg_select! {
+        xtensa => {
             xtensa_lx::timer::get_cycle_count() as usize
-        } else if #[cfg(soc_cpu_has_csr_pc)] {
+        }
+        soc_cpu_has_csr_pc => {
             const PRV_M: usize = 3;
             macro_rules! read_csr_fn {
-                ($fnname:ident, $csr:literal) => {
+                ($fnname:ident, $csr:expr) => {
                     #[inline]
                     fn $fnname() -> usize {
-                        riscv::read_csr!($csr);
+                        let r: usize;
 
-                        unsafe { _read() }
+                        unsafe {
+                            core::arch::asm!(concat!("csrrs {0}, ", $csr, ", x0"), out(reg) r);
+                        }
+
+                        return r;
                     }
                 }
             }
 
-            read_csr_fn!(read_pccr_machine, 0x7e2);
-            read_csr_fn!(read_pccr_user, 0x802);
+            read_csr_fn!(read_pccr_machine, "0x7e2");
+            read_csr_fn!(read_pccr_user, "0x802");
 
             fn read_prv_mode() -> usize {
-                #[cfg(soc_cpu_has_prv_mode)]
+                #[cfg(soc_cpu_csr_prv_mode_is_set)]
                 if tee_enabled() {
-                    riscv::read_csr!(0x810);
-                    return unsafe { _read() };
+                    read_csr_fn!(read_prv_m, property!("soc.cpu_csr_prv_mode", str));
+                    return read_prv_m();
                 }
 
                 PRV_M
@@ -45,7 +50,8 @@ fn current_cpu_cycles() -> usize {
             } else {
                 read_pccr_user()
             }
-        } else {
+        }
+        _ => {
             riscv::register::mcycle::read()
         }
     }
@@ -59,7 +65,18 @@ fn read_one(wait_cycles: usize) -> u32 {
             let now: usize = current_cpu_cycles();
             if now.wrapping_sub(*last_wait_start) >= wait_cycles {
                 *last_wait_start = now;
-                Some(RNG::regs().data().read().bits())
+
+                cfg_select! {
+                    rng_is_lp_sys => {
+                        Some(RNG::regs().rng_data().read().bits())
+                    }
+                    esp32s31 => {
+                        Some(RNG::regs().crc_sync_data().read().bits())
+                    }
+                    _ => {
+                        Some(RNG::regs().data().read().bits())
+                    }
+                }
             } else {
                 None
             }
@@ -71,8 +88,7 @@ fn read_one(wait_cycles: usize) -> u32 {
 }
 
 pub(super) fn fill_ptr_range(data: *mut u8, len: usize) {
-    let clocks = Clocks::get();
-    let cpu_to_apb_freq_ratio = clocks.cpu_clock / clocks.apb_clock;
+    let cpu_to_apb_freq_ratio = clocks::cpu_clk_frequency() / clocks::apb_clk_frequency();
     let wait_cycles = cpu_to_apb_freq_ratio as usize * property!("rng.apb_cycle_wait_num");
 
     let mut remaining = len;

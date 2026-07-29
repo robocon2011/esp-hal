@@ -13,7 +13,7 @@
 //! generated square waves are 90 degrees out of phase. DO NOT CONNECT GPIO2 and
 //! GPIO4 - they read back themselves.
 
-//% CHIPS: esp32 esp32s2 esp32s3 esp32c2 esp32c3 esp32c6 esp32h2
+//% CHIP_FILTER: gpio_driver_supported
 
 #![no_std]
 #![no_main]
@@ -32,7 +32,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 static SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let p = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
@@ -53,8 +53,8 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(p.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    spawner.must_spawn(toggle(enc_a_clone, enc_b_clone, &SIGNAL));
-    spawner.must_spawn(wait(enc_a, enc_b, &SIGNAL));
+    spawner.spawn(toggle(enc_a_clone, enc_b_clone, &SIGNAL).unwrap());
+    spawner.spawn(wait(enc_a, enc_b, &SIGNAL).unwrap());
 }
 
 #[embassy_executor::task(pool_size = 2)]

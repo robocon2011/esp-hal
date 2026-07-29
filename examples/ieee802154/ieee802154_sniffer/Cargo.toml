@@ -5,7 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-cfg-if = "1"
 esp-alloc = { path = "../../../esp-alloc" }
 esp-backtrace = { path = "../../../esp-backtrace", features = [
     "panic-handler",
@@ -21,6 +20,12 @@ esp-radio = { path = "../../../esp-radio", features = [
 ieee802154 = "0.6.1"
 
 [features]
+esp32c5 = [
+    "esp-backtrace/esp32c5",
+    "esp-bootloader-esp-idf/esp32c5",
+    "esp-hal/esp32c5",
+    "esp-radio/esp32c5",
+]
 esp32c6 = [
     "esp-backtrace/esp32c6",
     "esp-bootloader-esp-idf/esp32c6",

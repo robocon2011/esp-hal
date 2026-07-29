@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 
+## [v0.14.0] - 2026-04-16
+
+### Added
+
+- Added `clic-48` feature to generate more trap handlers (#4883)
+
 ## [v0.13.0] - 2025-10-13
 
 ### Added
@@ -31,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- the `pre_init` macro got removed - it's usage was always discouraged (#3857)
+- the `pre_init` macro got removed - its usage was always discouraged (#3857)
 
 ## [v0.12.0] - 2025-07-16
 
@@ -117,4 +123,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v0.11.0]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.10.0...esp-riscv-rt-v0.11.0
 [v0.12.0]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.11.0...esp-riscv-rt-v0.12.0
 [v0.13.0]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.12.0...esp-riscv-rt-v0.13.0
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.13.0...HEAD
+[v0.14.0]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.13.0...esp-riscv-rt-v0.14.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-riscv-rt-v0.14.0...HEAD

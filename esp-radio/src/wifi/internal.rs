@@ -1,4 +1,8 @@
 use super::os_adapter::{self, *};
+#[cfg(feature = "coex")]
+use crate::hal::ram;
+#[cfg(feature = "coex")]
+use crate::sys::c_types::c_void;
 use crate::{
     common_adapter::*,
     sys::include::{
@@ -8,10 +12,25 @@ use crate::{
         wifi_osi_funcs_t,
     },
 };
-#[cfg(coex)]
-use crate::{hal::ram, sys::c_types::c_void};
 
-#[cfg(all(coex, any(esp32, esp32c2, esp32c3, esp32c6, esp32s3)))]
+#[cfg(feature = "print-logs-from-driver")]
+unsafe extern "C" {
+    pub unsafe fn __esp_radio_log_write(
+        level: crate::sys::c_types::c_uint,
+        tag: *const crate::sys::c_types::c_char,
+        format: *const crate::sys::c_types::c_char,
+        ...
+    );
+
+    pub unsafe fn __esp_radio_log_writev(
+        level: crate::sys::c_types::c_uint,
+        tag: *const crate::sys::c_types::c_char,
+        format: *const crate::sys::c_types::c_char,
+        args: crate::sys::include::va_list,
+    );
+}
+
+#[cfg(all(feature = "coex", wifi_driver_supported, bt_driver_supported))]
 pub(super) static mut G_COEX_ADAPTER_FUNCS: crate::sys::include::coex_adapter_funcs_t =
     crate::sys::include::coex_adapter_funcs_t {
         _version: crate::sys::include::COEX_ADAPTER_VERSION as i32,
@@ -22,7 +41,7 @@ pub(super) static mut G_COEX_ADAPTER_FUNCS: crate::sys::include::coex_adapter_fu
         _semphr_give_from_isr: Some(semphr_give_from_isr_wrapper),
         _semphr_take: Some(semphr_take),
         _semphr_give: Some(semphr_give),
-        _is_in_isr: Some(is_in_isr_wrapper),
+        _is_in_isr: Some(is_in_isr),
         _malloc_internal: Some(malloc),
         _free: Some(free),
         _esp_timer_get_time: Some(__esp_radio_esp_timer_get_time),
@@ -49,13 +68,13 @@ pub(super) static mut G_COEX_ADAPTER_FUNCS: crate::sys::include::coex_adapter_fu
         _xtal_freq_get: Some(xtal_freq_get_wrapper),
     };
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 #[ram]
 unsafe extern "C" fn xtal_freq_get_wrapper() -> i32 {
-    crate::hal::clock::Clocks::get().xtal_clock.as_mhz() as i32
+    esp_hal::clock::xtal_clock().as_mhz() as i32
 }
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 unsafe extern "C" fn esp_coexist_debug_matrix_init_wrapper(
     _evt: i32,
     _sig: i32,
@@ -65,21 +84,16 @@ unsafe extern "C" fn esp_coexist_debug_matrix_init_wrapper(
     crate::sys::include::ESP_ERR_NOT_SUPPORTED as i32
 }
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 #[ram]
 unsafe extern "C" fn semphr_take_from_isr_wrapper(semphr: *mut c_void, hptw: *mut c_void) -> i32 {
     unsafe { crate::common_adapter::semphr_take_from_isr(semphr, hptw as *mut bool) }
 }
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 #[ram]
 unsafe extern "C" fn semphr_give_from_isr_wrapper(semphr: *mut c_void, hptw: *mut c_void) -> i32 {
     unsafe { crate::common_adapter::semphr_give_from_isr(semphr, hptw as *mut bool) }
-}
-
-#[cfg(coex)]
-unsafe extern "C" fn is_in_isr_wrapper() -> i32 {
-    crate::is_interrupts_disabled() as i32
 }
 
 #[unsafe(no_mangle)]
@@ -167,11 +181,11 @@ pub(crate) static __ESP_RADIO_G_WIFI_OSI_FUNCS: wifi_osi_funcs_t = wifi_osi_func
     _get_time: Some(get_time),
     _random: Some(random),
     #[cfg(feature = "print-logs-from-driver")]
-    _log_write: Some(log_write),
+    _log_write: Some(__esp_radio_log_write),
     #[cfg(not(feature = "print-logs-from-driver"))]
     _log_write: None,
     #[cfg(feature = "print-logs-from-driver")]
-    _log_writev: Some(log_writev),
+    _log_writev: Some(__esp_radio_log_writev),
     #[cfg(not(feature = "print-logs-from-driver"))]
     _log_writev: None,
     _log_timestamp: Some(log_timestamp),
@@ -202,7 +216,9 @@ pub(crate) static __ESP_RADIO_G_WIFI_OSI_FUNCS: wifi_osi_funcs_t = wifi_osi_func
     _coex_schm_interval_get: Some(coex_schm_interval_get),
     _coex_schm_curr_period_get: Some(coex_schm_curr_period_get),
     _coex_schm_curr_phase_get: Some(coex_schm_curr_phase_get),
-    #[cfg(any(esp32c3, esp32c2, esp32c6, esp32h2, esp32s3, esp32s2))]
+    #[cfg(any(
+        esp32c3, esp32c2, esp32c5, esp32c6, esp32c61, esp32h2, esp32s3, esp32s2
+    ))]
     _slowclk_cal_get: Some(slowclk_cal_get),
     #[cfg(any(esp32, esp32s2))]
     _phy_common_clock_disable: Some(os_adapter_chip_specific::phy_common_clock_disable),
@@ -210,15 +226,15 @@ pub(crate) static __ESP_RADIO_G_WIFI_OSI_FUNCS: wifi_osi_funcs_t = wifi_osi_func
     _phy_common_clock_enable: Some(os_adapter_chip_specific::phy_common_clock_enable),
     _coex_register_start_cb: Some(coex_register_start_cb),
 
-    #[cfg(esp32c6)]
+    #[cfg(any(esp32c6, esp32c5, esp32c61))]
     _regdma_link_set_write_wait_content: Some(
         os_adapter_chip_specific::regdma_link_set_write_wait_content_dummy,
     ),
-    #[cfg(esp32c6)]
+    #[cfg(any(esp32c6, esp32c5, esp32c61))]
     _sleep_retention_find_link_by_id: Some(
         os_adapter_chip_specific::sleep_retention_find_link_by_id_dummy,
     ),
-    _coex_schm_process_restart: Some(coex_schm_process_restart_wrapper),
+    _coex_schm_process_restart: Some(coex_schm_process_restart),
     _coex_schm_register_cb: Some(coex_schm_register_cb_wrapper),
 
     _coex_schm_flexible_period_set: Some(coex_schm_flexible_period_set),

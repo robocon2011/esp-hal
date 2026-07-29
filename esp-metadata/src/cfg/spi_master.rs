@@ -3,8 +3,9 @@ use quote::{format_ident, quote};
 
 use crate::{cfg::SpiMasterProperties, generate_for_each_macro};
 
-/// Instance configuration, used in [device.spi_slave.instances]
+/// Instance configuration, used in [device.spi_master.instances]
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpiMasterInstanceConfig {
     /// The name of the instance in the `esp_hal::system::Peripheral` enum
     pub sys_instance: String,
@@ -14,11 +15,20 @@ pub(crate) struct SpiMasterInstanceConfig {
     pub cs: Vec<String>,
 }
 
-/// Generates `for_each_spi_slave!` which can be used to implement the SPI
+/// Generates `for_each_spi_master!` which can be used to implement the SPI
 /// master Instance trait for the relevant peripherals. The macro generates code
 /// for each [device.spi_master.instances[X]] instance.
-pub(crate) fn generate_spi_master_peripherals(spi_slave: &SpiMasterProperties) -> TokenStream {
-    let instance_cfgs = spi_slave
+pub(crate) fn generate_spi_master_peripherals(spi_master: &SpiMasterProperties) -> TokenStream {
+    let names = spi_master
+        .instances
+        .iter()
+        .map(|instance| {
+            let instance = format_ident!("{}", instance.name.to_uppercase());
+            quote! { #instance }
+        })
+        .collect::<Vec<_>>();
+
+    let instance_cfgs = spi_master
         .instances
         .iter()
         .map(|instance| {
@@ -45,7 +55,8 @@ pub(crate) fn generate_spi_master_peripherals(spi_slave: &SpiMasterProperties) -
         })
         .collect::<Vec<_>>();
 
-    let for_each = generate_for_each_macro("spi_master", &[("all", &instance_cfgs)]);
+    let for_each =
+        generate_for_each_macro("spi_master", &[("names", &names), ("all", &instance_cfgs)]);
     quote! {
         /// This macro can be used to generate code for each peripheral instance of the SPI master driver.
         ///
@@ -54,7 +65,7 @@ pub(crate) fn generate_spi_master_peripherals(spi_slave: &SpiMasterProperties) -
         ///
         /// This macro has one option for its "Individual matcher" case:
         ///
-        /// Syntax: `($instance:ident, $sys:ident, $sclk:ident, [$($cs:ident),*] [$($sio:ident),* $($is_qspi:iteral)?])`
+        /// Syntax: `($instance:ident, $sys:ident, $sclk:ident [$($cs:ident),*] [$($sio:ident),*] $($is_qspi:literal)?)`
         ///
         /// Macro fragments:
         ///

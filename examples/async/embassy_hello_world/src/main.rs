@@ -21,7 +21,7 @@ async fn run() {
     }
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -32,7 +32,7 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    spawner.spawn(run()).ok();
+    spawner.spawn(run().unwrap());
 
     loop {
         esp_println::println!("Bing!");

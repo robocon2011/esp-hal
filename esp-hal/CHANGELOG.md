@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- C5 and C61: Enable RTC timekeeping (#5449)
+- C61: usb-serial-jtag and debug-assist (#5427)
+- C61: dedicated gpio (#5426)
+- Initial ESP32-P4 (chip revision v3.0+) support (#5400, #5523, #5535)
+- P4: Initial peripheral support for GPIO, UART, I2C, SPI, DMA, USB Serial/JTAG, eFuse, SYSTIMER (#5400, #5555, #5559)
+- P4: Enable RNG, ECC (#5525)
+- P4: AP-HEX PSRAM driver stub with configurable HP L2MEM cache/RAM split via `ESP_HAL_CONFIG_L2_CACHE_SIZE` (#5400)
+- P4: enable multi-core support (#5535)
+- C5 and C61: I2S support (#5483)
+- UART: `send_break_async` (#5536)
+- Added support for embassy-usb-host (#5283)
+- `handle_gpio_interrupt` and `wake_pin()` for user-defined GPIO ISRs (#5531)
+- GPIO: `Input::wait_for_with_options()` allows waking from light sleep while waiting for event (#5551)
+- Add ESP32-S31 support (#5922)
+
+### Changed
+
+- The clock frequency accessor functions no longer need to lock the clock tree (#5461)
+- SPI: `SpiDmaBus` has been merged into `SpiDma`. `with_buffers` now returns `SpiDma` directly, and the buffer-taking transfer methods have been renamed to `read_buffer`, `write_buffer`, `transfer_buffers`, `half_duplex_read_buffer` and `half_duplex_write_buffer` to avoid conflicts with the `SpiBus` trait methods. (#5272)
+- SPI: `SpiDma` will now skip copying into the internal buffers unless necessary (#5290)
+- `#[esp_hal::main]` can now serve as the entry point for both `esp-hal` and `esp-rtos` applications (#5541)
+- The embassy-usb device driver has been moved from `esp_hal::otg_fs::asynch` to `esp_hal::otg_fs::embassy_usb_device`. (#5283)
+
+### Fixed
+
+- RSA: the driver should no longer cause unhandled interrupts to fire (#5443)
+- UART: disallow 0 as the RX FIFO full threshold (#5451)
+- UART: prevent returning 0 from `read_async` (#5451)
+- ESP32-S2, ESP32-S3: Fixed a bug where `UlpCore.run()` with `UlpCoreWakeupSource::HpCpu` fails to wake the ULP Core (#5410)
+
+### Removed
+
+- The `Clocks` struct has been removed (#5461)
+
+## [v1.1.0] - 2026-04-24
+
+### Added
+
+- `AdcPin` now implements `Debug` and `defmt::Format`. (#5194)
 - RMT: All public types now derive `Debug` and `defmt::Format`. (#4302)
 - RMT: `Channel::apply_config` has been added. (#4302)
 - Added blocking `send_break`, `wait_for_break` and `wait_for_break_with_timeout` for sending and detecting software breaks with the UART driver (#4284)
@@ -18,12 +57,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unstable detailed clock configuration options (#4660, #4674)
 - `RsaContext`, `AesContext` now derive `Clone`. (#4709)
 - `Sha<X>Context` now derive `Clone`, except on ESP32. (#4709)
-- Dedicated GPIO implementation (#4699)
+- Dedicated GPIO implementation (#4699, #4819)
 - `esp_hal::interrupt::wait_for_interrupt`, which enters `wfi` (RISC-V) or `waiti 0` (Xtensa) when it would not prevent a debugger from reading memory (#4782)
+- Initial ESP32-C5 support (#4859, #4866, #4871, #4872, #4873, #4877, #4879, #4883, #4884)
+- New configuration option: `ESP_HAL_CONFIG_MIN_CHIP_REVISION` (#4875)
+- `Cpu::all` to iterate over all CPUs (#4890)
+- C5: Add initial GPIO support (#4899, #4928, #4935)
+- C5: Add PCNT support (#4934)
+- C5: Initial UART support (#4948, #4967)
+- C5: Add SPI support (#4943)
+- C5: Add RMT support (#4964)
+- Support ESP32-H2 rev 1.2 (#4949, #4969)
+- C5: Add DMA support (#4959)
+- C5: Add I2C support (#4975)
+- C5: Add basic RNG support (#4978)
+- C5: Add SHA, RSA support (#4979)
+- C5: Add ECC support (#4983, #5071)
+- C5: Add AES support (#4983)
+- C5: Add USB Serial/JTAG support (#5008)
+- C5: Add PARL_IO support (#5042)
+- `esp_hal::interrupt::{RunLevel, ElevatedRunLevel}` (#4996, #5108, #5146)
+- MAC addresses for radio interfaces getter: `esp_hal::efuse::interface_mac_address(InterfaceMacAddress::)`. (#5002)
+- `ShaXContext` objects now implement `digest::core_api::BlockSizeUser` (and thus they can be used with the `hmac` crate) (#5050)
+- C5: Add ASSIST_DEBUG support (#5058)
+- `Ecc::apply_config` and `esp_hal::ecc::Config` (#5073)
+- Added experimental low-level clock control functionality via `esp_hal::clock::ll` (#5092)
+- Work queue support for ECC operations (#5084)
+- A mechanism to hook into linker scripts (#5116)
+- ESP32-S2, ESP32-S3: Add `UlpWakeupSource` so these chips can be woken up by ULP-generated interrupts. (#5132)
+- ESP32-S2, ESP32-S3: `UlpCore.run()` now accepts `UlpCoreWakeupSource::Timer(UlpCoreSleepCycles)` as an argument, allowing ULP applications to be woken up by the ULP Timer. (#5134)
+- Initial ESP32-C61 support (#5187, #5237)
+- Add support for ADC1 on ESP32C5. (#5215)
+- ESP32-C61: RNG (#5244)
+- C61: Add GPIO support (#5248)
+- C61: Add UART support (#5251)
+- C61: Add I2C support (#5258)
+- C61: Add SPI support (#5261)
+- Added support for `rand_core 0.10.0` (#5280)
+- `esp_hal::efuse::ChipRevision` (#5287)
+- Cache configuration options for ESP32-S2 (#5306)
+- C5: Add PSRAM support (#5317, #5353)
+- C61: Add PSRAM support (#5325)
+- C61: Add DMA support (#5356)
+- C61: Add SHA and ECC support (#5354)
+- A `PsramMode` option has been introduced for ESP32-S3. The default mode is `Auto` which will try to detect if PSRAM works via Octal or Quad SPI and configure it accordingly. (#5334)
+- Add I2S loopback logic to the peripheral driver. (#5349)
+- SPI master: added `min_async_transfer_size` config option to force small transfers to use blocking/CPU driven mode. (#5350)
 
 ### Changed
 
+- The `Efuse` struct has been replaced by free-standing functions in the `efuse` module. `efuse::interface_mac_address` and `efuse::MacAddress` have been stabilized. (#5104)
+- `efuse::read_base_mac_address()` has been renamed to `efuse::base_mac_address()` (#5104)
+- Renamed `efuse::set_mac_address` to `efuse::override_mac_address` (#5104)
 - UART: `read_ready` and `write_ready` are now stable (#4600)
+- UART: `read_ready` and `write_ready` now take `&self` instead of `&mut self` (#5329)
 - RMT: `SingleShotTxTransaction` has been renamed to `TxTransaction`. (#4302)
 - RMT: `ChannelCreator::configure_tx` and `ChannelCreator::configure_rx` now take the configuration by reference. (#4302)
 - RMT: `ChannelCreator::configure_tx` and `ChannelCreator::configure_rx` don't take a pin anymore, instead `Channel::with_pin` has been added. (#4302)
@@ -35,9 +122,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RMT: Tx handling has been revised: Some errors will now be returned by `TxTransaction::wait()` instead of `Channel::transmit`. `Channel::transmit_continuously()` can now also report `Error::EndMarkerMissing`. (#4617)
 - `Rtc::time_since_boot()` has been renamed to `Rtc::time_since_power_up()` (#4630)
 - `LP_UART` now has its own configuration structure (#4667)
+- The `MEM2MEM` peripheral singletons have been re-numbered from 0-8 (#4944)
+- The `DmaPeripheral::Mem2MemX` variants have been renamed to `Mem2memX` and re-numbered from 0-8 (#4944)
+- `esp_hal::interrupt::status` has been replaced by `esp_hal::interrupt::InterruptStatus::current()` (#4997)
+- `esp_hal::interrupt::bind_interrupt` and `enable` have been merged into `bind_handler` which is now safe and infallible (#4996)
+- `esp_hal::peripherals::Peripherals.WIFI` and `esp_hal::peripherals::WIFI` are now stable (#5026)
+- RISC-V: `esp_hal::interrupt::enable_direct` now takes a `DirectBindableCpuInterrupt` and is infallible (#5037)
+- The `ecc` driver now takes the curve by value (#5055)
+- `EllipticCurve` now implements common traits (#5055)
+- The `interrupt` module, `esp_hal::interrupt::Priority`, `PERI::enable_X_interrupt` and `PERI::disable_X_interrupt_on_all_cores` have been stabilized (#5040)
+- The `Ecc` driver no longer expects some operations to receive big-endian input (#5061)
+- `Ecc::mod_operations` has been replaced by `modular_addition`, `modular_subtraction`, `modular_multiplication` and `modular_division` (#5061)
+- `Ecc` methods now return a result handle that can be used to retrieve the result of the operation. (#5061)
+- `Ecc` modular arithmetic methods now take the modulus as an argument (#5073)
+- `Ecc::new` now takes a configuration parameter (#5073)
+- It's no longer possible to pass `esp_hal::gpio::Output` to bidirectional peripheral signals (half-duplex SPI, I2C) (#5093)
+- S3: SPI1 is no longer initialized if PSRAM is not correctly detected. The warning message now includes PSRAM mode config (#5122)
+- `Rng`, `Rng::{random, read}` have been marked stable (#5098)
+- `esp_hal::init` now verifies that the initial stack pointer is in range (#5227)
+- Updated embassy dependencies: embassy-sync to 0.8, embassy-embedded-hal to 0.6 (#5249)
+- `esp_hal::efuse::chip_revision` has been marked stable (#5287)
+- `esp_hal::efuse::chip_revision` now returns `ChipRevision` (#5287)
+- DMA buffers can now be created using empty buffer slices (#5266)
 
 ### Fixed
 
+- SHA: Fixed potential unsoundness in `ShaDigest` by requiring exclusive access to the peripheral (#4837)
 - ESP32: ADC1 readings are no longer inverted (#4423)
 - RMT: All blocking methods now return the channel on failure. (#4302)
 - RMT: the `place_rmt_driver_in_ram` option now also places the async interrupt handler in RAM. (#4302)
@@ -52,12 +162,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All GPIOs are now available without unsafe code. The potentially reserved GPIOs are now documented. (#4728)
 - Make sure we added all relevant section to `.rwtext.wifi` (#4808)
 - ESP32-S3: Fixed startup code to prevent a linker error (#4815)
+- Fixed a situation where the ELF might make tooling emit more than two segments in the image which will make the bootloader refuse to boot (#4844)
+- ESP32-S3/ESP32-C2: WiFi will work after light-sleep with default settings (#4826)
+- ESP32-S2: Fixed an issue where enabling TRNG can prevent WiFi from working (#4856)
+- Fixed an issue that caused the stack guard to overwrite data moved to the second core (#4914)
+- PCNT: Fixed some potential data race issues (#4932)
+- Fixed PLL reconfiguration causing garbled serial output (#5067)
+- ESP32, ESP32-S2: Fixed RC_FAST divider enable polarity (#5067)
+- ESP32-C6: RtcClock clock calibration for v0.1 (#5109)
+- Improve LP timer accuracy (#5105, #5115)
+- Increase the size of `irom_seg`/`drom_seg` from 4 MB to 32 MB for the ESP32-S3 (#5121)
+- UART and I2C inputs are now correctly defined when creating drivers (#5214)
+- The `SpiBus::transfer` (both from `embedded_hal` and `embedded_hal_async`) implementations of `esp_hal::spi::master::Spi` no longer write more data than they need to (#5245)
+- Fixed a bug in `Spi::half_duplex_{read, write}` where calling these functions aborted previously running writes (#5247)
+- LP I2C: prevent spurious I2C start during the initialization of LpI2c (#5311)
+- Fixed a bug in `TWAI` that may cause the driver to hang (#5318)
+- ESP32-C6: Fixed an issue where the chip failed to enable a required clock signal before trying to use it (#5405)
 
 ### Removed
 
+- The `Efuse` struct has been removed. Use free-standing functions in the `efuse` module instead. (#5104)
 - The `ESP_HAL_CONFIG_XTAL_FREQUENCY` configuration option has been removed (#4517)
+- The `ESP_HAL_CONFIG_PSRAM_MODE` configuration option has been removed (#5334)
 - `Clocks::{i2c_clock, pwm_clock, crypto_clock}` fields (#4636, #4647)
 - `RtcClock::xtal_freq()` and the `XtalClock` enum (#4724)
+- `Rtc::estimate_xtal_frequency()` (#4851)
+- `RtcFastClock`, `RtcSlowClock` (#4851)
+- `esp_hal::interrupt::enable_direct` from ESP32, ESP32-S2 and ESP32-S3 (#5007)
+- `esp_hal::interrupt::RESERVED_INTERRUPTS` (#5007, #5037)
+- `esp_hal::interrupt::map` (#4996, #5007)
+- `InterruptHandler::new_not_nested` (#5000)
+- `esp_hal::interrupt::Priority::None` (#4996)
+- The `psram` feature has been replaced by a `Psram` driver object. esp-alloc has been updated so that no user code changes should be necessary when using `esp_alloc::psram_allocator!` (#5310)
+- The `esp_hal::psram::psram_raw_parts` function has been removed. Use `esp_alloc::psram_allocator`, or `Psram::raw_parts`. (#5310)
+- The `Trng::default()` which is insecure (#5403)
 
 ## [v1.0.0] - 2025-10-30
 
@@ -70,7 +208,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `work_queue` is no longer public (#4357)
 - UART memory is now powered down when the driver is no longer in use. (#4354)
 
-
 ### Removed
 
 - The `WatchdogConfig` enum and watchdog timer configuration from `esp_hal::init` (#4377)
@@ -79,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A reimplemntation of the `assign_resources!` macro (#3809)
+- A reimplementation of the `assign_resources!` macro (#3809)
 - `TrngSource` to manage random number generator entropy (#3829)
 - On RISC-V you can opt-out of nested interrupts for an interrupt handler by using `new_not_nested` (#3875)
 - A new default feature `exception-handler` was added (#3887)
@@ -272,7 +409,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented `embedded_io::ReadReady` for `Uart` and `UartRx` (#3423)
 - Implemented `embedded_io::WriteReady` for `Uart` and `UartTx` (#3423)
 - ESP32-H2: Support for ADC calibration (#3414)
-- Expose ADC asynchrounous functionalities where applicable (#3443)
+- Expose ADC asynchronous functionalities where applicable (#3443)
 - Added `UartInterrupt::RxTimeout` support (#3493)
 - UART: Added HW and SW flow control config option (#3435)
 - I2C master: `SoftwareTimeout` and `Config::with_software_timeout`. (#3577)
@@ -372,7 +509,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `esp_hal::time::{Rate, Duration, Instant}` (#3083)
 - Async support for ADC oneshot reads for ESP32C2, ESP32C3, ESP32C6 and ESP32H2 (#2925, #3082)
 - `ESP_HAL_CONFIG_XTAL_FREQUENCY` configuration. For now, chips other than ESP32 and ESP32-C2 have a single option only. (#3054)
-- Added more validation to UART and SPI. User can now specify the baudrate tolerance of UART config (#3074)
+- Added more validation to UART and SPI. The user can now specify the baudrate tolerance of UART config (#3074)
 - Add auto-writeback support to DMA buffers (#3107)
 
 ### Changed
@@ -443,7 +580,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `set_priority` to the `DmaChannel` trait on GDMA devices (#2403, #2526)
 - Added `into_async` and `into_blocking` functions for `ParlIoTxOnly`, `ParlIoRxOnly` (#2526)
 - ESP32-C6, H2, S3: Added `split` function to the `DmaChannel` trait. (#2526, #2532)
-- DMA: `PeripheralDmaChannel` type aliasses and `DmaChannelFor` traits to improve usability. (#2532)
+- DMA: `PeripheralDmaChannel` type aliases and `DmaChannelFor` traits to improve usability. (#2532)
 - `dma::{Channel, ChannelRx, ChannelTx}::set_priority` for GDMA devices (#2403)
 - `esp_hal::asynch::AtomicWaker` that does not hold a global critical section (#2555)
 - `esp_hal::sync::RawMutex` for embassy-sync. (#2555)
@@ -468,7 +605,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uart::ConfigError` now implements `Eq` (#2825)
 - `i2c::master::Error` now implements `Eq` and `Hash` (#2825)
 - `i2c::master::Operation` now implements `Debug`, `PartialEq`, `Eq`, `Hash`, and `Display` (#2825)
-- `i2c::master::Config` now implements `PartialEq`, `Eq`, ans `Hash` (#2825)
+- `i2c::master::Config` now implements `PartialEq`, `Eq`, and `Hash` (#2825)
 - `i2c::master::I2c` now implements `Debug`, `PartialEq`, and `Eq` (#2825)
 - `i2c::master::Info` now implements `Debug` (#2825)
 - `spi::master::Config` now implements `Hash` (#2823)
@@ -546,7 +683,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Xtensa devices now correctly enable the `esp-hal-procmacros/rtc-slow` feature (#2594)
 - User-bound GPIO interrupt handlers should no longer interfere with async pins. (#2625)
-- `spi::master::Spi::{into_async, into_blocking}` are now correctly available on the typed driver, to. (#2674)
+- `spi::master::Spi::{into_async, into_blocking}` are now correctly available on the typed driver, too. (#2674)
 - It is no longer possible to safely conjure `GpioPin` instances (#2688)
 - UART: Public API follows `C-WORD_ORDER` Rust API standard (`VerbObject` order) (#2851)
 - `DmaRxStreamBuf` now correctly resets the descriptors the next time it's used (#2890)
@@ -1197,7 +1334,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Direct boot support has been removed (#903)
 - Removed the `mcu-boot` feature from `esp32c3-hal` (#938)
-- Removed SpiBusController and SpiBusDevice in favour of embedded-hal-bus and embassy-embedded-hal implementataions. (#978)
+- Removed SpiBusController and SpiBusDevice in favour of embedded-hal-bus and embassy-embedded-hal implementations. (#978)
 
 ## [0.13.1] - 2023-11-02
 
@@ -1402,7 +1539,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sometimes half-duplex non-DMA SPI reads were reading garbage in non-release mode (#552)
 - ESP32-C3: Fix GPIO5 ADC channel id (#562)
 - ESP32-H2: Fix direct-boot feature (#570)
-- Fix Async GPIO not disabling interupts on chips with multiple banks (#572)
+- Fix Async GPIO not disabling interrupts on chips with multiple banks (#572)
 - ESP32-C6: Support FOSC CLK calibration for ECO1+ chip revisions (#593)
 - Fixed CI by pinning the log crate to 0.4.18 (#600)
 - ESP32-S3: Fix calculation of PSRAM start address (#601)
@@ -1497,4 +1634,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v1.0.0-rc.0]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.0.0-beta.1...esp-hal-v1.0.0-rc.0
 [v1.0.0-rc.1]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.0.0-rc.0...esp-hal-v1.0.0-rc.1
 [v1.0.0]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.0.0-rc.1...esp-hal-v1.0.0
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.0.0...HEAD
+[v1.1.0]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.1.0...esp-hal-v1.1.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.1.0...HEAD

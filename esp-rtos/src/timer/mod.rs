@@ -10,7 +10,6 @@ use crate::{
     SCHEDULER,
     TICK_RATE,
     TimeBase,
-    run_queue::RunSchedulerOn,
     task::{self, TaskExt, TaskPtr, TaskQueue, TaskState, TaskTimerQueueElement},
 };
 
@@ -111,19 +110,10 @@ impl TimeDriver {
     pub(crate) fn new(mut timer: TimeBase) -> Self {
         // The timer needs to tick at Priority 1 to prevent accidentally interrupting
         // priority limited locks.
-        let timer_priority = Priority::Priority1;
-
-        cfg_if::cfg_if! {
-            if #[cfg(riscv)] {
-                // Register the interrupt handler without nesting to satisfy the requirements of the
-                // task switching code
-                let handler = InterruptHandler::new_not_nested(timer_tick_handler, timer_priority);
-            } else {
-                let handler = InterruptHandler::new(timer_tick_handler, timer_priority);
-            }
-        };
-
-        timer.set_interrupt_handler(handler);
+        timer.set_interrupt_handler(InterruptHandler::new(
+            timer_tick_handler,
+            Priority::Priority1,
+        ));
         timer.listen();
 
         Self {
@@ -131,6 +121,17 @@ impl TimeDriver {
             timer_queue: TimerQueue::new(),
             current_alarm: u64::MAX,
         }
+    }
+
+    #[cfg(sleep_light_sleep)]
+    pub(crate) fn next_wakeup(&self) -> u64 {
+        self.timer_queue.next_wakeup()
+    }
+
+    /// Force-rearms the alarm timer.
+    pub(crate) fn rearm(&mut self, now: u64) {
+        self.current_alarm = u64::MAX;
+        self.arm_next_wakeup(now);
     }
 
     pub(crate) fn handle_alarm(&mut self, now: u64, on_task_ready: impl FnMut(TaskPtr)) {
@@ -187,10 +188,16 @@ impl TimeDriver {
     }
 
     pub(crate) fn schedule_wakeup(&mut self, mut current_task: TaskPtr, at: Instant) -> bool {
+        // FIXME: repeated call of this function is currently not supported.
+        // This function can be called in a critical section - usually it's paired with a yield,
+        // that will trigger a context switch when exiting the critical section. However, some
+        // callers will loop and if _they_ are called in a critical section, they will never make
+        // progress. This function will then first set the task state to `Sleeping` in the
+        // first iteration, then crash here in the next one.
         debug_assert_eq!(
             current_task.state(),
             TaskState::Ready,
-            "task: {:?}",
+            "Task {:?} is in an unexpected state. This can happen if OS methods are called inside a critical section.",
             current_task
         );
 
@@ -269,15 +276,10 @@ extern "C" fn timer_tick_handler() {
 
             debug!("Task {:?} is ready", ready_task);
 
-            match scheduler
+            let run_scheduler = scheduler
                 .run_queue
-                .mark_task_ready(&scheduler.per_cpu, ready_task)
-            {
-                RunSchedulerOn::DontRun => {}
-                RunSchedulerOn::CurrentCore => task::yield_task(),
-                #[cfg(multi_core)]
-                RunSchedulerOn::OtherCore => task::schedule_other_core(),
-            }
+                .mark_task_ready(&scheduler.per_cpu, ready_task);
+            task::trigger_scheduler(run_scheduler);
         });
 
         // After processing the timer queue, the next embassy wakeup time is lost and we have to
@@ -302,8 +304,7 @@ extern "C" fn timer_tick_handler() {
         // Re-arm the timer. This should be relatively cheap, and ensures that the timer will keep
         // ticking even if the interrupt doesn't trigger a context switch.
         // FIXME: this SHOULD be relatively cheap, but arming the timer involves u64 division.
-        time_driver.current_alarm = u64::MAX;
-        time_driver.arm_next_wakeup(now);
+        time_driver.rearm(now);
     });
 
     #[cfg(feature = "rtos-trace")]

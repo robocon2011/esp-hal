@@ -17,7 +17,7 @@
 //! - D6        => GPIO16
 //! - D7        => GPIO15
 
-//% CHIPS: esp32s3
+//% CHIP_FILTER: rgb_display_driver_supported && soc_has_lcd_cam
 
 #![no_std]
 #![no_main]

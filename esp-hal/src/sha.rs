@@ -14,10 +14,6 @@
 //! * SHA-384
 //! * SHA-512
 //!
-//! The driver supports two working modes:
-//! * Typical SHA (CPU-driven)
-//! * DMA-SHA (not supported yet)
-//!
 //! It provides functions to update the hash calculation with input data, finish
 //! the hash calculation and retrieve the resulting hash value. The SHA
 //! peripheral on ESP chips can handle large data streams efficiently, making it
@@ -88,9 +84,13 @@
 //! # {after_snippet}
 //! ```
 
-#![allow(deprecated, reason = "generic_array 0.14 has been deprecated")]
-
-use core::{borrow::Borrow, convert::Infallible, marker::PhantomData, mem::size_of, ptr::NonNull};
+use core::{
+    borrow::BorrowMut,
+    convert::Infallible,
+    marker::PhantomData,
+    mem::size_of,
+    ptr::NonNull,
+};
 
 /// Re-export digest for convenience
 pub use digest::Digest;
@@ -326,14 +326,12 @@ impl<'d> Sha<'d> {
 
 impl crate::private::Sealed for Sha<'_> {}
 
-#[cfg(sha_dma)]
+#[cfg(sha_supports_dma)]
 #[instability::unstable]
 impl crate::interrupt::InterruptConfigurable for Sha<'_> {
     fn set_interrupt_handler(&mut self, handler: crate::interrupt::InterruptHandler) {
-        self.sha.disable_peri_interrupt();
-
-        self.sha.bind_peri_interrupt(handler.handler());
-        self.sha.enable_peri_interrupt(handler.priority());
+        self.sha.disable_peri_interrupt_on_all_cores();
+        self.sha.bind_peri_interrupt(handler);
     }
 }
 
@@ -346,7 +344,7 @@ impl crate::interrupt::InterruptConfigurable for Sha<'_> {
 ///
 /// This implementation might fail after u32::MAX/8 bytes, to increase please
 /// see ::finish() length/self.cursor usage
-pub struct ShaDigest<'d, A, S: Borrow<Sha<'d>>> {
+pub struct ShaDigest<'d, A, S: BorrowMut<Sha<'d>>> {
     sha: S,
     state: DigestState,
     phantom: PhantomData<(&'d (), A)>,
@@ -387,13 +385,13 @@ impl DigestState {
     }
 }
 
-impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
+impl<'d, A: ShaAlgorithm, S: BorrowMut<Sha<'d>>> ShaDigest<'d, A, S> {
     /// Creates a new digest
     #[allow(unused_mut)]
     pub fn new(mut sha: S) -> Self {
         #[cfg(not(esp32))]
         // Setup SHA Mode.
-        sha.borrow()
+        sha.borrow_mut()
             .sha
             .register_block()
             .mode()
@@ -408,9 +406,9 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
 
     /// Restores a previously saved digest.
     #[cfg(not(esp32))]
-    pub fn restore(sha: S, ctx: &mut Context<A>) -> Self {
+    pub fn restore(mut sha: S, ctx: &mut Context<A>) -> Self {
         // Setup SHA Mode.
-        sha.borrow()
+        sha.borrow_mut()
             .sha
             .register_block()
             .mode()
@@ -418,12 +416,16 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
 
         // Restore the message buffer
         unsafe {
-            core::ptr::copy_nonoverlapping(ctx.buffer.as_ptr(), m_mem(&sha.borrow().sha, 0), 32);
+            core::ptr::copy_nonoverlapping(
+                ctx.buffer.as_ptr(),
+                m_mem(&sha.borrow_mut().sha, 0),
+                32,
+            );
         }
 
         // Restore previously saved hash
         ctx.state.alignment_helper.volatile_write_regset(
-            h_mem(&sha.borrow().sha, 0),
+            h_mem(&sha.borrow_mut().sha, 0),
             &ctx.saved_digest,
             64,
         );
@@ -442,7 +444,7 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
 
     /// Updates the SHA digest with the provided data buffer.
     pub fn update<'a>(&mut self, incoming: &'a [u8]) -> nb::Result<&'a [u8], Infallible> {
-        self.sha.borrow().update(&mut self.state, incoming)
+        self.sha.borrow_mut().update(&mut self.state, incoming)
     }
 
     /// Finish of the calculation (if not already) and copy result to output
@@ -453,7 +455,7 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
     /// [ShaAlgorithm::DIGEST_LENGTH], but smaller inputs can be given to
     /// get a "short hash"
     pub fn finish(&mut self, output: &mut [u8]) -> nb::Result<(), Infallible> {
-        self.sha.borrow().finish(&mut self.state, output)
+        self.sha.borrow_mut().finish(&mut self.state, output)
     }
 
     /// Save the current state of the digest for later continuation.
@@ -467,7 +469,7 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
 
         // Save the content of the current hash.
         self.state.alignment_helper.volatile_read_regset(
-            h_mem(&self.sha.borrow().sha, 0),
+            h_mem(&self.sha.borrow_mut().sha, 0),
             &mut context.saved_digest,
             64,
         );
@@ -475,7 +477,7 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> ShaDigest<'d, A, S> {
         // Save the content of the current (probably partially written) message.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                m_mem(&self.sha.borrow().sha, 0),
+                m_mem(&self.sha.borrow_mut().sha, 0),
                 context.buffer.as_mut_ptr(),
                 32,
             );
@@ -549,18 +551,18 @@ pub trait ShaAlgorithm: crate::private::Sealed {
     const DIGEST_LENGTH: usize;
 
     #[doc(hidden)]
-    type DigestOutputSize: digest::generic_array::ArrayLength<u8> + 'static;
+    type DigestOutputSize: digest::array::ArraySize + 'static;
 }
 
 /// Note: digest has a blanket trait implementation for [digest::Digest] for any
 /// element that implements FixedOutput + Default + Update + HashMarker
-impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> digest::HashMarker for ShaDigest<'d, A, S> {}
+impl<'d, A: ShaAlgorithm, S: BorrowMut<Sha<'d>>> digest::HashMarker for ShaDigest<'d, A, S> {}
 
-impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> digest::OutputSizeUser for ShaDigest<'d, A, S> {
+impl<'d, A: ShaAlgorithm, S: BorrowMut<Sha<'d>>> digest::OutputSizeUser for ShaDigest<'d, A, S> {
     type OutputSize = A::DigestOutputSize;
 }
 
-impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> digest::Update for ShaDigest<'d, A, S> {
+impl<'d, A: ShaAlgorithm, S: BorrowMut<Sha<'d>>> digest::Update for ShaDigest<'d, A, S> {
     fn update(&mut self, mut remaining: &[u8]) {
         while !remaining.is_empty() {
             remaining = nb::block!(Self::update(self, remaining)).unwrap();
@@ -568,7 +570,7 @@ impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> digest::Update for ShaDigest<'d, A
     }
 }
 
-impl<'d, A: ShaAlgorithm, S: Borrow<Sha<'d>>> digest::FixedOutput for ShaDigest<'d, A, S> {
+impl<'d, A: ShaAlgorithm, S: BorrowMut<Sha<'d>>> digest::FixedOutput for ShaDigest<'d, A, S> {
     fn finalize_into(mut self, out: &mut digest::Output<Self>) {
         nb::block!(self.finish(out)).unwrap();
     }
@@ -625,15 +627,16 @@ for_each_sha_algorithm! {
 impl ShaAlgorithmKind {
     fn start(self, sha: &crate::peripherals::SHA<'_>) {
         let regs = sha.register_block();
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 match self {
                     ShaAlgorithmKind::Sha1 => regs.sha1_start().write(|w| w.sha1_start().set_bit()),
                     ShaAlgorithmKind::Sha256 => regs.sha256_start().write(|w| w.sha256_start().set_bit()),
                     ShaAlgorithmKind::Sha384 => regs.sha384_start().write(|w| w.sha384_start().set_bit()),
                     ShaAlgorithmKind::Sha512 => regs.sha512_start().write(|w| w.sha512_start().set_bit()),
                 };
-            } else {
+            }
+            _ => {
                 regs.start().write(|w| w.start().set_bit());
             }
         }
@@ -641,15 +644,16 @@ impl ShaAlgorithmKind {
 
     fn r#continue(self, sha: &crate::peripherals::SHA<'_>) {
         let regs = sha.register_block();
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 match self {
                     ShaAlgorithmKind::Sha1 => regs.sha1_continue().write(|w| w.sha1_continue().set_bit()),
                     ShaAlgorithmKind::Sha256 => regs.sha256_continue().write(|w| w.sha256_continue().set_bit()),
                     ShaAlgorithmKind::Sha384 => regs.sha384_continue().write(|w| w.sha384_continue().set_bit()),
                     ShaAlgorithmKind::Sha512 => regs.sha512_continue().write(|w| w.sha512_continue().set_bit()),
                 };
-            } else {
+            }
+            _ => {
                 regs.continue_().write(|w| w.continue_().set_bit());
             }
         }
@@ -659,8 +663,8 @@ impl ShaAlgorithmKind {
     ///
     /// Returns whether the caller needs to wait for the hash to be loaded.
     fn load(self, _sha: &crate::peripherals::SHA<'_>) -> bool {
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 let regs = _sha.register_block();
                 match self {
                     ShaAlgorithmKind::Sha1 => regs.sha1_load().write(|w| w.sha1_load().set_bit()),
@@ -670,7 +674,8 @@ impl ShaAlgorithmKind {
                 };
 
                 true
-            } else {
+            }
+            _ => {
                 // Return that no waiting is necessary
                 false
             }
@@ -679,15 +684,16 @@ impl ShaAlgorithmKind {
 
     fn is_busy(self, sha: &crate::peripherals::SHA<'_>) -> bool {
         let regs = sha.register_block();
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 let bit = match self {
                     ShaAlgorithmKind::Sha1 => regs.sha1_busy().read().sha1_busy(),
                     ShaAlgorithmKind::Sha256 => regs.sha256_busy().read().sha256_busy(),
                     ShaAlgorithmKind::Sha384 => regs.sha384_busy().read().sha384_busy(),
                     ShaAlgorithmKind::Sha512 => regs.sha512_busy().read().sha512_busy(),
                 };
-            } else {
+            }
+            _ => {
                 let bit = regs.busy().read().state();
             }
         }
@@ -730,10 +736,11 @@ for_each_sha_algorithm! {
 
 fn h_mem(sha: &crate::peripherals::SHA<'_>, index: usize) -> *mut u32 {
     let sha = sha.register_block();
-    cfg_if::cfg_if! {
-        if #[cfg(esp32)] {
+    cfg_select! {
+        esp32 => {
             sha.text(index).as_ptr()
-        } else {
+        }
+        _ => {
             sha.h_mem(index).as_ptr()
         }
     }
@@ -741,10 +748,11 @@ fn h_mem(sha: &crate::peripherals::SHA<'_>, index: usize) -> *mut u32 {
 
 fn m_mem(sha: &crate::peripherals::SHA<'_>, index: usize) -> *mut u32 {
     let sha = sha.register_block();
-    cfg_if::cfg_if! {
-        if #[cfg(esp32)] {
+    cfg_select! {
+        esp32 => {
             sha.text(index).as_ptr()
-        } else {
+        }
+        _ => {
             sha.m_mem(index).as_ptr()
         }
     }
@@ -803,7 +811,7 @@ const BLOCKING_SHA_VTABLE: VTable<ShaOperation> = VTable {
         // manner and so they can't be cancelled.
     },
     stop: |driver| {
-        // Drop the SHA driver to conserve power when there is nothig to do (or when the driver was
+        // Drop the SHA driver to conserve power when there is nothing to do (or when the driver was
         // stopped).
         let driver = unsafe { ShaBackend::from_raw(driver) };
         driver.deinitialize()
@@ -1097,6 +1105,16 @@ impl<'t, 'd> ShaWorkQueueDriver<'t, 'd> {
     }
 }
 
+// ESP32 can't save (or rather, restore) the hash context, so we need to fall back to software
+// if a context already uses the hardware. Also we must not power down the hardware when a
+// context uses it, as it corrupts state.
+#[cfg(esp32)]
+#[expect(clippy::large_enum_variant)]
+enum Esp32Hasher {
+    Hardware(GenericPeripheralGuard<{ crate::system::Peripheral::Sha as u8 }>),
+    Software(SoftwareHasher),
+}
+
 #[cfg(esp32)]
 enum SoftwareHasher {
     Sha1(sha1::Sha1),
@@ -1114,10 +1132,8 @@ struct ShaContext<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> {
     #[cfg(not(esp32))] // Saved H_MEM registers
     state: [u32; 16],
 
-    // ESP32 can't save (or rather, restore) the hash context, so we need to fall back to software
-    // if a context already uses the hardware.
     #[cfg(esp32)]
-    use_software: Option<SoftwareHasher>,
+    hasher: Esp32Hasher,
 }
 
 // ESP32 can't save the context, so it can't support interleaved operation. To support the digest
@@ -1135,16 +1151,16 @@ static ACCELERATOR_IN_USE: AtomicBool = AtomicBool::new(false);
 impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> ShaContext<CHUNK_BYTES, DIGEST_WORDS> {
     fn new(algorithm: ShaAlgorithmKind) -> Self {
         #[cfg(esp32)]
-        let use_software = if ACCELERATOR_IN_USE.swap(true, Ordering::SeqCst) {
+        let hasher = if ACCELERATOR_IN_USE.swap(true, Ordering::SeqCst) {
             let hasher = match algorithm {
                 ShaAlgorithmKind::Sha1 => SoftwareHasher::Sha1(sha1::Sha1::new()),
                 ShaAlgorithmKind::Sha256 => SoftwareHasher::Sha256(sha2::Sha256::new()),
                 ShaAlgorithmKind::Sha384 => SoftwareHasher::Sha384(sha2::Sha384::new()),
                 ShaAlgorithmKind::Sha512 => SoftwareHasher::Sha512(sha2::Sha512::new()),
             };
-            Some(hasher)
+            Esp32Hasher::Software(hasher)
         } else {
-            None
+            Esp32Hasher::Hardware(GenericPeripheralGuard::new())
         };
 
         Self {
@@ -1162,7 +1178,7 @@ impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> ShaContext<CHUNK_BYTES
             state: [0; 16],
 
             #[cfg(esp32)]
-            use_software,
+            hasher,
         }
     }
 
@@ -1173,7 +1189,7 @@ impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> ShaContext<CHUNK_BYTES
             data.len()
         );
         #[cfg(esp32)]
-        if let Some(hasher) = self.use_software.as_mut() {
+        if let Esp32Hasher::Software(ref mut hasher) = self.hasher {
             Self::update_using_software(hasher, data);
             return ShaHandle(self.frontend.post_completed(&SHA_WORK_QUEUE));
         }
@@ -1224,7 +1240,7 @@ impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> ShaContext<CHUNK_BYTES
             result.len()
         );
         #[cfg(esp32)]
-        if let Some(hasher) = self.use_software.as_mut() {
+        if let Esp32Hasher::Software(ref mut hasher) = self.hasher {
             Self::finalize_using_software(hasher, result);
             return ShaHandle(self.frontend.post_completed(&SHA_WORK_QUEUE));
         }
@@ -1259,19 +1275,19 @@ impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> ShaContext<CHUNK_BYTES
         match hasher {
             SoftwareHasher::Sha1(sha) => {
                 let output = sha.finalize_reset();
-                result.copy_from_slice(output.as_slice())
+                result.copy_from_slice(output.as_ref())
             }
             SoftwareHasher::Sha256(sha) => {
                 let output = sha.finalize_reset();
-                result.copy_from_slice(output.as_slice())
+                result.copy_from_slice(output.as_ref())
             }
             SoftwareHasher::Sha384(sha) => {
                 let output = sha.finalize_reset();
-                result.copy_from_slice(output.as_slice())
+                result.copy_from_slice(output.as_ref())
             }
             SoftwareHasher::Sha512(sha) => {
                 let output = sha.finalize_reset();
-                result.copy_from_slice(output.as_slice())
+                result.copy_from_slice(output.as_ref())
             }
         }
     }
@@ -1282,7 +1298,9 @@ impl<const CHUNK_BYTES: usize, const DIGEST_WORDS: usize> Drop
     for ShaContext<CHUNK_BYTES, DIGEST_WORDS>
 {
     fn drop(&mut self) {
-        ACCELERATOR_IN_USE.store(false, Ordering::Release);
+        if matches!(self.hasher, Esp32Hasher::Hardware(_)) {
+            ACCELERATOR_IN_USE.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1332,7 +1350,7 @@ pub enum FinalizeError {
 // Now implement the actual public types.
 // Helper macro to limit the scope of `paste`
 macro_rules! impl_worker_context {
-    ($name:ident, $full_name:literal, $algo:expr, $digest_len:literal ) => {
+    ($name:ident, $full_name:literal, $algo:expr, $digest_len:literal, $block_size:literal ) => {
         #[doc = concat!("A ", $full_name, " context.")]
         #[cfg_attr(not(esp32), derive(Clone))]
         pub struct $name(ShaContext<{ $algo.chunk_length() }, { $algo.digest_length() / 4 }>);
@@ -1406,13 +1424,21 @@ macro_rules! impl_worker_context {
                 Self::finalize(&mut self, out.as_mut()).wait_blocking();
             }
         }
+
+        impl digest::block_api::BlockSizeUser for $name {
+            type BlockSize = paste::paste!(digest::consts::[< U $block_size >]);
+
+            fn block_size() -> usize {
+                $block_size
+            }
+        }
     };
 }
 
 for_each_sha_algorithm! {
     ( $name:ident, $full_name:literal (sizes: $block_size:literal, $digest_len:literal, $message_length_bytes:literal) $security:tt, $mode_bits:literal ) => {
         paste::paste! {
-            impl_worker_context!( [<$name Context>], $full_name, ShaAlgorithmKind::$name, $digest_len );
+            impl_worker_context!( [<$name Context>], $full_name, ShaAlgorithmKind::$name, $digest_len, $block_size );
         }
     };
 }

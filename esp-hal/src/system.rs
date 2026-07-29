@@ -1,6 +1,16 @@
 //! # System Control
 
+#![cfg_attr(esp32s31, allow(dead_code))]
+
 use esp_sync::NonReentrantMutex;
+
+cfg_select! {
+    all(soc_multi_core_enabled, feature = "unstable") => {
+        pub(crate) mod multi_core;
+        pub use multi_core::*;
+    }
+    _ => {}
+}
 
 // Implements the Peripheral enum based on esp-metadata/device.soc/peripheral_clocks
 implement_peripheral_clocks!();
@@ -57,10 +67,7 @@ pub(crate) struct PeripheralGuard {
 
 impl PeripheralGuard {
     pub(crate) fn new_with(p: Peripheral, init: fn()) -> Self {
-        if PeripheralClockControl::enable(p) {
-            PeripheralClockControl::reset(p);
-            init();
-        }
+        PeripheralClockControl::request_peripheral(p, init);
 
         Self { peripheral: p }
     }
@@ -92,18 +99,13 @@ pub(crate) struct GenericPeripheralGuard<const P: u8> {}
 
 impl<const P: u8> GenericPeripheralGuard<P> {
     pub(crate) fn new_with(init: fn()) -> Self {
-        let peripheral = const { Peripheral::try_from(P).unwrap() };
-
-        PERIPHERAL_REF_COUNT.with(|ref_counts| {
-            if PeripheralClockControl::enable_with_counts(peripheral, ref_counts) {
-                unsafe { PeripheralClockControl::reset_racey(peripheral) };
-                init();
-            }
-        });
+        let p = const { Peripheral::try_from(P).unwrap() };
+        PeripheralClockControl::request_peripheral(p, init);
 
         Self {}
     }
 
+    #[cfg_attr(esp32p4, allow(unused))]
     #[cfg_attr(not(feature = "unstable"), allow(unused))]
     pub(crate) fn new() -> Self {
         Self::new_with(|| {})
@@ -131,6 +133,15 @@ impl<const P: u8> Drop for GenericPeripheralGuard<P> {
 pub(crate) struct PeripheralClockControl;
 
 impl PeripheralClockControl {
+    fn request_peripheral(p: Peripheral, init: fn()) {
+        PERIPHERAL_REF_COUNT.with(|ref_counts| {
+            if Self::enable_with_counts(p, ref_counts) {
+                unsafe { Self::reset_racey(p) };
+                init();
+            }
+        });
+    }
+
     /// Enables the given peripheral.
     ///
     /// This keeps track of enabling a peripheral - i.e. a peripheral
@@ -157,8 +168,6 @@ impl PeripheralClockControl {
     /// gets disabled when the number of enable/disable attempts is balanced.
     ///
     /// Returns `true` if it actually disabled the peripheral.
-    ///
-    /// Before disabling a peripheral it will also get reset
     pub(crate) fn disable(peripheral: Peripheral) -> bool {
         PERIPHERAL_REF_COUNT.with(|ref_counts| {
             Self::enable_forced_with_counts(peripheral, false, false, ref_counts)
@@ -192,10 +201,6 @@ impl PeripheralClockControl {
             assert!(*ref_count == 0);
         }
 
-        if !enable {
-            unsafe { Self::reset_racey(peripheral) };
-        }
-
         debug!("Enable {:?} {}", peripheral, enable);
         unsafe { enable_internal_racey(peripheral, enable) };
 
@@ -217,10 +222,6 @@ impl PeripheralClockControl {
         PERIPHERAL_REF_COUNT.with(|_| unsafe { Self::reset_racey(peripheral) })
     }
 }
-
-#[cfg(any(esp32, esp32s3))]
-#[allow(unused_imports)]
-pub use crate::soc::cpu_control::*;
 
 /// Available CPU cores
 ///
@@ -259,11 +260,14 @@ impl Cpu {
         // in the case of Xtensa.
         match raw_core() {
             0 => Cpu::ProCpu,
+
             #[cfg(all(multi_core, riscv))]
             1 => Cpu::AppCpu,
+
             #[cfg(all(multi_core, xtensa))]
             0x2000 => Cpu::AppCpu,
-            _ => unreachable!(),
+
+            other => unreachable!("unknown core id: {}", other),
         }
     }
 
@@ -271,13 +275,14 @@ impl Cpu {
     #[inline(always)]
     #[instability::unstable]
     pub fn other() -> impl Iterator<Item = Self> {
-        cfg_if::cfg_if! {
-            if #[cfg(multi_core)] {
+        cfg_select! {
+            multi_core => {
                 match Self::current() {
                     Cpu::ProCpu => [Cpu::AppCpu].into_iter(),
                     Cpu::AppCpu => [Cpu::ProCpu].into_iter(),
                 }
-            } else {
+            }
+            _ => {
                 [].into_iter()
             }
         }
@@ -285,11 +290,12 @@ impl Cpu {
 
     /// Returns an iterator over all cores.
     #[inline(always)]
-    pub(crate) fn all() -> impl Iterator<Item = Self> {
-        cfg_if::cfg_if! {
-            if #[cfg(multi_core)] {
+    pub fn all() -> impl Iterator<Item = Self> {
+        cfg_select! {
+            multi_core => {
                 [Cpu::ProCpu, Cpu::AppCpu].into_iter()
-            } else {
+            }
+            _ => {
                 [Cpu::ProCpu].into_iter()
             }
         }
@@ -306,52 +312,20 @@ impl Cpu {
 #[inline(always)]
 pub(crate) fn raw_core() -> usize {
     // This method must never return UNUSED_THREAD_ID_VALUE
-    cfg_if::cfg_if! {
-        if #[cfg(all(multi_core, riscv))] {
+    cfg_select! {
+        all(multi_core, riscv) => {
             riscv::register::mhartid::read()
-        } else if #[cfg(all(multi_core, xtensa))] {
+        }
+        all(multi_core, xtensa) => {
             (xtensa_lx::get_processor_id() & 0x2000) as usize
-        } else {
+        }
+        _ => {
             0
         }
     }
 }
 
 use crate::rtc_cntl::SocResetReason;
-
-/// Source of the wakeup event
-#[derive(Debug, Copy, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[instability::unstable]
-pub enum SleepSource {
-    /// In case of deep sleep, reset was not caused by exit from deep sleep
-    Undefined = 0,
-    /// Not a wakeup cause, used to disable all wakeup sources with
-    /// esp_sleep_disable_wakeup_source
-    All,
-    /// Wakeup caused by external signal using RTC_IO
-    Ext0,
-    /// Wakeup caused by external signal using RTC_CNTL
-    Ext1,
-    /// Wakeup caused by timer
-    Timer,
-    /// Wakeup caused by touchpad
-    TouchPad,
-    /// Wakeup caused by ULP program
-    Ulp,
-    /// Wakeup caused by GPIO (light sleep only on ESP32, S2 and S3)
-    Gpio,
-    /// Wakeup caused by UART (light sleep only)
-    Uart,
-    /// Wakeup caused by WIFI (light sleep only)
-    Wifi,
-    /// Wakeup caused by COCPU int
-    Cocpu,
-    /// Wakeup caused by COCPU crash
-    CocpuTrapTrig,
-    /// Wakeup caused by BT (light sleep only)
-    BT,
-}
 
 #[procmacros::doc_replace]
 /// Performs a software reset on the chip.
@@ -366,6 +340,9 @@ pub enum SleepSource {
 /// ```
 #[inline]
 pub fn software_reset() -> ! {
+    let _uart0_sclk_guard = ensure_uart0_sclk_enabled();
+    #[cfg(any(esp32p4, esp32s31))]
+    crate::soc::cpu_control::pre_system_reset();
     crate::rom::software_reset()
 }
 
@@ -373,8 +350,66 @@ pub fn software_reset() -> ! {
 #[instability::unstable]
 #[inline]
 pub fn software_reset_cpu(cpu: Cpu) {
+    let _uart0_sclk_guard = ensure_uart0_sclk_enabled();
     crate::rom::software_reset_cpu(cpu as u32)
 }
+
+/// Guard for a temporary UART0 source-clock request.
+///
+/// Drops its request when dropped. If no request was needed, this is a no-op.
+#[must_use = "dropping the guard releases the UART0 source clock"]
+pub(crate) struct Uart0SclkGuard {
+    release: bool,
+}
+
+impl Drop for Uart0SclkGuard {
+    fn drop(&mut self) {
+        if self.release {
+            release_uart0_sclk();
+        }
+    }
+}
+
+/// Ensure UART0's source clock stays enabled for boot ROM compatibility.
+///
+/// On some chips, resetting or waking up while UART0's source clock is disabled
+/// can prevent the boot ROM from starting correctly. This only requests the
+/// clock when UART0 already has a function-clock configuration; otherwise the
+/// returned guard is a no-op.
+#[inline(always)]
+pub(crate) fn ensure_uart0_sclk_enabled() -> Uart0SclkGuard {
+    Uart0SclkGuard {
+        release: request_uart0_sclk(),
+    }
+}
+
+#[cfg(soc_has_clock_node_uart_function_clock)]
+fn request_uart0_sclk() -> bool {
+    crate::soc::clocks::ClockTree::with(|clocks| {
+        let uart = crate::soc::clocks::UartInstance::Uart0;
+        if uart.function_clock_config(clocks).is_some() {
+            uart.request_function_clock(clocks);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(not(soc_has_clock_node_uart_function_clock))]
+fn request_uart0_sclk() -> bool {
+    false
+}
+
+#[cfg(soc_has_clock_node_uart_function_clock)]
+fn release_uart0_sclk() {
+    crate::soc::clocks::ClockTree::with(|clocks| {
+        crate::soc::clocks::UartInstance::Uart0.release_function_clock(clocks);
+    });
+}
+
+#[cfg(not(soc_has_clock_node_uart_function_clock))]
+fn release_uart0_sclk() {}
 
 /// Retrieves the reason for the last reset as a SocResetReason enum value.
 /// Returns `None` if the reset reason cannot be determined.
@@ -384,9 +419,13 @@ pub fn reset_reason() -> Option<SocResetReason> {
     crate::rtc_cntl::reset_reason(Cpu::current())
 }
 
-/// Retrieves the cause of the last wakeup event as a SleepSource enum value.
+/// Retrieves the cause(s) of the last wakeup event.
+///
+/// Returns the [`WakeupReason`][crate::rtc_cntl::WakeupReason] describing the source(s) that ended
+/// the most recent sleep. The result is empty if the chip was not woken from sleep.
+#[cfg(sleep_driver_supported)]
 #[instability::unstable]
 #[inline]
-pub fn wakeup_cause() -> SleepSource {
+pub fn wakeup_cause() -> crate::rtc_cntl::WakeupReason {
     crate::rtc_cntl::wakeup_cause()
 }

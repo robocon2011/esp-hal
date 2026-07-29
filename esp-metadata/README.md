@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/esp-metadata?labelColor=1C2C2E&color=C96329&logo=Rust&style=flat-square)](https://crates.io/crates/esp-metadata)
 [![docs.rs](https://img.shields.io/docsrs/esp-metadata?labelColor=1C2C2E&color=C96329&logo=rust&style=flat-square)](https://docs.espressif.com/projects/rust/esp-metadata/latest/)
-![MSRV](https://img.shields.io/badge/MSRV-1.86.0-blue?labelColor=1C2C2E&style=flat-square)
+![MSRV](https://img.shields.io/badge/MSRV-1.95.0-blue?labelColor=1C2C2E&style=flat-square)
 ![Crates.io](https://img.shields.io/crates/l/esp-metadata?labelColor=1C2C2E&style=flat-square)
 [![Matrix](https://img.shields.io/matrix/esp-rs:matrix.org?label=join%20matrix&labelColor=1C2C2E&color=BEC5C9&logo=matrix&style=flat-square)](https://matrix.to/#/#esp-rs:matrix.org)
 
@@ -11,6 +11,21 @@ Metadata for Espressif devices, intended for use in [build scripts].
 Firmware crates are meant to depend on `esp-metadata-generated`, not on this crate directly. To update `esp-metadata-generated`, make your changes in `esp-metadata`, then run `cargo xtask update-metadata`.
 
 [build scripts]: https://doc.rust-lang.org/cargo/reference/build-scripts.html
+
+## Device metadata files
+
+Per-chip metadata lives under `devices/`. Each chip has an entry file at
+`devices/<chip>.toml` that may include fragments from `devices/<chip>/` using:
+
+```toml
+# {include <chip>/fragment.toml}
+```
+
+Includes are expanded as raw text before parsing. Paths are relative to the
+including file's directory, must use forward slashes, and must not contain `..`.
+The marker must appear alone on a line (leading whitespace is allowed). Included
+files may contain further includes; cycles are rejected with the full include
+chain in the error message.
 
 ## [Documentation](https://docs.espressif.com/projects/rust/esp-metadata/latest/)
 

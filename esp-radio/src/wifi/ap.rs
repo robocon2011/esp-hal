@@ -3,10 +3,11 @@
 use alloc::string::String;
 use core::fmt;
 
-use enumset::EnumSet;
 use procmacros::BuilderLite;
 
-use super::{AuthenticationMethod, CountryInfo, Protocol, SecondaryChannel};
+#[cfg(feature = "unstable")]
+use super::CountryInfo;
+use super::{AuthenticationMethod, DisconnectReason, Protocols, SecondaryChannel, Ssid};
 use crate::{WifiError, sys::include::wifi_ap_record_t};
 
 /// Information about a detected Wi-Fi access point.
@@ -15,9 +16,7 @@ use crate::{WifiError, sys::include::wifi_ap_record_t};
 #[non_exhaustive]
 pub struct AccessPointInfo {
     /// The SSID of the access point.
-    // TODO: we can use the `alloc` feature once we have `defmt` 1.0.2
-    #[cfg_attr(feature = "defmt", defmt(Debug2Format))]
-    pub ssid: String,
+    pub ssid: Ssid,
     /// The BSSID (MAC address) of the access point.
     pub bssid: [u8; 6],
     /// The channel the access point is operating on.
@@ -28,6 +27,8 @@ pub struct AccessPointInfo {
     pub signal_strength: i8,
     /// The authentication method used by the access point.
     pub auth_method: Option<AuthenticationMethod>,
+    #[cfg(feature = "unstable")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
     /// The country information of the access point (if available from beacon frames).
     pub country: Option<CountryInfo>,
 }
@@ -36,8 +37,8 @@ pub struct AccessPointInfo {
 #[derive(Clone, PartialEq, Eq, BuilderLite, Hash)]
 pub struct AccessPointConfig {
     /// The SSID of the access point.
-    #[builder_lite(reference)]
-    pub(crate) ssid: String,
+    #[builder_lite(skip_setter)]
+    pub(crate) ssid: Ssid,
     /// Whether the SSID is hidden or visible.
     pub(crate) ssid_hidden: bool,
     /// The channel the access point will operate on.
@@ -45,15 +46,20 @@ pub struct AccessPointConfig {
     /// The secondary channel configuration.
     pub(crate) secondary_channel: Option<SecondaryChannel>,
     /// The set of protocols supported by the access point.
-    pub(crate) protocols: EnumSet<Protocol>,
+    pub(crate) protocols: Protocols,
     /// The authentication method to be used by the access point.
     pub(crate) auth_method: AuthenticationMethod,
     /// The password for securing the access point (if applicable).
     #[builder_lite(reference)]
     pub(crate) password: String,
     /// The maximum number of connections allowed on the access point.
+    /// When set, this number can be clipped to a true upper limit because
+    /// ESPNow and access point connections share a common pool of hardware
+    /// encryption keys.
+    #[builder_lite(unstable)]
     pub(crate) max_connections: u16,
     /// Dtim period of the access point (Range: 1 ~ 10).
+    #[builder_lite(unstable)]
     pub(crate) dtim_period: u8,
     /// Time to force deauth the station if the Soft-AccessPoint doesn't receive any data.
     #[builder_lite(unstable)]
@@ -61,12 +67,18 @@ pub struct AccessPointConfig {
 }
 
 impl AccessPointConfig {
+    /// Set the SSID of the access point.
+    pub fn with_ssid(mut self, ssid: impl Into<Ssid>) -> Self {
+        self.ssid = ssid.into();
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), WifiError> {
         if self.ssid.len() > 32 {
             return Err(WifiError::InvalidArguments);
         }
 
-        if self.password.len() > 64 {
+        if self.password.len() >= 64 {
             return Err(WifiError::InvalidArguments);
         }
 
@@ -81,11 +93,11 @@ impl AccessPointConfig {
 impl Default for AccessPointConfig {
     fn default() -> Self {
         Self {
-            ssid: String::from("iot-device"),
+            ssid: "iot-device".into(),
             ssid_hidden: false,
             channel: 1,
             secondary_channel: None,
-            protocols: (Protocol::P802D11B | Protocol::P802D11BG | Protocol::P802D11BGN),
+            protocols: Protocols::default(),
             auth_method: AuthenticationMethod::None,
             password: String::new(),
             max_connections: 255,
@@ -142,6 +154,44 @@ impl defmt::Format for AccessPointConfig {
     }
 }
 
+/// Information about a station connected to the access point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct ConnectedInfo {
+    /// The MAC address.
+    pub mac: [u8; 6],
+    /// The Association ID (AID) of the connected station.
+    pub aid: u16,
+    /// If this is a mesh child.
+    pub is_mesh_child: bool,
+}
+
+/// Information about a station disconnected from the access point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct DisconnectedInfo {
+    /// The MAC address.
+    pub mac: [u8; 6],
+    /// The Association ID (AID) of the connected station.
+    pub aid: u16,
+    /// If this is a mesh child.
+    pub is_mesh_child: bool,
+    /// The disconnect reason.
+    pub reason: DisconnectReason,
+}
+
+/// Either the [ConnectedInfo] or [DisconnectedInfo].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EventInfo {
+    /// Information about a station connected to the access point.
+    Connected(ConnectedInfo),
+    /// Information about a station disconnected from the access point.
+    Disconnected(DisconnectedInfo),
+}
+
 #[allow(non_upper_case_globals)]
 pub(crate) fn convert_ap_info(record: &wifi_ap_record_t) -> AccessPointInfo {
     let str_len = record
@@ -149,7 +199,7 @@ pub(crate) fn convert_ap_info(record: &wifi_ap_record_t) -> AccessPointInfo {
         .iter()
         .position(|&c| c == 0)
         .unwrap_or(record.ssid.len());
-    let ssid = alloc::string::String::from_utf8_lossy(&record.ssid[..str_len]).into_owned();
+    let ssid = Ssid::from(&record.ssid[..str_len]);
 
     AccessPointInfo {
         ssid,
@@ -158,6 +208,7 @@ pub(crate) fn convert_ap_info(record: &wifi_ap_record_t) -> AccessPointInfo {
         secondary_channel: SecondaryChannel::from_raw(record.second),
         signal_strength: record.rssi,
         auth_method: Some(AuthenticationMethod::from_raw(record.authmode)),
+        #[cfg(feature = "unstable")]
         country: CountryInfo::try_from_c(&record.country),
     }
 }

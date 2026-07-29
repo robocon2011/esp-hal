@@ -762,12 +762,7 @@ where
         for core in Cpu::other() {
             crate::interrupt::disable(core, self.twai.interrupt());
         }
-        unsafe { crate::interrupt::bind_interrupt(self.twai.interrupt(), handler.handler()) };
-
-        unwrap!(crate::interrupt::enable(
-            self.twai.interrupt(),
-            handler.priority()
-        ));
+        crate::interrupt::bind_handler(self.twai.interrupt(), handler);
     }
 
     /// Set the bitrate of the bus.
@@ -778,8 +773,7 @@ where
         // Included timings are all for 80MHz so assert that we are running at 80MHz.
         #[cfg(not(any(esp32h2, esp32c6)))]
         {
-            let apb_clock = crate::clock::Clocks::get().apb_clock;
-            assert!(apb_clock.as_mhz() == 80);
+            assert!(crate::soc::clocks::apb_clk_frequency() == 80_000_000);
         }
 
         // Unpack the baud rate timings and convert them to the values needed for the
@@ -1503,20 +1497,22 @@ impl PrivateInstance for crate::peripherals::TWAI0<'_> {
     }
 
     fn input_signal(&self) -> InputSignal {
-        cfg_if::cfg_if! {
-            if #[cfg(any(esp32, esp32c3, esp32s2, esp32s3))] {
+        cfg_select! {
+            any(esp32, esp32c3, esp32s2, esp32s3) => {
                 InputSignal::TWAI_RX
-            } else {
+            }
+            _ => {
                 InputSignal::TWAI0_RX
             }
         }
     }
 
     fn output_signal(&self) -> OutputSignal {
-        cfg_if::cfg_if! {
-            if #[cfg(any(esp32, esp32c3, esp32s2, esp32s3))] {
+        cfg_select! {
+            any(esp32, esp32c3, esp32s2, esp32s3) => {
                 OutputSignal::TWAI_TX
-            } else {
+            }
+            _ => {
                 OutputSignal::TWAI0_TX
             }
         }
@@ -1627,18 +1623,16 @@ impl Instance for AnyTwai<'_> {}
 mod asynch {
     use core::{future::poll_fn, task::Poll};
 
-    use embassy_sync::{
-        blocking_mutex::raw::CriticalSectionRawMutex,
-        channel::Channel,
-        waitqueue::AtomicWaker,
-    };
+    use embassy_sync::{channel::Channel, waitqueue::AtomicWaker};
+    use esp_sync::RawMutex;
 
     use super::*;
+    use crate::rtc_cntl::WakeLock;
 
     pub struct TwaiAsyncState {
         pub tx_waker: AtomicWaker,
         pub err_waker: AtomicWaker,
-        pub rx_queue: Channel<CriticalSectionRawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
+        pub rx_queue: Channel<RawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
     }
 
     impl Default for TwaiAsyncState {
@@ -1679,6 +1673,7 @@ mod asynch {
         twai: AnyTwai<'d>,
         frame: &'f EspTwaiFrame,
         in_flight: bool,
+        _wake_lock: WakeLock,
     }
 
     impl<'d, 'f> TransmitFuture<'d, 'f> {
@@ -1687,6 +1682,7 @@ mod asynch {
                 twai,
                 frame,
                 in_flight: false,
+                _wake_lock: WakeLock::new(),
             }
         }
     }
@@ -1699,6 +1695,7 @@ mod asynch {
             cx: &mut core::task::Context<'_>,
         ) -> Poll<Self::Output> {
             self.twai.async_state().tx_waker.register(cx.waker());
+            self.twai.listen(EnumSet::all());
 
             let regs = self.twai.register_block();
             let status = regs.status().read();
@@ -1741,7 +1738,6 @@ mod asynch {
         /// the case that even though the future is dropped, the frame was sent
         /// anyways.
         pub async fn transmit_async(&mut self, frame: &EspTwaiFrame) -> Result<(), EspTwaiError> {
-            self.twai.listen(EnumSet::all());
             TransmitFuture::new(self.twai.reborrow(), frame).await
         }
     }
@@ -1749,9 +1745,9 @@ mod asynch {
     impl TwaiRx<'_, Async> {
         /// Receives an `EspTwaiFrame` asynchronously over the TWAI bus.
         pub async fn receive_async(&mut self) -> Result<EspTwaiFrame, EspTwaiError> {
-            self.twai.listen(EnumSet::all());
             poll_fn(|cx| {
                 self.twai.async_state().err_waker.register(cx.waker());
+                self.twai.listen(EnumSet::all());
 
                 if let Poll::Ready(result) = self.twai.async_state().rx_queue.poll_receive(cx) {
                     return Poll::Ready(result);

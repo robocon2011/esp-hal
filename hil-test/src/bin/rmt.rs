@@ -5,7 +5,7 @@
 //! timing-sensitive tests! This doesn't apply to `check_data_eq` since it is used after the
 //! action, but adding any additional logging to the driver is likely to cause sporadic issues.
 
-//% CHIPS: esp32 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: rmt_driver_supported
 //% FEATURES: embassy esp-alloc unstable
 
 #![no_std]
@@ -58,11 +58,12 @@ use esp_hal::{
 use hil_test::{assert, assert_eq};
 
 // RMT channel clock = 500kHz
-cfg_if::cfg_if! {
-    if #[cfg(esp32h2)] {
+cfg_select! {
+    esp32h2 => {
         const FREQ: Rate = Rate::from_mhz(32);
         const DIV: u8 = 64;
-    } else {
+    }
+    _ => {
         const FREQ: Rate = Rate::from_mhz(80);
         const DIV: u8 = 160;
     }
@@ -354,7 +355,7 @@ fn do_rmt_loopback_inner(
         core::mem::drop(rx_transaction);
         core::mem::drop(tx_transaction);
 
-        // The test should fail here when the the delay above is increased, e.g. to 100ms.
+        // The test should fail here when the delay above is increased, e.g. to 100ms.
         assert!(!rx_done);
         assert!(!tx_done);
     } else {
@@ -414,7 +415,7 @@ async fn do_rmt_loopback_async_inner(
         let rx_poll = poll_once(rx_fut);
         let tx_poll = poll_once(tx_fut);
 
-        // The test should fail here when the the delay above is increased, e.g. to 100ms.
+        // The test should fail here when the delay above is increased, e.g. to 100ms.
         assert!(rx_poll.is_pending());
         assert!(tx_poll.is_pending());
     } else {
@@ -440,25 +441,27 @@ macro_rules! pins {
     };
 }
 
-cfg_if::cfg_if!(
-    if #[cfg(any(esp32, esp32s3))] {
+cfg_select! {
+    any(esp32, esp32s3) => {
         macro_rules! rx_channel_creator {
             ($rmt:expr) => {
                 $rmt.channel4
             };
         }
-    } else {
+    }
+    _ => {
         macro_rules! rx_channel_creator {
             ($rmt:expr) => {
                 $rmt.channel2
             };
         }
     }
-);
+}
 
 struct Context {
     rmt: RMT<'static>,
     pin: AnyPin<'static>,
+    pin2: AnyPin<'static>,
 }
 
 impl Context {
@@ -521,12 +524,45 @@ mod tests {
 
         esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
 
-        let pin = AnyPin::from(hil_test::common_test_pins!(peripherals).1);
+        let pins = hil_test::common_test_pins!(peripherals);
+        let (pin, pin2) = (AnyPin::from(pins.1), AnyPin::from(pins.0));
 
         Context {
             rmt: peripherals.RMT,
             pin,
+            pin2,
         }
+    }
+
+    #[test]
+    fn rmt_frequency_accessor_reports_configured_rate(mut ctx: Context) {
+        let rmt = Rmt::new(ctx.rmt.reborrow(), FREQ).unwrap();
+        assert_eq!(rmt.frequency(), FREQ);
+
+        #[cfg(soc_has_clock_node_rmt_sclk)]
+        assert_eq!(
+            esp_hal::clock::ll::RmtInstance::Rmt.sclk_frequency(),
+            FREQ.as_hz()
+        );
+    }
+
+    #[test]
+    #[cfg(esp32c6)]
+    fn rmt_frequency_is_not_apb_on_default_esp32c6(mut ctx: Context) {
+        // Reproducer for #5532: with the default ESP32-C6 clock configuration, APB runs at
+        // 40 MHz, while the RMT driver configures the RMT counter clock to 80 MHz. Code that
+        // derives pulse lengths from APB will therefore generate pulses that are too short.
+        let rmt = Rmt::new(ctx.rmt.reborrow(), FREQ).unwrap();
+
+        let apb_frequency = Rate::from_hz(esp_hal::clock::ll::apb_clk_frequency());
+
+        assert_eq!(apb_frequency.as_hz(), 40_000_000);
+        assert_eq!(rmt.frequency().as_hz(), 80_000_000);
+
+        let ticks_for_400ns =
+            |frequency: Rate| ((400_u64 * u64::from(frequency.as_hz())) / 1_000_000_000) as u16;
+        assert_eq!(ticks_for_400ns(apb_frequency), 16);
+        assert_eq!(ticks_for_400ns(rmt.frequency()), 32);
     }
 
     #[test]
@@ -1195,5 +1231,59 @@ mod tests {
             start.elapsed().as_micros() < 1000,
             "tx with loopcount 0 did not complete immediately"
         );
+    }
+
+    // Regression test for esp-rs/esp-hal#4697
+    //
+    // This tests ESP32-specific (mis-)behavior
+    #[cfg(esp32)]
+    #[test]
+    async fn rmt_check_regression_4697(mut ctx: Context) {
+        let rmt = Rmt::new(ctx.rmt.reborrow(), FREQ).unwrap().into_async();
+
+        let (rx, tx) = (ctx.pin, ctx.pin2);
+
+        let mut rx_channel = rx_channel_creator!(rmt)
+            .configure_rx(
+                &RxChannelConfig::default()
+                    .with_clk_divider(255)
+                    .with_idle_threshold(10000),
+            )
+            .unwrap()
+            .with_pin(rx);
+
+        let mut spi = esp_hal::spi::master::Spi::new(
+            unsafe { esp_hal::peripherals::SPI2::steal() },
+            Default::default(),
+        )
+        .unwrap()
+        .with_sck(tx)
+        .into_async();
+
+        let mut buf = [0u8; 1000];
+
+        // This code is to drive the hardware into the state that caused the
+        // originally failed assertion.
+        //
+        // We are "spamming" RMT with pulses by feeding it the SPI SCK.
+        //
+        // While not really explainable from any documentation, this turned out to drive the
+        // hardware into an unexpected state.
+        //
+        // With the previous assert in place, interestingly the first two receive calls failed as
+        // expected but then we ran into the issue where the assert failed instead of seeing
+        // the error bit set.
+        embassy_futures::join::join(
+            async {
+                let mut data = [PulseCode::default(); 10];
+                for _ in 0..3 {
+                    assert!(rx_channel.receive(&mut data).await.is_err());
+                }
+            },
+            async {
+                spi.transfer_in_place_async(&mut buf).await.unwrap();
+            },
+        )
+        .await;
     }
 }

@@ -1,5 +1,9 @@
 crate: esp-hal
 
+# When adding an option whose non-default value changes the compiled code, set it via `env` in the
+# non-default `check-configs` entry in `Cargo.toml` of an appropriate crate (e.g.
+# `ESP_HAL_CONFIG_<NAME> = "false"`) so CI can check if the crate builds with non-default configurations.
+
 options:
   - name: place-spi-master-driver-in-ram
     description: Places the SPI master driver in RAM for better performance
@@ -33,25 +37,7 @@ options:
       data buffer is empty."
     default:
       - value: true
-    active: 'chip == "esp32"'
-
-  - name: psram-mode
-    description: SPIRAM chip mode
-    default:
-      - value: '"quad"'
-    constraints:
-      - if: 'feature("octal_psram")'
-        type:
-          validator: enumeration
-          value:
-            - "quad"
-            - "octal"
-      - if: '!feature("octal_psram")'
-        type:
-          validator: enumeration
-          value:
-            - "quad"
-    active: 'feature("psram")'
+    active: "esp32"
 
   - name: stack-guard-offset
     description: The stack guard variable will be placed this many bytes from the stack's end. Needs to be a multiple of 4.
@@ -66,6 +52,11 @@ options:
       - value: 3740121773
     display_hint: Hex
 
+  - name: init-stack-ptr-range-check
+    description: Check that the stack pointer is in range during initialization.
+    default:
+      - value: true
+
   - name: stack-guard-monitoring
     description: Use a data watchpoint to check if the stack guard was overwritten.
     default:
@@ -75,7 +66,7 @@ options:
     description: Use a data watchpoint to check that the vector table was not unintentionally overwritten.
     default:
       - value: false
-    active: 'chip == "esp32c2" || chip == "esp32c3" || chip == "esp32c6" || chip == "esp32h2"'
+    active: "esp32c2 || esp32c3 || esp32c6 || esp32h2"
 
   - name: stack-guard-monitoring-with-debugger-connected
     description: Enable the stack guard also with a debugger connected. Also applies to `write-vec-table-monitoring`.
@@ -92,14 +83,22 @@ options:
   - name: instruction-cache-size
     description: Instruction cache size to be set on application startup.
     default:
+      - value: '"8KB"'
+        if: "esp32s2"
       - value: '"32KB"'
     constraints:
+      - if: "esp32s2"
+        type:
+          validator: enumeration
+          value:
+            - "8KB"
+            - "16KB"
       - type:
           validator: enumeration
           value:
             - "16KB"
             - "32KB"
-    active: 'chip == "esp32s3"'
+    active: "esp32s2 || esp32s3"
 
   - name: instruction-cache-line-size
     description: Instruction cache line size to be set on application startup.
@@ -111,7 +110,7 @@ options:
           value:
             - "16B"
             - "32B"
-    active: 'chip == "esp32s3"'
+    active: "esp32s2 || esp32s3"
 
   - name: icache-associated-ways
     description: Instruction cache associated ways to be set on application startup.
@@ -123,33 +122,47 @@ options:
           value:
             - "4"
             - "8"
-    active: 'chip == "esp32s3"'
+    active: "esp32s3"
 
   - name: data-cache-size
     description: Data cache size to be set on application startup.
     default:
-      - value: '"32KB"'
+      - value: '"8KB"'
+        if: "esp32s2"
+      - value: '"64KB"'
     constraints:
+      - if: "esp32s2"
+        type:
+          validator: enumeration
+          value:
+            - "0KB"
+            - "8KB"
+            - "16KB"
       - type:
           validator: enumeration
           value:
-            - "16KB"
             - "32KB"
             - "64KB"
-    active: 'chip == "esp32s3"'
+    active: "esp32s2 || esp32s3"
 
   - name: data-cache-line-size
     description: Data cache line size to be set on application startup.
     default:
       - value: '"32B"'
     constraints:
+      - if: "esp32s2"
+        type:
+          validator: enumeration
+          value:
+            - "16B"
+            - "32B"
       - type:
           validator: enumeration
           value:
             - "16B"
             - "32B"
             - "64B"
-    active: 'chip == "esp32s3"'
+    active: "esp32s2 || esp32s3"
 
   - name: dcache-associated-ways
     description: Data cache associated ways to be set on application startup.
@@ -161,7 +174,57 @@ options:
           value:
             - "4"
             - "8"
-    active: 'chip == "esp32s3"'
+    active: "esp32s3"
+
+  - name: l2-cache-size
+    description: "ESP32-P4 L2 cache size. Must match the 2nd-stage bootloader's
+      `CACHE.L2_CACHE_CACHESIZE_CONF` setting (TRM L2MEM Config 0..3). Default
+      `256KB` matches the IDF bootloader bundled by espflash."
+    default:
+      - value: '"256KB"'
+    constraints:
+      - type:
+          validator: enumeration
+          value:
+            - "0KB"
+            - "128KB"
+            - "256KB"
+            - "512KB"
+    active: "esp32p4"
+
+  - name: min-chip-revision
+    description: "The minimum chip revision required for the application to run, in format: major * 100 + minor."
+    default:
+      - value: 300
+        if: "esp32"
+      - value: 0
+
+  - name: use_rwdata_ld_hook
+    description: Include 'rwdata_hook.x'
+    default:
+      - value: false
+
+  - name: use_rwtext_ld_hook
+    description: Include 'rwtext_hook.x'
+    default:
+      - value: false
+
+  - name: clear-crypto-secrets
+    description: "Clear secret material (keys, exponents, intermediate results) from
+      the crypto accelerator registers after each operation. Disabling
+      this leaves secret material in the peripheral until a subsequent operation
+      overwrites it."
+    default:
+      - value: true
+
+  - name: enable-pmp
+    description: "Protects additional memory regions via Physical Memory Protection (PMP). (Only RISC-V other than ESP32-C2/C3)"
+    default:
+      # TODO - investigate why it's not working correctly
+      - value: false
+        if: "esp32s31"
+      - value: true
+    active: "riscv && !esp32c2 && !esp32c3"
 
 checks:
   - "ESP_HAL_CONFIG_STACK_GUARD_OFFSET % 4 == 0"

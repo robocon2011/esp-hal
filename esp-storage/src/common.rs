@@ -1,15 +1,15 @@
 use core::mem::MaybeUninit;
 
-#[cfg(multi_core)]
-use esp_hal::peripherals::CPU_CTRL;
 #[cfg(not(feature = "emulation"))]
 pub use esp_hal::peripherals::FLASH as Flash;
+
 #[cfg(multi_core)]
-use esp_hal::system::Cpu;
-#[cfg(multi_core)]
-use esp_hal::system::CpuControl;
-#[cfg(multi_core)]
-use esp_hal::system::is_running;
+esp_hal::if_unstable_hal! {
+    use esp_hal::peripherals::CPU_CTRL;
+    use esp_hal::system::Cpu;
+    use esp_hal::system::CpuControl;
+    use esp_hal::system::is_running;
+}
 
 use crate::chip_specific;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +27,8 @@ pub enum FlashStorageError {
     NotAligned,
     /// Address or length out of bounds.
     OutOfBounds,
+    /// Operation not supported (e.g. no free MMU entry).
+    NotSupported,
     /// Cannot write to flash as more than one core is running.
     /// Either manually suspend the other core, or use one of the available strategies:
     /// * [`FlashStorage::multicore_auto_park`]
@@ -69,7 +71,6 @@ impl<'d> Flash<'d> {
 pub struct FlashStorage<'d> {
     pub(crate) capacity: usize,
     unlocked: bool,
-    #[cfg(multi_core)]
     pub(crate) multi_core_strategy: MultiCoreStrategy,
     _flash: Flash<'d>,
 }
@@ -79,6 +80,8 @@ impl<'d> FlashStorage<'d> {
     pub const WORD_SIZE: u32 = 4;
     /// Flash sector size in bytes.
     pub const SECTOR_SIZE: u32 = 4096;
+    /// Flash block size in bytes.
+    pub const BLOCK_SIZE: u32 = 65536;
 
     /// Create a new flash storage instance.
     ///
@@ -86,35 +89,15 @@ impl<'d> FlashStorage<'d> {
     ///
     /// Panics if called more than once.
     pub fn new(flash: Flash<'d>) -> Self {
-        #[cfg(not(any(feature = "esp32", feature = "esp32s2")))]
-        const ADDR: u32 = 0x0000;
-        #[cfg(any(feature = "esp32", feature = "esp32s2"))]
-        const ADDR: u32 = 0x1000;
-
-        let mut storage = Self {
-            capacity: 0,
+        Self {
+            capacity: chip_specific::get_flash_size() as usize,
             unlocked: false,
-            #[cfg(multi_core)]
-            multi_core_strategy: MultiCoreStrategy::Error,
+            multi_core_strategy: cfg_select!(
+                multi_core => MultiCoreStrategy::Error,
+                _ => MultiCoreStrategy::Ignore
+            ),
             _flash: flash,
-        };
-
-        let mut buffer = crate::buffer::FlashWordBuffer::uninit();
-        storage.internal_read(ADDR, buffer.as_bytes_mut()).unwrap();
-
-        let buffer = unsafe { buffer.assume_init_bytes() };
-        let mb = match buffer[3] & 0xf0 {
-            0x00 => 1,
-            0x10 => 2,
-            0x20 => 4,
-            0x30 => 8,
-            0x40 => 16,
-            0x50 => 32,
-            _ => 0,
-        };
-        storage.capacity = mb * 1024 * 1024;
-
-        storage
+        }
     }
 
     #[inline(always)]
@@ -124,7 +107,7 @@ impl<'d> FlashStorage<'d> {
         length: usize,
     ) -> Result<(), FlashStorageError> {
         let offset = offset as usize;
-        if offset % ALIGN as usize != 0 || length % ALIGN as usize != 0 {
+        if !offset.is_multiple_of(ALIGN as usize) || !length.is_multiple_of(ALIGN as usize) {
             return Err(FlashStorageError::NotAligned);
         }
         Ok(())
@@ -162,17 +145,18 @@ impl<'d> FlashStorage<'d> {
         Ok(())
     }
 
-    pub(crate) fn internal_erase(&mut self, sector: u32) -> Result<(), FlashStorageError> {
-        #[cfg(multi_core)]
-        let unpark = self.multi_core_strategy.pre_write()?;
+    pub(crate) fn internal_erase_sector(&mut self, sector: u32) -> Result<(), FlashStorageError> {
+        self.multi_core_strategy.with(|| {
+            self.unlock_once()?;
+            check_rc(chip_specific::spiflash_erase_sector(sector))
+        })
+    }
 
-        self.unlock_once()?;
-        check_rc(chip_specific::spiflash_erase_sector(sector))?;
-
-        #[cfg(multi_core)]
-        self.multi_core_strategy.post_write(unpark);
-
-        Ok(())
+    pub(crate) fn internal_erase_block(&mut self, block: u32) -> Result<(), FlashStorageError> {
+        self.multi_core_strategy.with(|| {
+            self.unlock_once()?;
+            check_rc(chip_specific::spiflash_erase_block(block))
+        })
     }
 
     pub(crate) fn internal_write(
@@ -180,20 +164,40 @@ impl<'d> FlashStorage<'d> {
         offset: u32,
         bytes: &[u8],
     ) -> Result<(), FlashStorageError> {
-        #[cfg(multi_core)]
-        let unpark = self.multi_core_strategy.pre_write()?;
+        self.multi_core_strategy.with(|| {
+            self.unlock_once()?;
+            check_rc(chip_specific::spiflash_write(
+                offset,
+                bytes.as_ptr() as *const u32,
+                bytes.len() as u32,
+            ))
+        })
+    }
 
-        self.unlock_once()?;
-        check_rc(chip_specific::spiflash_write(
-            offset,
-            bytes.as_ptr() as *const u32,
-            bytes.len() as u32,
-        ))?;
+    pub(crate) fn internal_read_encrypted(
+        &mut self,
+        offset: u32,
+        bytes: &mut [MaybeUninit<u8>],
+    ) -> Result<(), FlashStorageError> {
+        // SAFETY: `read_flash_encrypted` fully initializes every byte in `bytes`.
+        let initialized = unsafe {
+            core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len())
+        };
+        chip_specific::read_flash_encrypted(offset, initialized)
+    }
 
-        #[cfg(multi_core)]
-        self.multi_core_strategy.post_write(unpark);
-
-        Ok(())
+    pub(crate) fn internal_write_encrypted(
+        &mut self,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), FlashStorageError> {
+        self.multi_core_strategy.with(|| {
+            check_rc(chip_specific::spiflash_write_encrypted(
+                offset,
+                bytes.as_ptr() as *mut u32,
+                bytes.len() as u32,
+            ))
+        })
     }
 }
 
@@ -201,13 +205,16 @@ impl<'d> FlashStorage<'d> {
 /// one core.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[cfg(multi_core)]
 pub(crate) enum MultiCoreStrategy {
     /// Flash writes simply fail if the second core is active while attempting a write (default
     /// behavior).
+    #[cfg(multi_core)]
     Error,
+
     /// Auto park the other core before writing. Un-park it when writing is complete.
+    #[cfg(multi_core)]
     AutoPark,
+
     /// Ignore that the other core is active.
     /// This is useful if the second core is known to not fetch instructions from the flash for the
     /// duration of the write. This is unsafe to use.
@@ -234,7 +241,6 @@ impl<'d> FlashStorage<'d> {
     }
 }
 
-#[cfg(multi_core)]
 impl MultiCoreStrategy {
     /// Perform checks/Prepare for a flash write according to the current strategy.
     ///
@@ -242,25 +248,33 @@ impl MultiCoreStrategy {
     /// * `True` if the other core needs to be un-parked by post_write
     /// * `False` otherwise
     pub(crate) fn pre_write(&self) -> Result<bool, FlashStorageError> {
-        let mut cpu_ctrl = CpuControl::new(unsafe { CPU_CTRL::steal() });
         match self {
+            #[cfg(multi_core)]
             MultiCoreStrategy::Error => {
-                for other_cpu in Cpu::other() {
-                    if is_running(other_cpu) {
-                        return Err(FlashStorageError::OtherCoreRunning);
+                esp_hal::if_unstable_hal! {
+                    for other_cpu in Cpu::other() {
+                        if is_running(other_cpu) {
+                            return Err(FlashStorageError::OtherCoreRunning);
+                        }
                     }
                 }
                 Ok(false)
             }
+
+            #[cfg(multi_core)]
             MultiCoreStrategy::AutoPark => {
-                for other_cpu in Cpu::other() {
-                    if is_running(other_cpu) {
-                        unsafe { cpu_ctrl.park_core(other_cpu) };
-                        return Ok(true);
+                esp_hal::if_unstable_hal! {
+                    let mut cpu_ctrl = CpuControl::new(unsafe { CPU_CTRL::steal() });
+                    for other_cpu in Cpu::other() {
+                        if is_running(other_cpu) {
+                            unsafe { cpu_ctrl.park_core(other_cpu) };
+                            return Ok(true);
+                        }
                     }
                 }
                 Ok(false)
             }
+
             MultiCoreStrategy::Ignore => Ok(false),
         }
     }
@@ -271,13 +285,39 @@ impl MultiCoreStrategy {
     /// * `True` if the other core needs to be un-parked by post_write
     /// * `False` otherwise
     pub(crate) fn post_write(&self, unpark: bool) {
-        let mut cpu_ctrl = CpuControl::new(unsafe { CPU_CTRL::steal() });
-        if let MultiCoreStrategy::AutoPark = self {
-            if unpark {
-                for other_cpu in Cpu::other() {
-                    cpu_ctrl.unpark_core(other_cpu);
+        cfg_select! {
+            multi_core => {
+                if let MultiCoreStrategy::AutoPark = self
+                    && unpark
+                {
+                    esp_hal::if_unstable_hal! {
+                        let mut cpu_ctrl = CpuControl::new(unsafe { CPU_CTRL::steal() });
+                        for other_cpu in Cpu::other() {
+                            cpu_ctrl.unpark_core(other_cpu);
+                        }
+                    }
                 }
             }
+            _ => {
+                let _ = unpark;
+            }
         }
+    }
+
+    /// Run a flash write operation, handling multi-core synchronization.
+    ///
+    /// # Returns
+    /// * `Ok` with the result of the operation
+    /// * `Err` if the operation fails
+    pub(crate) fn with<R>(
+        self,
+        f: impl FnOnce() -> Result<R, FlashStorageError>,
+    ) -> Result<R, FlashStorageError> {
+        let unpark = self.pre_write()?;
+
+        let result = f();
+
+        self.post_write(unpark);
+        result
     }
 }

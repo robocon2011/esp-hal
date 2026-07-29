@@ -3,12 +3,12 @@
 use alloc::string::String;
 use core::fmt;
 
-use enumset::EnumSet;
 use procmacros::BuilderLite;
 
+use super::ScanMethod;
 use crate::{
     WifiError,
-    wifi::{AuthenticationMethod, Protocol, scan::ScanMethod},
+    wifi::{AuthenticationMethod, Protocols, Ssid},
 };
 
 /// Configuration for EAP-FAST authentication protocol.
@@ -71,8 +71,8 @@ type CertificateAndKey = (&'static [u8], &'static [u8], Option<&'static [u8]>);
 #[instability::unstable]
 pub struct EapStationConfig {
     /// The SSID of the network the station is connecting to.
-    #[builder_lite(reference)]
-    pub(crate) ssid: String,
+    #[builder_lite(skip_setter)]
+    pub(crate) ssid: Ssid,
     /// The BSSID (MAC Address) of the specific access point.
     pub(crate) bssid: Option<[u8; 6]>,
     /// The authentication method used for EAP.
@@ -111,7 +111,7 @@ pub struct EapStationConfig {
     /// The specific Wi-Fi channel to use for the connection.
     pub(crate) channel: Option<u8>,
     /// The set of protocols supported by the access point.
-    pub(crate) protocols: EnumSet<Protocol>,
+    pub(crate) protocols: Protocols,
     /// Interval for station to listen to beacon from access point.
     ///
     /// The unit of listen interval is one beacon interval.
@@ -138,6 +138,13 @@ pub struct EapStationConfig {
 }
 
 impl EapStationConfig {
+    /// Set the SSID of the access point.
+    #[instability::unstable]
+    pub fn with_ssid(mut self, ssid: impl Into<Ssid>) -> Self {
+        self.ssid = ssid.into();
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), WifiError> {
         if self.ssid.len() > 32 {
             return Err(WifiError::InvalidArguments);
@@ -170,7 +177,7 @@ impl EapStationConfig {
 impl Default for EapStationConfig {
     fn default() -> Self {
         EapStationConfig {
-            ssid: String::new(),
+            ssid: Ssid::default(),
             bssid: None,
             auth_method: AuthenticationMethod::Wpa2Enterprise,
             identity: None,
@@ -184,7 +191,7 @@ impl Default for EapStationConfig {
             ca_cert: None,
             certificate_and_key: None,
             ttls_phase2_method: None,
-            protocols: (Protocol::P802D11B | Protocol::P802D11BG | Protocol::P802D11BGN),
+            protocols: Protocols::default(),
             listen_interval: 3,
             beacon_timeout: 6,
             failure_retry_cnt: 1,

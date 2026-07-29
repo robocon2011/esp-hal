@@ -4,7 +4,7 @@ This package contains a number of binary applications intended for manual/qualit
 
 Each device has its own unique set of peripherals, and as such not every test will run on every device. We recommend building and flashing the tests using the `xtask` method documented below, which will greatly simplify the process.
 
-To check if a device is compatible with a given test, check the metadata comments above the imports, which will list all supported devices following the `//% CHIPS:` designator. If this metadata is not present, then the test will work on any device supported by `esp-hal`.
+To check if a device is compatible with a given test, check the metadata comments above the imports, which describe the supported devices following the `//% CHIP_FILTER:` designator. The expression can use boolean cfg symbols, key-value cfg comparisons (e.g. `interrupt_controller != "clic"`), and chip names — see [`xtask/README.md`](../xtask/README.md) for details. If this metadata is not present, then the test will work on any device supported by `esp-hal`.
 
 As previously stated, we use the [cargo-xtask] pattern for automation. Commands invoking this tool must be run from the root of the repository.
 
@@ -12,7 +12,7 @@ As previously stated, we use the [cargo-xtask] pattern for automation. Commands 
 
 ## Running Tests
 
-You can build and then subsequently flash and run an test using the `run example` subcommand. With a target device connected to your host system, run:
+You can build and then subsequently flash and run a test using the `run example` subcommand. With a target device connected to your host system, run:
 
 ```shell
 cargo xtask run example --package qa-test --chip esp32c6 sleep_timer
@@ -22,18 +22,18 @@ Again, note that we must specify which package to build the test from, plus whic
 
 ## Adding Tests
 
-If you are contributing to `esp-hal` and would like to add an test, the process is generally the same as any other project.
+If you are contributing to `esp-hal` and would like to add a test, the process is generally the same as any other project.
 
-One major difference in our case is the metadata comments which state the compatible devices and required features for an test. Both of these designators are optional; if `//% CHIPS:` is omitted then all devices considered to be supported, and if `//% FEATURES:` is omitted then no features are enabled at build time.
+One major difference in our case is the metadata comments which state the compatible devices and required features for a test. Both of these designators are optional; if `//% CHIP_FILTER:` is omitted then all devices are considered to be supported, and if `//% FEATURES:` is omitted then no features are enabled at build time.
 
-To demonstrated, in `src/bin/psram.rs` you will see the following:
+To demonstrate, in `src/bin/psram.rs` you will see the following:
 
 ```rust
-//% CHIPS: esp32 esp32s2 esp32s3
-//% FEATURES: esp-hal/psram esp-alloc/internal-heap-stats
+//% CHIP_FILTER: esp32 || esp32s2 || esp32s3
+//% FEATURES: esp-alloc/internal-heap-stats
 ```
 
-Another thing to be aware of is the GPIO pins being used. We have tried to use pins available the DevKit-C boards from Espressif, however this is being done on a best-effort basis.
+Another thing to be aware of is the GPIO pins being used. We have tried to use pins available on the DevKit-C boards from Espressif, however this is being done on a best-effort basis.
 
 In general, the following GPIO are recommended for use, though be conscious of whether certain pins are used for UART, strapping pins, etc. on some devices:
 

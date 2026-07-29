@@ -26,6 +26,7 @@ const IEEE802154_MULTIPAN_MAX: usize = 4;
 /// Frame pending mode
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
 pub enum PendingMode {
     /// Frame pending bit always set to 1 in the ack to Data Request
     #[default]
@@ -43,6 +44,7 @@ pub enum PendingMode {
 /// CCA mode
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
 pub enum CcaMode {
     /// Carrier only
     #[default]
@@ -101,7 +103,7 @@ pub(crate) fn ieee802154_pib_init() {
             coordinator: false,
             promiscuous: true,
             rx_when_idle: false,
-            txpower: 10,
+            txpower: 20,
             channel: 11,
             pending_mode: PendingMode::Disable,
             multipan_mask: 1 << IEEE802154_MULTIPAN_0,
@@ -212,22 +214,24 @@ fn ieee802154_set_multipan_hal(pib: &Pib) {
     }
 }
 
-// https://github.com/espressif/esp-idf/blob/release/v5.3/components/ieee802154/driver/esp_ieee802154_pib.c#L48
+// https://github.com/espressif/esp-idf/blob/v5.3/components/ieee802154/driver/esp_ieee802154_pib.c#L48
 fn ieee802154_txpower_convert(txpower: i8) -> u8 {
-    cfg_if::cfg_if! {
-        if #[cfg(feature="esp32h2")] {
-            // https://github.com/espressif/esp-idf/blob/release/v5.3/components/hal/esp32h2/include/hal/ieee802154_ll.h
+    cfg_select! {
+        esp32h2 => {
+            // https://github.com/espressif/esp-idf/blob/v5.3/components/hal/esp32h2/include/hal/ieee802154_ll.h
             const IEEE802154_TXPOWER_VALUE_MAX: i8 = 20;
             const IEEE802154_TXPOWER_VALUE_MIN: i8 = -24;
             const IEEE802154_TXPOWER_INDEX_MIN: i8 = 0;
-        } else if #[cfg(feature="esp32c6")]{
-            // https://github.com/espressif/esp-idf/blob/release/v5.3/components/hal/esp32c6/include/hal/ieee802154_ll.h
+        }
+        any(esp32c6, esp32c5) => {
+            // https://github.com/espressif/esp-idf/blob/v5.3/components/hal/esp32c6/include/hal/ieee802154_ll.h
             const IEEE802154_TXPOWER_VALUE_MAX: i8 = 20;
             const IEEE802154_TXPOWER_VALUE_MIN: i8 = -15;
             const IEEE802154_TXPOWER_INDEX_MIN: i8 = 3;
         }
+        _ => {}
     }
-    if txpower > IEEE802154_TXPOWER_VALUE_MAX {
+    if txpower >= IEEE802154_TXPOWER_VALUE_MAX {
         15
     } else if txpower <= IEEE802154_TXPOWER_VALUE_MIN {
         IEEE802154_TXPOWER_INDEX_MIN as u8

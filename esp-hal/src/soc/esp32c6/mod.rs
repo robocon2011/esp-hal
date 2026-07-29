@@ -7,29 +7,24 @@
 //!
 //! Also few constants are defined in this module for `ESP32-C6` chip:
 //!    * TIMG_DEFAULT_CLK_SRC: 1 - Timer clock source
-//!    * I2S_DEFAULT_CLK_SRC: 2 - I2S clock source
-//!    * I2S_SCLK: 160_000_000 - I2S clock frequency
 
 crate::unstable_module! {
     pub mod clocks;
     pub mod lp_core;
     pub mod trng;
 }
-pub mod gpio;
 pub(crate) mod regi2c;
 
 pub(crate) use esp32c6 as pac;
 
+#[cfg(i2s_driver_supported)]
 #[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) mod constants {
-    /// The clock frequency for the I2S peripheral in Hertz.
-    pub const I2S_SCLK: u32 = 160_000_000;
-    /// The default clock source for the I2S peripheral.
-    pub const I2S_DEFAULT_CLK_SRC: u8 = 2;
-
-    /// The clock frequency for the Parallel IO peripheral in Hertz.
-    pub const PARL_IO_SCLK: u32 = 240_000_000;
+pub(crate) fn i2s_sclk_frequency() -> u32 {
+    clocks::pll_f160m_frequency()
 }
+
+#[cfg(feature = "rt")]
+pub(crate) fn riscv_preinit() {}
 
 pub(crate) fn pre_init() {
     // By default, these access path filters are enable and allow the access to

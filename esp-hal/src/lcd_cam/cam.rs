@@ -56,7 +56,7 @@ use core::{
 
 use crate::{
     Blocking,
-    dma::{ChannelRx, DmaError, DmaPeripheral, DmaRxBuffer, PeripheralRxChannel, RxChannelFor},
+    dma::{ChannelRx, DmaError, DmaPeripheral, DmaRxBuffer},
     gpio::{
         InputConfig,
         InputSignal,
@@ -64,10 +64,10 @@ use crate::{
         OutputSignal,
         interconnect::{PeripheralInput, PeripheralOutput},
     },
-    lcd_cam::{BitOrder, ByteOrder, ClockError, calculate_clkm},
+    lcd_cam::{BitOrder, ByteOrder, CamDmaRxChannel, ClockError, ErasedRxChannel, calculate_clkm},
     pac,
     peripherals::LCD_CAM,
-    soc::clocks::ClockTree,
+    soc::clocks::{ClockTree, LcdCamCamClockConfig, LcdCamInstance},
     system::{self, GenericPeripheralGuard},
     time::Rate,
 };
@@ -138,29 +138,34 @@ pub struct Cam<'d> {
     /// The LCD_CAM peripheral reference for managing the camera functionality.
     pub(crate) lcd_cam: LCD_CAM<'d>,
     pub(super) _guard: GenericPeripheralGuard<{ system::Peripheral::LcdCam as u8 }>,
+    pub(super) clock_requested: bool,
+}
+
+impl Drop for Cam<'_> {
+    fn drop(&mut self) {
+        if self.clock_requested {
+            ClockTree::with(|clocks| LcdCamInstance::LcdCam.release_cam_clock(clocks));
+        }
+    }
 }
 
 /// Represents the camera interface with DMA support.
 pub struct Camera<'d> {
-    lcd_cam: LCD_CAM<'d>,
-    rx_channel: ChannelRx<Blocking, PeripheralRxChannel<LCD_CAM<'d>>>,
-    _guard: GenericPeripheralGuard<{ system::Peripheral::LcdCam as u8 }>,
+    cam: Cam<'d>,
+    rx_channel: ChannelRx<Blocking, ErasedRxChannel<'d>>,
 }
 
 impl<'d> Camera<'d> {
     /// Creates a new `Camera` instance with DMA support.
     pub fn new(
         cam: Cam<'d>,
-        channel: impl RxChannelFor<LCD_CAM<'d>>,
+        channel: impl CamDmaRxChannel<'d>,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let rx_channel = ChannelRx::new(channel.degrade());
+        let rx_channel = ChannelRx::new(channel.into());
+        rx_channel.runtime_ensure_compatible(DmaPeripheral::LCD_CAM);
 
-        let mut this = Self {
-            lcd_cam: cam.lcd_cam,
-            rx_channel,
-            _guard: cam._guard,
-        };
+        let mut this = Self { cam, rx_channel };
 
         this.apply_config(&config)?;
 
@@ -168,7 +173,7 @@ impl<'d> Camera<'d> {
     }
 
     fn regs(&self) -> &pac::lcd_cam::RegisterBlock {
-        self.lcd_cam.register_block()
+        self.cam.lcd_cam.register_block()
     }
 
     /// Applies the configuration to the camera interface.
@@ -178,17 +183,14 @@ impl<'d> Camera<'d> {
     /// [`ConfigError::Clock`] will be returned if the frequency passed in
     /// `Config` is too low.
     pub fn apply_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-        let (i, divider) = ClockTree::with(|clocks| {
-            calculate_clkm(
-                config.frequency.as_hz() as _,
-                &[
-                    crate::soc::clocks::xtal_clk_frequency(clocks) as usize,
-                    crate::soc::clocks::pll_d2_frequency(clocks) as usize,
-                    crate::soc::clocks::crypto_pwm_clk_frequency(clocks) as usize,
-                ],
-            )
-        })
+        let sources = property!("clock_tree.lcd_cam.cam_clock.sclk");
+        let (i, divider) = calculate_clkm(
+            config.frequency.as_hz(),
+            &sources.map(LcdCamInstance::cam_clock_source_frequency),
+        )
         .map_err(ConfigError::Clock)?;
+        let clock_config =
+            LcdCamCamClockConfig::new(sources[i], divider.div_num, divider.div_a, divider.div_b);
 
         if let Some(value) = config.line_interrupt
             && value > 0b0111_1111
@@ -199,10 +201,6 @@ impl<'d> Camera<'d> {
         self.regs().cam_ctrl().write(|w| {
             // Force enable the clock for all configuration registers.
             unsafe {
-                w.cam_clk_sel().bits((i + 1) as _);
-                w.cam_clkm_div_num().bits(divider.div_num as _);
-                w.cam_clkm_div_b().bits(divider.div_b as _);
-                w.cam_clkm_div_a().bits(divider.div_a as _);
                 if let Some(threshold) = config.vsync_filter_threshold {
                     w.cam_vsync_filter_thres().bits(threshold as _);
                 }
@@ -216,6 +214,14 @@ impl<'d> Camera<'d> {
                 w.cam_stop_en().clear_bit()
             }
         });
+        ClockTree::with(|clocks| {
+            LcdCamInstance::LcdCam.configure_cam_clock(clocks, clock_config);
+            if !self.cam.clock_requested {
+                LcdCamInstance::LcdCam.request_cam_clock(clocks);
+                self.cam.clock_requested = true;
+            }
+        });
+
         self.regs().cam_ctrl1().write(|w| unsafe {
             w.cam_2byte_en().bit(config.enable_2byte_mode);
             w.cam_vh_de_mode_en()
@@ -417,7 +423,7 @@ impl<'d> Camera<'d> {
         // Start DMA to receive incoming transfer.
         let result = unsafe {
             self.rx_channel
-                .prepare_transfer(DmaPeripheral::LcdCam, &mut buf)
+                .prepare_transfer(DmaPeripheral::LCD_CAM, &mut buf)
                 .and_then(|_| self.rx_channel.start_transfer())
         };
 

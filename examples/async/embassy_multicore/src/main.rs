@@ -7,7 +7,12 @@
 //! is running.
 //!
 //! The following wiring is assumed:
-//! - LED => GPIO0
+//!
+//! Signal | ESP32-S31 | others |
+//! ------ | --------- | ------ |
+//! LED    | GPIO45    | GPIO0  |
+
+//% CHIP_FILTER: multi_core && gpio_driver_supported
 
 #![no_std]
 #![no_main]
@@ -47,7 +52,7 @@ async fn control_led(
     }
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -62,7 +67,11 @@ async fn main(_spawner: Spawner) {
     static LED_CTRL: StaticCell<Signal<CriticalSectionRawMutex, bool>> = StaticCell::new();
     let led_ctrl_signal = &*LED_CTRL.init(Signal::new());
 
-    let led = Output::new(peripherals.GPIO0, Level::Low, OutputConfig::default());
+    let gpio = cfg_select! {
+        feature = "esp32s31" => peripherals.GPIO45,
+        _ => peripherals.GPIO0,
+    };
+    let led = Output::new(gpio, Level::Low, OutputConfig::default());
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -72,7 +81,7 @@ async fn main(_spawner: Spawner) {
             static EXECUTOR: StaticCell<Executor> = StaticCell::new();
             let executor = EXECUTOR.init(Executor::new());
             executor.run(|spawner| {
-                spawner.spawn(control_led(led, led_ctrl_signal)).ok();
+                spawner.spawn(control_led(led, led_ctrl_signal).unwrap());
             });
         },
     );

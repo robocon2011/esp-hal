@@ -2,7 +2,7 @@
 mod cfg;
 
 use core::str::FromStr;
-use std::{fmt::Write, sync::OnceLock};
+use std::{fmt::Write, path::Path, sync::OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use cfg::PeriConfig;
@@ -11,23 +11,53 @@ pub use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use strum::IntoEnumIterator;
 
-use crate::cfg::{PinLimitation, SupportItem, SupportStatus, Value};
+mod include;
+mod support_status;
 
-macro_rules! include_toml {
-    (Config, $file:expr) => {{
-        static LOADED_TOML: OnceLock<Config> = OnceLock::new();
-        LOADED_TOML.get_or_init(|| {
-            let config: Config = basic_toml::from_str(include_str!($file))
-                .with_context(|| format!("Failed to load device configuration: {}", $file))
-                .unwrap();
+use crate::{
+    cfg::{SupportItem, Value},
+    support_status::SupportStatusLevel,
+};
 
-            config
-                .validate()
-                .with_context(|| format!("Failed to validate device configuration: {}", $file))
-                .unwrap();
+fn load_device_config(relative_path: &str) -> Config {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join(relative_path);
+    log::debug!("Loading device config from {}", path.display());
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read device configuration: {}", path.display()))
+        .unwrap();
 
-            config
+    let devices_dir = manifest_dir.join("devices");
+    let content = include::expand_includes(&content, &path, &devices_dir)
+        .with_context(|| {
+            format!(
+                "Failed to expand includes in device configuration: {}",
+                path.display()
+            )
         })
+        .unwrap();
+
+    let config: Config = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse device configuration: {}", path.display()))
+        .unwrap();
+
+    config
+        .validate()
+        .with_context(|| {
+            format!(
+                "Failed to validate device configuration: {}",
+                path.display()
+            )
+        })
+        .unwrap();
+
+    config
+}
+
+macro_rules! cached_device_config {
+    ($file:literal) => {{
+        static LOADED_TOML: OnceLock<Config> = OnceLock::new();
+        LOADED_TOML.get_or_init(|| load_device_config($file))
     }};
 }
 
@@ -110,14 +140,22 @@ pub enum Chip {
     Esp32c2,
     /// ESP32-C3, ESP8685
     Esp32c3,
+    /// ESP32-C5
+    Esp32c5,
     /// ESP32-C6
     Esp32c6,
+    /// ESP32-C61
+    Esp32c61,
     /// ESP32-H2
     Esp32h2,
+    /// ESP32-P4 (chip revision v3.x / eco5 only)
+    Esp32p4,
     /// ESP32-S2
     Esp32s2,
     /// ESP32-S3
     Esp32s3,
+    /// ESP32-S31
+    Esp32s31,
 }
 
 impl Chip {
@@ -153,13 +191,13 @@ impl Chip {
 
     pub fn has_lp_core(&self) -> bool {
         use Chip::*;
-
+        // TODO this should be checking for lp_core_driver_supported
         matches!(self, Esp32c6 | Esp32s2 | Esp32s3)
     }
 
     pub fn lp_target(&self) -> Result<&'static str> {
         match self {
-            Chip::Esp32c6 => Ok("riscv32imac-unknown-none-elf"),
+            Chip::Esp32c5 | Chip::Esp32c6 => Ok("riscv32imac-unknown-none-elf"),
             Chip::Esp32s2 | Chip::Esp32s3 => Ok("riscv32imc-unknown-none-elf"),
             _ => bail!("Chip does not contain an LP core: '{self}'"),
         }
@@ -170,10 +208,14 @@ impl Chip {
             Chip::Esp32 => "Esp32",
             Chip::Esp32c2 => "Esp32c2",
             Chip::Esp32c3 => "Esp32c3",
+            Chip::Esp32c5 => "Esp32c5",
             Chip::Esp32c6 => "Esp32c6",
+            Chip::Esp32c61 => "Esp32c61",
             Chip::Esp32h2 => "Esp32h2",
+            Chip::Esp32p4 => "Esp32p4",
             Chip::Esp32s2 => "Esp32s2",
             Chip::Esp32s3 => "Esp32s3",
+            Chip::Esp32s31 => "Esp32s31",
         }
     }
 
@@ -182,10 +224,14 @@ impl Chip {
             Chip::Esp32 => "ESP32",
             Chip::Esp32c2 => "ESP32-C2",
             Chip::Esp32c3 => "ESP32-C3",
+            Chip::Esp32c5 => "ESP32-C5",
             Chip::Esp32c6 => "ESP32-C6",
+            Chip::Esp32c61 => "ESP32-C61",
             Chip::Esp32h2 => "ESP32-H2",
+            Chip::Esp32p4 => "ESP32-P4",
             Chip::Esp32s2 => "ESP32-S2",
             Chip::Esp32s3 => "ESP32-S3",
+            Chip::Esp32s31 => "ESP32-S31",
         }
     }
 
@@ -197,47 +243,39 @@ impl Chip {
         !self.is_xtensa()
     }
 
-    pub fn list_of_check_cfgs() -> Vec<String> {
-        let mut cfgs = vec![];
+    pub fn list_of_possible_symbols() -> &'static IndexMap<String, Option<Vec<String>>> {
+        type SymbolMap = IndexMap<String, Option<Vec<String>>>;
+        static CACHED_SYMBOLS: OnceLock<SymbolMap> = OnceLock::new();
+        CACHED_SYMBOLS.get_or_init(|| {
+            let mut cfgs: SymbolMap = SymbolMap::new();
 
-        // Used by our documentation builds to prevent the huge red warning banner.
-        cfgs.push(String::from("cargo:rustc-check-cfg=cfg(not_really_docsrs)"));
-        cfgs.push(String::from("cargo:rustc-check-cfg=cfg(semver_checks)"));
+            for chip in Chip::iter() {
+                let config = Config::for_chip(&chip);
+                for symbol in config.all() {
+                    if let Some((symbol_name, symbol_value)) = symbol.split_once('=') {
+                        let symbol_name = symbol_name.trim().replace('.', "_");
+                        let symbol_value = symbol_value.trim().to_string();
 
-        let mut cfg_values: IndexMap<String, Vec<String>> = IndexMap::new();
+                        let entry = cfgs.entry(symbol_name).or_default();
+                        let vec = entry.get_or_insert_with(Vec::new);
 
-        for chip in Chip::iter() {
-            let config = Config::for_chip(&chip);
-            for symbol in config.all() {
-                if let Some((symbol_name, symbol_value)) = symbol.split_once('=') {
-                    // cfg's with values need special syntax, so let's collect all
-                    // of them separately.
-                    let symbol_name = symbol_name.replace('.', "_");
-                    let entry = cfg_values.entry(symbol_name).or_default();
-                    // Avoid duplicates in the same cfg.
-                    if !entry.contains(&symbol_value.to_string()) {
-                        entry.push(symbol_value.to_string());
-                    }
-                } else {
-                    // https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-check-cfg
-                    let cfg = format!("cargo:rustc-check-cfg=cfg({})", symbol.replace('.', "_"));
+                        // Avoid duplicates in the same cfg.
+                        if !vec.contains(&symbol_value) {
+                            vec.push(symbol_value);
+                        }
+                    } else {
+                        // https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-check-cfg
+                        let cfg = symbol.trim().replace('.', "_");
 
-                    if !cfgs.contains(&cfg) {
-                        cfgs.push(cfg);
+                        if !cfgs.contains_key(&cfg) {
+                            cfgs.insert(cfg, None);
+                        }
                     }
                 }
             }
-        }
 
-        // Now output all cfgs with values.
-        for (symbol_name, symbol_values) in cfg_values {
-            cfgs.push(format!(
-                "cargo:rustc-check-cfg=cfg({symbol_name}, values({}))",
-                symbol_values.join(",")
-            ));
-        }
-
-        cfgs
+            cfgs
+        })
     }
 }
 
@@ -261,6 +299,20 @@ pub struct PeripheralDef {
     /// List of related interrupt signals
     #[serde(default)]
     interrupts: IndexMap<String, String>,
+    /// If the peripheral is DMA eligible, this defines the peripheral selector value.
+    #[serde(default)]
+    dma_peripheral: Option<u32>,
+    /// Set to true to hide a peripheral from the Peripherals struct.
+    #[serde(default)]
+    hidden: bool,
+    /// If the peripheral isn't specifically named by a driver, this field can be used to mark it
+    /// as stable.
+    #[serde(default)]
+    stable: bool,
+
+    /// Instantiates a clock group for the peripheral.
+    #[serde(default)]
+    clock_group: Option<String>,
 }
 
 impl PeripheralDef {
@@ -270,15 +322,14 @@ impl PeripheralDef {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Device {
     name: String,
     arch: Arch,
     target: String,
     cores: usize,
+    datasheet: String,
     trm: String,
-
-    peripherals: Vec<PeripheralDef>,
-    symbols: Vec<String>,
 
     // Peripheral driver configuration:
     #[serde(flatten)]
@@ -306,13 +357,17 @@ impl Config {
     /// The configuration for the specified chip.
     pub fn for_chip(chip: &Chip) -> &Self {
         match chip {
-            Chip::Esp32 => include_toml!(Config, "../devices/esp32.toml"),
-            Chip::Esp32c2 => include_toml!(Config, "../devices/esp32c2.toml"),
-            Chip::Esp32c3 => include_toml!(Config, "../devices/esp32c3.toml"),
-            Chip::Esp32c6 => include_toml!(Config, "../devices/esp32c6.toml"),
-            Chip::Esp32h2 => include_toml!(Config, "../devices/esp32h2.toml"),
-            Chip::Esp32s2 => include_toml!(Config, "../devices/esp32s2.toml"),
-            Chip::Esp32s3 => include_toml!(Config, "../devices/esp32s3.toml"),
+            Chip::Esp32 => cached_device_config!("devices/esp32/soc.toml"),
+            Chip::Esp32c2 => cached_device_config!("devices/esp32c2/soc.toml"),
+            Chip::Esp32c3 => cached_device_config!("devices/esp32c3/soc.toml"),
+            Chip::Esp32c5 => cached_device_config!("devices/esp32c5/soc.toml"),
+            Chip::Esp32c6 => cached_device_config!("devices/esp32c6/soc.toml"),
+            Chip::Esp32c61 => cached_device_config!("devices/esp32c61/soc.toml"),
+            Chip::Esp32h2 => cached_device_config!("devices/esp32h2/soc.toml"),
+            Chip::Esp32p4 => cached_device_config!("devices/esp32p4/soc.toml"),
+            Chip::Esp32s2 => cached_device_config!("devices/esp32s2/soc.toml"),
+            Chip::Esp32s3 => cached_device_config!("devices/esp32s3/soc.toml"),
+            Chip::Esp32s31 => cached_device_config!("devices/esp32s31/soc.toml"),
         }
     }
 
@@ -324,9 +379,8 @@ impl Config {
                 arch: Arch::RiscV,
                 target: String::new(),
                 cores: 1,
+                datasheet: String::new(),
                 trm: String::new(),
-                peripherals: Vec::new(),
-                symbols: Vec::new(),
                 peri_config: PeriConfig::default(),
             },
             all_symbols: OnceLock::new(),
@@ -337,13 +391,17 @@ impl Config {
         for instance in self.device.peri_config.driver_instances() {
             let (driver, peri) = instance.split_once('.').unwrap();
             ensure!(
-                self.device
-                    .peripherals
+                self.peripherals()
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(peri)),
                 "Driver {driver} marks an implementation for '{peri}' but this peripheral is not defined for '{}'",
                 self.device.name
             );
+        }
+
+        if let Some(dma) = self.device.peri_config.dma.as_ref() {
+            dma.engines
+                .validate_mem2mem(dma.mem2mem_requires_peripheral)?;
         }
 
         Ok(())
@@ -370,12 +428,12 @@ impl Config {
 
     /// The peripherals of the device.
     pub fn peripherals(&self) -> &[PeripheralDef] {
-        &self.device.peripherals
-    }
-
-    /// User-defined symbols for the device.
-    pub fn symbols(&self) -> &[String] {
-        &self.device.symbols
+        self.device
+            .peri_config
+            .soc
+            .as_ref()
+            .map(|props| props.config.peripherals.as_slice())
+            .unwrap_or(&[])
     }
 
     /// All configuration values for the device.
@@ -389,13 +447,12 @@ impl Config {
                     Cores::Multi => String::from("multi_core"),
                 },
             ];
-            all.extend(self.device.peripherals.iter().map(|p| p.symbol_name()));
-            all.extend_from_slice(&self.device.symbols);
+            all.extend(self.peripherals().iter().map(|p| p.symbol_name()));
             all.extend(
                 self.device
                     .peri_config
                     .driver_names()
-                    .map(|name| name.to_string()),
+                    .map(|name| format!("{name}_driver_supported")),
             );
             all.extend(self.device.peri_config.driver_instances());
 
@@ -439,7 +496,9 @@ impl Config {
 
     /// Does the configuration contain `item`?
     pub fn contains(&self, item: &str) -> bool {
-        self.all().iter().any(|i| i == item)
+        // Normalize the item to match the exact name of the symbols.
+        let normalized = item.replace('.', "_");
+        self.all().iter().any(|i| i.replace('.', "_") == normalized)
     }
 
     pub fn generate_metadata(&self) -> TokenStream {
@@ -456,6 +515,10 @@ impl Config {
 
     fn generate_properties(&self) -> TokenStream {
         let chip_name = self.name();
+        let chip_pretty_name = Chip::from_str(&chip_name)
+            .expect("Valid chip name")
+            .pretty_name()
+            .to_string();
 
         // Translate the chip properties into a macro that can be used in esp-hal:
         let arch = self.device.arch.as_ref();
@@ -517,6 +580,21 @@ impl Config {
                 () => { #chip_name };
             }
 
+            /// The pretty name of the chip as `&str`
+            ///
+            /// # Example
+            ///
+            /// ```rust, no_run
+            /// use esp_hal::chip;
+            /// let chip_name = chip_pretty!();
+            #[doc = concat!("assert_eq!(chip_name, ", chip_pretty!(), ")")]
+            /// ```
+            #[macro_export]
+            #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
+            macro_rules! chip_pretty {
+                () => { #chip_pretty_name };
+            }
+
             /// The properties of this chip and its drivers.
             #[macro_export]
             #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
@@ -549,6 +627,9 @@ impl Config {
         if let Some(peri) = self.device.peri_config.i2c_master.as_ref() {
             tokens.extend(cfg::generate_i2c_master_peripherals(peri));
         };
+        if let Some(peri) = self.device.peri_config.i2s.as_ref() {
+            tokens.extend(cfg::generate_i2s_peripherals(peri));
+        };
         if let Some(peri) = self.device.peri_config.uart.as_ref() {
             tokens.extend(cfg::generate_uart_peripherals(peri));
         }
@@ -567,18 +648,13 @@ impl Config {
     fn generate_peripherals_macro(&self) -> TokenStream {
         let mut all_peripherals = vec![];
         let mut singleton_peripherals = vec![];
+        let mut dma_peripherals: Vec<(String, u32, proc_macro2::Ident)> = vec![];
 
         let mut stable_peris = vec![];
 
-        for item in PeriConfig::drivers() {
-            if self.device.peri_config.support_status(item.config_group)
-                == Some(SupportStatus::Supported)
-            {
-                for p in self.device.peri_config.driver_peris(item.config_group) {
-                    if !stable_peris.contains(&p) {
-                        stable_peris.push(p);
-                    }
-                }
+        for p in self.peripherals().iter() {
+            if p.stable && !stable_peris.contains(&p.name.as_str()) {
+                stable_peris.push(p.name.as_str());
             }
         }
 
@@ -587,24 +663,7 @@ impl Config {
                 let pin = format_ident!("GPIO{}", gpio.pin);
                 let mut docs = format!("GPIO{} peripheral singleton", gpio.pin);
 
-                let mut limitations = gpio.limitations.clone();
-
-                // Resolve implicit limitations - based on pin alternate functions
-                let implicit: &[(&[&str], PinLimitation)] = &[
-                    (&["MTMS", "MTCK", "MTDO", "MTDI"], PinLimitation::Jtag),
-                    (&["USB_DP", "USB_DM"], PinLimitation::UsbJtag),
-                    (&["U0TXD", "U0RXD"], PinLimitation::BootloaderUart),
-                ];
-
-                for i in 0..6 {
-                    if let Some(func) = gpio.functions.get(i) {
-                        for (pins, limitation) in implicit.iter() {
-                            if pins.contains(&func) {
-                                limitations.push(*limitation);
-                            }
-                        }
-                    }
-                }
+                let limitations = gpio.limitations();
 
                 if !limitations.is_empty() {
                     // Append a marker and an explanation to the short description
@@ -635,7 +694,46 @@ This pin may be available with certain limitations. Check your hardware to make 
             }
         }
 
-        for peri in self.device.peripherals.iter() {
+        if let Some(dma) = self.device.peri_config.dma.as_ref() {
+            for engine in dma.engines.0.iter() {
+                for channel in engine.channels.iter() {
+                    let ch_name = format_ident!("{}", channel.name);
+                    let singleton_doc = format!("{} peripheral singleton", channel.name);
+                    let pac = match &channel.pac {
+                        Some(pac_name) => format_ident!("{}", pac_name),
+                        None => format_ident!("virtual"),
+                    };
+                    let interrupts: Vec<TokenStream> = match (
+                        &channel.interrupt,
+                        &channel.interrupt_in,
+                        &channel.interrupt_out,
+                    ) {
+                        (Some(interrupt), None, None) => {
+                            let interrupt = format_ident!("{}", interrupt);
+                            vec![quote! {
+                                #interrupt: { bind_dma_interrupt, enable_dma_interrupt, disable_dma_interrupt }
+                            }]
+                        }
+                        (None, Some(interrupt_in), Some(interrupt_out)) => {
+                            let interrupt_in = format_ident!("{}", interrupt_in);
+                            let interrupt_out = format_ident!("{}", interrupt_out);
+                            vec![
+                                quote! { #interrupt_in: { bind_dma_in_interrupt, enable_dma_in_interrupt, disable_dma_in_interrupt } },
+                                quote! { #interrupt_out: { bind_dma_out_interrupt, enable_dma_out_interrupt, disable_dma_out_interrupt } },
+                            ]
+                        }
+                        _ => vec![],
+                    };
+                    let tokens = quote! {
+                        #[doc = #singleton_doc] #ch_name <= #pac ( #(#interrupts),* )
+                    };
+                    all_peripherals.push(quote! { @peri_type #tokens (unstable) });
+                    singleton_peripherals.push(quote! { #ch_name (unstable) });
+                }
+            }
+        }
+
+        for peri in self.peripherals().iter() {
             let hal = format_ident!("{}", peri.name);
             let pac = if peri.is_virtual {
                 format_ident!("virtual")
@@ -661,11 +759,50 @@ This pin may be available with certain limitations. Check your hardware to make 
                 .any(|p| peri.name.eq_ignore_ascii_case(p))
             {
                 all_peripherals.push(quote! { @peri_type #tokens });
-                singleton_peripherals.push(quote! { #hal });
+                if !peri.hidden {
+                    singleton_peripherals.push(quote! { #hal });
+                }
             } else {
                 all_peripherals.push(quote! { @peri_type #tokens (unstable) });
-                singleton_peripherals.push(quote! { #hal (unstable) });
+                if !peri.hidden {
+                    singleton_peripherals.push(quote! { #hal (unstable) });
+                }
             }
+        }
+
+        if let Some(dma) = self.device.peri_config.dma.as_ref() {
+            for engine in dma.engines.0.iter() {
+                use convert_case::{Case, Casing};
+                let channel = engine.name.from_case(Case::Snake).to_case(Case::Pascal);
+                let any_channel = format_ident!("{channel}Channel");
+                for instance in &engine.peripheral_instances {
+                    dma_peripherals.push((
+                        instance.name.clone(),
+                        instance.dma_id,
+                        any_channel.clone(),
+                    ));
+                }
+            }
+        }
+
+        dma_peripherals.sort_by_key(|(_, dma_id, _)| *dma_id);
+
+        let mut dma_eligible = vec![];
+        for (name, dma_id, any_channel) in dma_peripherals {
+            use convert_case::{Boundary, Case, Casing, pattern};
+
+            let peri = format_ident!("{}", name);
+            let dma_id_num = number(dma_id);
+            let variant_name = format_ident!(
+                "{}",
+                name.from_case(Case::Custom {
+                    boundaries: &[Boundary::LOWER_UPPER, Boundary::UNDERSCORE],
+                    pattern: pattern::capital,
+                    delim: "",
+                })
+                .to_case(Case::Pascal)
+            );
+            dma_eligible.push(quote! { #peri, #variant_name, #dma_id_num, #any_channel });
         }
 
         generate_for_each_macro(
@@ -673,6 +810,7 @@ This pin may be available with certain limitations. Check your hardware to make 
             &[
                 ("all", &all_peripherals),
                 ("singletons", &singleton_peripherals),
+                ("dma_eligible", &dma_eligible),
             ],
         )
     }
@@ -705,6 +843,7 @@ fn generate_for_each_macro(name: &str, branches: &[Branch<'_>]) -> TokenStream {
     let flat_branches = branches.iter().flat_map(|b| b.1.iter());
     let repeat_names = branches.iter().map(|b| TokenStream::from_str(b.0).unwrap());
     let repeat_branches = branches.iter().map(|b| b.1);
+    let inner = format_ident!("_for_each_inner_{name}");
 
     quote! {
         // This macro is called in esp-hal to implement a driver's
@@ -716,7 +855,7 @@ fn generate_for_each_macro(name: &str, branches: &[Branch<'_>]) -> TokenStream {
             (
                 $($pattern:tt => $code:tt;)*
             ) => {
-                macro_rules! _for_each_inner {
+                macro_rules! #inner {
                     $(($pattern) => $code;)*
                     ($other:tt) => {}
                 }
@@ -730,7 +869,7 @@ fn generate_for_each_macro(name: &str, branches: &[Branch<'_>]) -> TokenStream {
                 //     }
                 // }
                 // ```
-                #(_for_each_inner!(( #flat_branches ));)*
+                #( #inner!(( #flat_branches ));)*
 
                 // Generate a single macro call with all branches.
                 // Usage:
@@ -741,14 +880,31 @@ fn generate_for_each_macro(name: &str, branches: &[Branch<'_>]) -> TokenStream {
                 //     }
                 // }
                 // ```
-                #( _for_each_inner!( (#repeat_names #( (#repeat_branches) ),*) ); )*
+                #( #inner!( (#repeat_names #( (#repeat_branches) ),*) ); )*
             };
         }
     }
 }
 
 pub fn generate_build_script_utils() -> TokenStream {
-    let check_cfgs = Chip::list_of_check_cfgs();
+    // The union of every chip's symbols, deduplicated while preserving first-seen order.
+    // This is the list of all symbols that any supported chip can possibly define.
+    let all_possible_symbols = {
+        let possible_symbols = Chip::list_of_possible_symbols();
+        let mut cfgs = Vec::with_capacity(possible_symbols.len());
+        for (sym, values) in possible_symbols.iter() {
+            if values.is_none() {
+                cfgs.push(sym.to_string());
+            }
+        }
+
+        for (sym, values) in possible_symbols.iter() {
+            if let Some(values) = values {
+                cfgs.push(format!("{sym}, values({})", values.join(",")));
+            }
+        }
+        cfgs
+    };
 
     let chip = Chip::iter()
         .map(|c| format_ident!("{}", c.name()))
@@ -765,7 +921,7 @@ pub fn generate_build_script_utils() -> TokenStream {
         let target = config.device.target.as_str();
         let cfgs = config.list_of_cfgs();
         let soc_config = config.device.peri_config.soc.as_ref().unwrap();
-        let memory_regions = soc_config.memory_map.ranges.iter().map(|r| {
+        let memory_regions = soc_config.config.memory_map.ranges.iter().map(|r| {
             let name = r.name.as_str();
             let start = number_hex(r.range.start);
             let end = number_hex(r.range.end);
@@ -786,12 +942,16 @@ pub fn generate_build_script_utils() -> TokenStream {
                     .iter()
                     .map(|pin| {
                         let num = number(pin.pin);
-                        let limitations = pin.limitations.iter().map(|limitation| {
-                            TokenStream::from_str(
-                                &basic_toml::to_string(&limitation)
-                                    .expect("Serializing limitations should be infallible"),
+                        let limitations = pin.limitations().into_iter().map(|limitation| {
+                            let mut value = String::new();
+                            serde::Serialize::serialize(
+                                &limitation,
+                                toml::ser::ValueSerializer::new(&mut value),
                             )
-                            .expect("Valid TOML string can be re-parsed as Rust strings")
+                            .expect("Serializing limitations should be infallible");
+
+                            TokenStream::from_str(&value)
+                                .expect("Valid TOML string can be re-parsed as Rust strings")
                         });
                         quote! {
                             PinInfo {
@@ -842,6 +1002,54 @@ pub fn generate_build_script_utils() -> TokenStream {
             ($($any:tt)*) => {};
         }
 
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! __assert_features_logic {
+            ($op:tt, $limit:expr, $msg:literal, $($feature:literal),+ $(,)?) => {{
+                let enabled: Vec<&str> = [
+                    $( if cfg!(feature = $feature) { Some($feature) } else { None }, )+
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+
+                assert!(
+                    enabled.len() $op $limit,
+                    concat!($msg, ": {}.\nCurrently enabled: {}. This might be caused by enabled default features.\n"),
+                    [$($feature),+].join(", "),
+                    if enabled.is_empty() {
+                        "none".to_string()
+                    } else {
+                        enabled.join(", ")
+                    }
+                );
+            }};
+        }
+
+        #[macro_export]
+        macro_rules! assert_unique_features {
+            ($($f:literal),+ $(,)?) => {
+                $crate::__assert_features_logic!(
+                    <=,
+                    1,
+                    "\nAt most one of the following features must be enabled",
+                    $($f),+
+                );
+            };
+        }
+
+        #[macro_export]
+        macro_rules! assert_unique_used_features {
+            ($($f:literal),+ $(,)?) => {
+                $crate::__assert_features_logic!(
+                    ==,
+                    1,
+                    "\nExactly one of the following features must be enabled",
+                    $($f),+
+                );
+            };
+        }
+
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         #[cfg_attr(docsrs, doc(cfg(feature = "build-script")))]
         pub enum Chip {
@@ -853,7 +1061,7 @@ pub fn generate_build_script_utils() -> TokenStream {
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 match s {
-                    #( #name => Ok(Self::#chip),)*
+                    #( #name => Ok(Self::#chip), )*
                     _ => Err(alloc::format!(#from_str_err)),
                 }
             }
@@ -865,10 +1073,11 @@ pub fn generate_build_script_utils() -> TokenStream {
             /// Exactly one device feature must be enabled for this function to succeed.
             pub fn from_cargo_feature() -> Result<Self, &'static str> {
                 let all_chips = [
-                    #(( #feature_env, Self::#chip )),*
+                    #((#feature_env, Self::#chip)),*
                 ];
 
                 let mut chip = None;
+
                 for (env, c) in all_chips {
                     if std::env::var(env).is_ok() {
                         if chip.is_some() {
@@ -880,7 +1089,7 @@ pub fn generate_build_script_utils() -> TokenStream {
 
                 match chip {
                     Some(chip) => Ok(chip),
-                    None => Err(#bail_message)
+                    None => Err(#bail_message),
                 }
             }
 
@@ -956,13 +1165,27 @@ pub fn generate_build_script_utils() -> TokenStream {
             pub fn iter() -> impl Iterator<Item = Chip> {
                 [
                     #( Self::#chip ),*
-                ].into_iter()
+                ]
+                .into_iter()
             }
 
             fn config(self) -> Config {
                 match self {
-                    #(Self::#chip => #config),*
+                    #( Self::#chip => #config ),*
                 }
+            }
+
+            /// Returns the list of all symbols that any supported chip can define.
+            ///
+            /// Unlike [`Chip::all_symbols`], which returns the symbols defined for the
+            /// selected chip, this returns the union of the symbols across every chip.
+            ///
+            /// Key-value configurations are returned with the syntax `cfg(<symbol>, values(<values>))`,
+            /// as used by `cargo:rustc-check-cfg` directives.
+            pub fn all_possible_symbols() -> &'static [&'static str] {
+                &[
+                    #(#all_possible_symbols,)*
+                ]
             }
         }
 
@@ -991,7 +1214,9 @@ pub fn generate_build_script_utils() -> TokenStream {
         impl MemoryLayout {
             /// Returns the memory region with the given name.
             pub fn region(&self, name: &str) -> Option<&'static MemoryRegion> {
-                self.regions.iter().find_map(|(n, r)| if *n == name { Some(r) } else { None })
+                self.regions
+                    .iter()
+                    .find_map(|(n, r)| if *n == name { Some(r) } else { None })
             }
         }
 
@@ -1027,7 +1252,12 @@ pub fn generate_build_script_utils() -> TokenStream {
 
         /// Prints `cargo:rustc-check-cfg` lines.
         pub fn emit_check_cfg_directives() {
-            #(println!(#check_cfgs);)*
+            println!("cargo:rustc-check-cfg=cfg(not_really_docsrs)");
+            println!("cargo:rustc-check-cfg=cfg(semver_checks)");
+
+            for cfg in Chip::all_possible_symbols() {
+                println!("cargo:rustc-check-cfg=cfg({cfg})");
+            }
         }
     }
 }
@@ -1182,6 +1412,7 @@ pub fn generate_chip_support_status(output: &mut impl Write) -> std::fmt::Result
     writeln!(output)?;
 
     // Driver support status
+    let mut issues = Vec::new();
     for SupportItem {
         name,
         config_group,
@@ -1196,29 +1427,90 @@ pub fn generate_chip_support_status(output: &mut impl Write) -> std::fmt::Result
             let config = Config::for_chip(&chip);
 
             let status = config.device.peri_config.support_status(config_group);
-            let status_icon = match status {
-                None => " ",
-                Some(status) => status.icon(),
-            };
             // VSCode displays emojis just a bit wider than 2 characters, making this
             // approximation a bit too wide but good enough.
-            let support_cell_width = chip.pretty_name().len() - status.is_some() as usize;
-            write!(output, " {status_icon:support_cell_width$} |")?;
+            let support_cell_width =
+                chip.pretty_name().len() - !status.status.icon().is_empty() as usize;
+            if let Some(issue) = status.issue {
+                write!(output, " [{}][{issue}] [^1] |", status.status.icon())?;
+                issues.push(issue);
+            } else {
+                write!(output, " {:support_cell_width$} |", status.status.icon())?;
+            }
         }
         writeln!(output)?;
     }
 
     writeln!(output)?;
+    SupportStatusLevel::write_legend(output)?;
+    writeln!(output)?;
 
-    // Print legend
-    writeln!(output, " * Empty cell: not available")?;
-    for s in [
-        SupportStatus::NotSupported,
-        SupportStatus::Partial,
-        SupportStatus::Supported,
-    ] {
-        writeln!(output, " * {}: {}", s.icon(), s.status())?;
+    // Print issue link definitions
+    issues.sort();
+    issues.dedup();
+
+    if !issues.is_empty() {
+        writeln!(
+            output,
+            "[^1]: This cell is clickable and will open the peripheral's issue on GitHub"
+        )?;
+        writeln!(output)?;
+    }
+    for issue in issues {
+        writeln!(
+            output,
+            "[{issue}]: https://github.com/esp-rs/esp-hal/issues/{issue}"
+        )?;
     }
 
     Ok(())
+}
+
+pub fn generate_supported_devices_table(output: &mut impl Write) -> std::fmt::Result {
+    writeln!(
+        output,
+        "| Chip | Datasheet | Technical Reference Manual | Target |"
+    )?;
+    writeln!(
+        output,
+        "| :---: | :-------: | :------------------------: | :----: |"
+    )?;
+
+    for chip in Chip::iter() {
+        let config = Config::for_chip(&chip);
+        writeln!(
+            output,
+            "| {pretty} | [{pretty}][{chip}-datasheet] | [{pretty}][{chip}-trm] | `{target}` |",
+            pretty = chip.pretty_name(),
+            target = config.device.target,
+        )?;
+    }
+
+    writeln!(output)?;
+
+    for chip in Chip::iter() {
+        let config = Config::for_chip(&chip);
+        writeln!(output, "[{chip}-datasheet]: {}", config.device.datasheet,)?;
+        writeln!(output, "[{chip}-trm]: {}", config.device.trm,)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_devices_table_uses_metadata() {
+        let mut table = String::new();
+        generate_supported_devices_table(&mut table).unwrap();
+
+        for chip in Chip::iter() {
+            let config = Config::for_chip(&chip);
+            assert!(table.contains(&config.device.datasheet));
+            assert!(table.contains(&config.device.trm));
+            assert!(table.contains(&config.device.target));
+        }
+    }
 }

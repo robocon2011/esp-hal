@@ -33,7 +33,7 @@
 //! // Define a shared handle to the software interrupt.
 //! static SWINT0: Mutex<RefCell<Option<SoftwareInterrupt<0>>>> = Mutex::new(RefCell::new(None));
 //!
-//! #[handler]
+//! #[esp_hal::handler]
 //! fn swint0_handler() {
 //!     println!("SW interrupt0 handled");
 //!
@@ -103,43 +103,55 @@ impl<const NUM: u8> SoftwareInterrupt<'_, NUM> {
         for core in Cpu::other() {
             interrupt::disable(core, interrupt);
         }
-        unsafe { interrupt::bind_interrupt(interrupt, handler.handler()) };
-        unwrap!(interrupt::enable(interrupt, handler.priority()));
+        interrupt::bind_handler(interrupt, handler);
     }
 
     /// Trigger this software-interrupt
+    #[crate::ram]
     pub fn raise(&self) {
-        cfg_if::cfg_if! {
-            if #[cfg(any(esp32c6, esp32h2))] {
-                let regs = crate::peripherals::INTPRI::regs();
-            } else {
-                let regs = crate::peripherals::SYSTEM::regs();
+        let regs = cfg_select! {
+            soc_has_intpri => crate::peripherals::INTPRI::regs(),
+            _ => crate::peripherals::SYSTEM::regs(),
+        };
+        let reg = regs.cpu_intr_from_cpu(NUM as usize);
+
+        cfg_select! {
+            xtensa => {
+                reg.write(|w| w.cpu_intr().set_bit());
+                // Read back to ensure the write is completed.
+                _ = reg.read();
+            },
+            _ => {
+                crate::interrupt::free(|| {
+                    reg.write(|w| w.cpu_intr().set_bit());
+                    // Wait for the interrupt to actually take effect.
+                    while !self.is_pending() {}
+                });
             }
         }
-        let reg;
+    }
 
+    #[cfg(riscv)]
+    fn is_pending(&self) -> bool {
+        let interrupt;
         for_each_sw_interrupt! {
-            (all $( ($n:literal, $i:ident, $f:ident) ),*) => {
-                reg = match NUM {
-                    $($n => regs.cpu_intr_from_cpu($n),)*
+            (all $( ($n:literal, $interrupt_name:ident, $f:ident) ),*) => {
+                interrupt = match NUM {
+                    $($n => Interrupt::$interrupt_name,)*
                     _ => unreachable!(),
                 };
             };
         }
-
-        reg.write(|w| w.cpu_intr().set_bit());
-        _ = reg.read(); // Read back to ensure the write is completed.
-
-        // Insert enough delay to ensure the interrupt is fired before returning.
-        sw_interrupt_delay!();
+        crate::interrupt::InterruptStatus::is_pending(interrupt)
     }
 
     /// Resets this software-interrupt
     pub fn reset(&self) {
-        cfg_if::cfg_if! {
-            if #[cfg(any(esp32c6, esp32h2))] {
+        cfg_select! {
+            soc_has_intpri => {
                 let regs = crate::peripherals::INTPRI::regs();
-            } else {
+            }
+            _ => {
                 let regs = crate::peripherals::SYSTEM::regs();
             }
         }

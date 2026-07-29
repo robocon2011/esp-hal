@@ -1,45 +1,32 @@
 //! Allocator and PSRAM-related tests
 
-//% CHIPS:
-//% CHIPS(llff_quad, tlsf_quad): esp32 esp32s2
-// The S3 dev kit in the HIL-tester has octal PSRAM.
-//% CHIPS(llff_octal, tlsf_octal): esp32s3
-//% ENV(llff_octal, tlsf_octal): ESP_HAL_CONFIG_PSRAM_MODE=octal
-//% ENV(llff_octal, llff_quad): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
-//% ENV(tlsf_octal, tlsf_quad): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
-//% FEATURES: unstable psram esp-storage esp-alloc/nightly
+//% CHIP_FILTER(llff, tlsf): psram_driver_supported && !soc_has_flash
+//% CHIP_FILTER(llff_with_storage, tlsf_with_storage): psram_driver_supported && soc_has_flash
+//% ENV(llff, llff_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
+//% ENV(tlsf, tlsf_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
+//% FEATURES: unstable esp-alloc/nightly
+//% FEATURES(llff_with_storage, tlsf_with_storage): esp-storage
 
 #![no_std]
 #![no_main]
-// TODO: this test is Xtensa-only, so we can enable allocator_api unconditionally. This will not
-// always be the case. Will this need a //% TOOLCHAIN?
-#![feature(allocator_api)]
 
 use hil_test as _;
 
 extern crate alloc;
 
-#[embedded_test::tests]
+#[embedded_test::tests(default_timeout = 30)] // P4 PSRAM can get large
 mod tests {
     use alloc::vec::Vec as AllocVec;
 
     use allocator_api2::vec::Vec;
-    use embedded_storage::*;
     use esp_alloc::{AnyMemory, ExternalMemory, InternalMemory};
-    use esp_bootloader_esp_idf::partitions;
-    use esp_hal::peripherals::FLASH;
-    use esp_storage::FlashStorage;
-
-    struct Context<'a> {
-        flash: FLASH<'a>,
-    }
+    use esp_hal::clock::CpuClock;
 
     #[init]
-    fn init() -> Context<'static> {
-        let p = esp_hal::init(esp_hal::Config::default());
+    fn init() {
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let p = esp_hal::init(config);
         esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
-
-        Context { flash: p.FLASH }
     }
 
     // alloc::vec::Vec tests
@@ -151,6 +138,26 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(feature = "esp-storage")]
+#[embedded_test::tests]
+mod storage_tests {
+    use esp_bootloader_esp_idf::partitions;
+    use esp_hal::peripherals::FLASH;
+    use esp_storage::FlashStorage;
+
+    struct Context<'a> {
+        flash: FLASH<'a>,
+    }
+
+    #[init]
+    fn init() -> Context<'static> {
+        let p = esp_hal::init(esp_hal::Config::default());
+        esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
+
+        Context { flash: p.FLASH }
+    }
 
     #[test]
     fn test_with_accessing_flash_storage(ctx: Context<'static>) {
@@ -168,7 +175,7 @@ mod tests {
         ))
         .unwrap()
         .unwrap()
-        .as_embedded_storage(&mut flash)
+        .as_flash_region(&mut flash)
         .read(32, &mut app_desc)
         .unwrap();
 

@@ -2,24 +2,21 @@
 
 /// Checks if a debugger is connected.
 pub fn debugger_connected() -> bool {
-    #[cfg(xtensa)]
-    {
-        xtensa_lx::is_debugger_attached()
-    }
-
-    #[cfg(riscv)]
-    {
-        crate::peripherals::ASSIST_DEBUG::regs()
-            .cpu(0)
-            .debug_mode()
-            .read()
-            .debug_module_active()
-            .bit_is_set()
-    }
-
-    #[cfg(not(any(xtensa, riscv)))]
-    {
-        false
+    cfg_select! {
+        xtensa => {
+            xtensa_lx::is_debugger_attached()
+        }
+        all(riscv, soc_has_assist_debug) => {
+            crate::peripherals::ASSIST_DEBUG::regs()
+                .cpu(0)
+                .debug_mode()
+                .read()
+                .debug_module_active()
+                .bit_is_set()
+        }
+        _ => {
+            false
+        }
     }
 }
 
@@ -37,8 +34,8 @@ pub unsafe fn set_stack_watchpoint(addr: usize) {
     if cfg!(stack_guard_monitoring_with_debugger_connected)
         || !crate::debugger::debugger_connected()
     {
-        cfg_if::cfg_if! {
-            if #[cfg(xtensa)] {
+        cfg_select! {
+            xtensa => {
                 let addr = addr & !0b11;
                 let dbreakc = 0b1111100 | (1 << 31); // bit 31 = STORE
 
@@ -52,7 +49,8 @@ pub unsafe fn set_stack_watchpoint(addr: usize) {
                         dbreakc = in(reg) dbreakc,
                     );
                 }
-            } else {
+            }
+            _ => {
                 unsafe { set_watchpoint(0, addr, 4); }
             }
         }

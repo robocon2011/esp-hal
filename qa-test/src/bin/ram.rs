@@ -11,7 +11,7 @@
 //!
 //! We can also run code from RTC memory.
 
-//% CHIPS: esp32 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: soc_has_lpwr && !esp32c2 && !esp32c61 && !esp32p4
 
 #![allow(static_mut_refs)]
 #![no_std]
@@ -40,7 +40,7 @@ fn main() -> ! {
 
     // The RWDT flash boot protection must be enabled, as it is triggered as part of
     // the example.
-    let mut rtc = Rtc::new(peripherals.LPWR);
+    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
     rtc.rwdt.enable();
 
     println!(

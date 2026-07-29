@@ -10,9 +10,15 @@ use toml_edit::{Item, Value};
 
 use crate::{
     Package,
+    Version,
     cargo::CargoToml,
-    commands::{VersionBump, checker::min_package_update, do_version_bump},
-    git::current_branch,
+    commands::{
+        VersionBump,
+        checker::min_package_update,
+        do_version_bump,
+        release::changelog_preview,
+    },
+    git::{BackportInfo, current_branch, parse_backport_branch},
 };
 
 /// Arguments for generating a release plan.
@@ -49,8 +55,45 @@ pub struct PackagePlan {
 pub struct Plan {
     /// The branch the release is made from.
     pub base: String,
+    /// Short random slug that pins this plan to its release branch
+    /// (`release-branch-<slug>`). Generated once when the plan is created and
+    /// preserved across re-plans so re-runs of `execute-plan` target the same
+    /// branch and PR.
+    pub slug: String,
+    /// Present when this plan was generated from a backport branch (e.g.
+    /// `esp-hal-1.1.x`). Downstream steps use this to enforce patch-only bumps
+    /// and skip inapplicable post-release work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backport: Option<BackportInfo>,
     /// The packages to be released, in order.
     pub packages: Vec<PackagePlan>,
+}
+
+/// Generate a short base36 slug. Not cryptographically random — we only need
+/// uniqueness across release attempts, and the slug is persisted in the plan
+/// file so it survives re-runs.
+fn generate_slug() -> String {
+    let mut n = jiff::Timestamp::now().as_nanosecond() as u128;
+    const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut slug = String::new();
+    for _ in 0..6 {
+        slug.push(CHARS[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    slug
+}
+
+/// Read the slug from an existing (finalized) plan file, so that re-running
+/// `plan` preserves the release branch name. Returns `Ok(None)` when no plan
+/// file exists yet. Bails with the same error as `Plan::from_path` if the
+/// file is present but still carries its JSONC comment header — the user is
+/// expected to finalize the plan before re-running.
+fn read_existing_slug(plan_path: &Path) -> Result<Option<String>> {
+    if !plan_path.exists() {
+        return Ok(None);
+    }
+    let plan = Plan::from_path(plan_path)?;
+    Ok(Some(plan.slug))
 }
 
 impl Plan {
@@ -75,29 +118,47 @@ impl Plan {
 
 /// Generate a release plan for the specified packages.
 pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
-    let current_branch = ensure_main_branch(args.allow_non_main)?;
+    let (current_branch, backport) = ensure_main_branch(args.allow_non_main)?;
 
-    // Recursively collect dependencies. A bit inefficient, but we don't need to
-    // sort a lot.
-    let mut packages_to_release = args
-        .packages
-        .iter()
-        .filter(|p| p.is_published())
-        .flat_map(|p| related_crates(workspace, *p))
-        .collect::<Vec<_>>();
+    // On a backport branch, scope to exactly the backport package. Each
+    // backport branch serves a single package; dependencies have their own
+    // branches and are released independently.
+    let packages_to_release = if let Some(ref ctx) = backport {
+        println!("Backport branch detected: releasing only {}.", ctx.package);
+        vec![ctx.package]
+    } else {
+        // Recursively collect dependencies. A bit inefficient, but we don't
+        // need to sort a lot.
+        let mut pkgs = args
+            .packages
+            .iter()
+            .filter(|p| p.is_published())
+            .flat_map(|p| related_crates(workspace, *p))
+            .collect::<Vec<_>>();
 
-    packages_to_release.sort();
-    packages_to_release.dedup();
+        pkgs.sort();
+        pkgs.dedup();
+        pkgs
+    };
 
     let mut package_tomls = packages_to_release
         .iter()
         .map(|pkg| CargoToml::new(workspace, *pkg).map(|cargo_toml| (*pkg, cargo_toml)))
         .collect::<Result<HashMap<_, _>>>()?;
 
-    // Determine package dependencies (package -> dependencies)
+    // Determine package dependencies (package -> dependencies). Restrict deps
+    // to the in-scope set so the graph is self-contained — otherwise
+    // `topological_sort` spins forever waiting for a dep that will never be
+    // emitted (e.g. on a backport branch where `packages_to_release` is just
+    // the single backport package).
     let mut dep_graph = HashMap::new();
     for (package, toml) in package_tomls.iter_mut() {
-        dep_graph.insert(*package, toml.repo_dependencies());
+        let deps = toml
+            .repo_dependencies()
+            .into_iter()
+            .filter(|d| packages_to_release.contains(d))
+            .collect();
+        dep_graph.insert(*package, deps);
     }
 
     // Topological sort the packages into a release order. Note that this is not a stable order,
@@ -132,7 +193,7 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
 
     for package in sorted.iter().copied() {
         let amount = if changed[&package] {
-            let amount = if package.is_semver_checked() {
+            let mut amount = if package.is_semver_checked() {
                 min_package_update(workspace, package, &all_chips)?
             } else {
                 let forever_unstable = if let Some(metadata) =
@@ -161,6 +222,16 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
                 }
             };
 
+            // On a backport branch, force all bumps to Patch.
+            if backport.is_some() && amount != ReleaseType::Patch {
+                log::info!(
+                    "{}: overriding {:?} bump to Patch (backport branch)",
+                    package,
+                    amount
+                );
+                amount = ReleaseType::Patch;
+            }
+
             log::debug!("{} needs {:?} version bump", package, amount);
             Some(amount)
         } else {
@@ -174,8 +245,17 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
     // Generate plan file. The plan should include, as an ordered list, the packages
     // and their version increment.
 
+    let plan_path = workspace.join("release_plan.jsonc");
+    let plan_path = crate::windows_safe_path(&plan_path);
+
+    // Preserve the slug from an existing plan file so that re-running `plan`
+    // after tweaks keeps targeting the same release branch.
+    let slug = read_existing_slug(&plan_path)?.unwrap_or_else(generate_slug);
+
     let plan = Plan {
         base: current_branch,
+        slug,
+        backport: backport.clone(),
         packages: update_amounts
             .into_iter()
             .filter_map(|(package, bump)| {
@@ -183,21 +263,32 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
                     let current_version = package_tomls[&package].package_version();
 
                     let bump = if !current_version.pre.is_empty() {
-                        VersionBump::PreRelease(
-                            current_version
-                                .pre
-                                .as_str()
-                                .split('.')
-                                .next()
-                                .unwrap()
-                                .to_string(),
-                        )
+                        // Package is already in a pre-release cycle — continue it
+                        // on the same base. Hand-edit the plan to start a new
+                        // cycle on a bumped base (e.g. `1.1.0-alpha.0` from
+                        // `1.0.0`) by also setting `base`.
+                        VersionBump {
+                            base: None,
+                            pre: Some(
+                                current_version
+                                    .pre
+                                    .as_str()
+                                    .split('.')
+                                    .next()
+                                    .unwrap()
+                                    .to_string(),
+                            ),
+                        }
                     } else {
-                        match b {
-                            ReleaseType::Major => VersionBump::Major,
-                            ReleaseType::Minor => VersionBump::Minor,
-                            ReleaseType::Patch => VersionBump::Patch,
+                        let base = match b {
+                            ReleaseType::Major => Version::Major,
+                            ReleaseType::Minor => Version::Minor,
+                            ReleaseType::Patch => Version::Patch,
                             _ => unreachable!(),
+                        };
+                        VersionBump {
+                            base: Some(base),
+                            pre: None,
                         }
                     };
 
@@ -217,11 +308,9 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
             .collect(),
     };
 
-    let plan_path = workspace.join("release_plan.jsonc");
-    let plan_path = crate::windows_safe_path(&plan_path);
     log::debug!("Writing release plan to {}", plan_path.display());
 
-    let plan_header = String::from(
+    let mut plan_header = String::from(
         r#"// Release plan generated by xtask.
 //
 // This file is automatically generated and meant to be manually edited. Change the version bump
@@ -241,13 +330,35 @@ pub fn plan(workspace: &Path, args: PlanArgs) -> Result<()> {
 // orchestrate the actual publishing process.
 //
 // For each package, this plan contains the version bump that will be applied.
-// The version bump is one of:
-// - PreRelease (`"bump": { "PreRelease": "beta" }`)
-// - Patch (`"bump": "Patch"`)
-// - Minor (`"bump": "Minor"`)
-// - Major (`"bump": "Major"`)
+// A bump has two orthogonal fields — `base` (how much to bump
+// major.minor.patch) and `pre` (the pre-release identifier):
+//
+// - Stable bump:               `"bump": { "base": "Minor", "pre": null }`
+// - Continue pre-release cycle:`"bump": { "base": null,    "pre": "beta" }`
+// - Start a new pre-release cycle on a bumped base (e.g. 1.0.0 -> 1.1.0-alpha.0):
+//                              `"bump": { "base": "Minor", "pre": "alpha" }`
+//
+// Starting a pre-release cycle from a stable version without also setting
+// `base` is an error, as it would produce a version lower than the current
+// one.
+//
+// CHANGELOG NOTE
+// When you run `cargo xrelease execute-plan`, changelog entries from recently
+// merged PRs will be collected and merged into each package's CHANGELOG.md
+// (Unreleased section) and MIGRATING-*.md files. You can preview them with:
+//   cargo xtask release changelog-preview
 "#,
     );
+
+    if backport.is_some() {
+        plan_header.push_str(
+            r#"//
+// PATCH RELEASE from backport branch.
+// All bumps have been forced to Patch. Do NOT change bumps to Minor or Major —
+// only bug fixes should be included in patch releases.
+"#,
+        );
+    }
 
     let mut plan_file = std::fs::File::create(&plan_path)
         .with_context(|| format!("Failed to create {plan_path:?}"))?;
@@ -307,10 +418,17 @@ fn collect_changed_packages(
 }
 
 /// Ensure we are on the main branch, or allow non-main if specified.
-pub fn ensure_main_branch(allow_non_main: bool) -> Result<String> {
+///
+/// Backport branches (e.g. `esp-hal-1.1.x`) are always allowed without
+/// `--allow-non-main`. Returns the branch name and, when applicable, the
+/// parsed backport context.
+pub fn ensure_main_branch(allow_non_main: bool) -> Result<(String, Option<BackportInfo>)> {
     let current_branch = current_branch()?;
+    let backport = parse_backport_branch(&current_branch);
 
-    if allow_non_main {
+    if backport.is_some() {
+        println!("Detected backport branch: {current_branch}");
+    } else if allow_non_main {
         println!("Release will be made from branch: {current_branch}");
     } else {
         ensure!(
@@ -319,7 +437,7 @@ pub fn ensure_main_branch(allow_non_main: bool) -> Result<String> {
         );
     }
 
-    Ok(current_branch)
+    Ok((current_branch, backport))
 }
 
 fn package_changed_since_last_release(workspace: &Path, package: Package) -> bool {
@@ -394,10 +512,149 @@ fn related_crates(workspace: &Path, package: Package) -> Vec<Package> {
     })
 }
 
+/// Merge PR changelog and migration guide entries from recently-merged PRs
+/// directly into each package's `CHANGELOG.md` and `MIGRATING-*.md` files.
+///
+/// Returns the paths of files that were modified. Returns an empty list if the
+/// `gh` CLI is unavailable, no entries were found, or any other non-fatal
+/// problem occurred.
+pub(super) fn generate_changelog_draft(workspace: &Path, plan: &Plan) -> Vec<std::path::PathBuf> {
+    if plan.packages.is_empty() {
+        return vec![];
+    }
+
+    // Use the oldest last-release tag as the baseline so we don't miss entries
+    // for packages that were last released earlier than others.
+    let since_ref = plan
+        .packages
+        .iter()
+        .map(|pkg| pkg.package.tag(&pkg.current_version))
+        .min_by_key(|tag| tag_commit_timestamp(workspace, tag))
+        .expect("packages is non-empty");
+
+    // Map crate name → PackagePlan for quick lookup.
+    let pkg_by_crate: HashMap<String, &PackagePlan> = plan
+        .packages
+        .iter()
+        .map(|pkg| (pkg.package.to_string(), pkg))
+        .collect();
+
+    // Restrict the harvest to PRs merged into the branch this release is cut
+    // from (`main`, or a backport branch like `esp-hal-1.1.x`). Without this,
+    // backport PRs would leak into the next `main` release and every `main` PR
+    // would leak into a patch release.
+    let (changelogs, migrations) = match changelog_preview::collect_changelogs(
+        workspace, &since_ref, 500, &plan.base,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "Could not collect changelog entries (is `gh` installed and authenticated?): {e}"
+            );
+            return vec![];
+        }
+    };
+
+    let mut modified: Vec<std::path::PathBuf> = Vec::new();
+
+    // Merge changelog entries into each package's CHANGELOG.md.
+    for (crate_name, new_entries) in &changelogs {
+        let Some(_pkg) = pkg_by_crate.get(crate_name) else {
+            continue;
+        };
+        if new_entries.format_unreleased().is_none() {
+            continue;
+        }
+
+        let changelog_path = workspace.join(crate_name).join("CHANGELOG.md");
+        let changelog_path = crate::windows_safe_path(&changelog_path);
+
+        let written = match std::fs::write(&changelog_path, new_entries.to_string()) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("Could not write {}: {e}", changelog_path.display());
+                false
+            }
+        };
+        if written {
+            modified.push(changelog_path);
+        }
+    }
+
+    // Append migration guide entries to each package's active MIGRATING-*.md.
+    for (crate_name, entries) in &migrations {
+        let Some(pkg) = pkg_by_crate.get(crate_name) else {
+            continue;
+        };
+
+        // Patch releases don't have migration guides; skip them.
+        if pkg.bump.base == Some(Version::Patch) {
+            continue;
+        }
+
+        // The active migration guide is named after the current major.minor version
+        // (zeroed patch). It was created by `post_release` after the previous release.
+        let v = &pkg.current_version;
+        let migration_file = format!("MIGRATING-{}.{}.0.md", v.major, v.minor);
+        let migration_path = workspace.join(crate_name).join(&migration_file);
+        let migration_path = crate::windows_safe_path(&migration_path);
+
+        if !migration_path.exists() {
+            log::warn!("Migration guide {migration_file} not found for {crate_name}; skipping.");
+            continue;
+        }
+
+        let mut content = match std::fs::read_to_string(&migration_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Could not read {}: {e}", migration_path.display());
+                continue;
+            }
+        };
+
+        // Append each entry's guide text under its area heading.
+        let mut appended = false;
+        for (area, _pr, guide) in entries {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+            if let Some(area) = area {
+                content.push_str(&format!("## {area}\n\n"));
+            }
+            content.push_str(guide.trim_end());
+            content.push('\n');
+            appended = true;
+        }
+
+        if appended {
+            match std::fs::write(&migration_path, &content) {
+                Ok(()) => modified.push(migration_path),
+                Err(e) => log::warn!("Could not write {}: {e}", migration_path.display()),
+            }
+        }
+    }
+
+    modified
+}
+
+/// Return the UNIX commit timestamp for `tag`, or `0` if unknown.
+fn tag_commit_timestamp(workspace: &Path, tag: &str) -> i64 {
+    Command::new("git")
+        .args(["log", "-1", "--format=%ct", tag])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 fn topological_sort(dep_graph: &HashMap<Package, Vec<Package>>) -> Vec<Package> {
     let mut sorted = Vec::new();
     let mut dep_graph = dep_graph.clone();
     while !dep_graph.is_empty() {
+        let before = sorted.len();
         dep_graph.retain(|pkg, deps| {
             deps.retain(|dep| !sorted.contains(dep));
 
@@ -408,6 +665,15 @@ fn topological_sort(dep_graph: &HashMap<Package, Vec<Package>>) -> Vec<Package> 
                 true
             }
         });
+
+        // No package was removed this pass — the remaining graph is either
+        // cyclic or references deps not in the graph. Either way, looping
+        // again would spin forever. Panic with the offending state so a
+        // future regression fails loudly instead of pegging a CPU.
+        assert!(
+            sorted.len() > before,
+            "topological_sort made no progress; remaining graph: {dep_graph:?}"
+        );
     }
 
     sorted
@@ -454,6 +720,16 @@ mod tests {
                 Package::EspRtos
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "topological_sort made no progress")]
+    fn test_topological_sort_dangling_dep_panics() {
+        // Graph references a package that isn't a key — previously caused an
+        // infinite loop. Now the assert in `topological_sort` catches it.
+        let mut dep_graph = HashMap::new();
+        dep_graph.insert(Package::EspHal, vec![Package::EspAlloc]);
+        let _ = topological_sort(&dep_graph);
     }
 
     #[test]

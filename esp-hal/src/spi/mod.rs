@@ -9,13 +9,29 @@
 //! more information on these modes, please refer to the documentation in their
 //! respective modules.
 
+#[cfg(any(spi_master_supports_dma, spi_slave_supports_dma))]
 use crate::dma::DmaError;
 
+#[cfg(spi_master_driver_supported)]
 pub mod master;
 
 crate::unstable_module! {
+    #[cfg(spi_slave_driver_supported)]
     pub mod slave;
 }
+
+#[cfg_attr(
+    any(spi_master_version = "1", spi_master_version = "2"),
+    path = "clocks/v1v2.rs"
+)]
+#[cfg_attr(
+    all(spi_master_version = "3", not(any(esp32p4, esp32s31, soc_has_pcr))),
+    path = "clocks/v3.rs"
+)]
+#[cfg_attr(esp32p4, path = "clocks/esp32p4.rs")]
+#[cfg_attr(esp32s31, path = "clocks/esp32s31.rs")]
+#[cfg_attr(soc_has_pcr, path = "clocks/v3_pcr.rs")]
+mod clocks;
 
 /// SPI errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +42,7 @@ pub enum Error {
     #[cfg(feature = "unstable")]
     #[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
     #[allow(clippy::enum_variant_names, reason = "DMA is unstable")]
+    #[cfg(any(spi_master_supports_dma, spi_slave_supports_dma))]
     DmaError(DmaError),
     /// Error indicating that the maximum DMA transfer size was exceeded.
     MaxDmaTransferSizeExceeded,
@@ -41,6 +58,7 @@ pub enum Error {
 
 #[doc(hidden)]
 #[cfg(feature = "unstable")]
+#[cfg(any(spi_master_supports_dma, spi_slave_supports_dma))]
 impl From<DmaError> for Error {
     fn from(value: DmaError) -> Self {
         Error::DmaError(value)
@@ -49,6 +67,7 @@ impl From<DmaError> for Error {
 
 #[doc(hidden)]
 #[cfg(not(feature = "unstable"))]
+#[cfg(any(spi_master_supports_dma, spi_slave_supports_dma))]
 impl From<DmaError> for Error {
     fn from(_value: DmaError) -> Self {
         Error::Unknown

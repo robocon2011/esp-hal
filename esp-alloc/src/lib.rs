@@ -140,7 +140,7 @@
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 
 mod allocators;
 mod heap;
@@ -154,6 +154,11 @@ use core::{
     ptr::{self, NonNull},
 };
 
+/// Re-exported crates.
+pub mod export {
+    pub use enumset;
+}
+
 pub use allocators::*;
 use enumset::{EnumSet, EnumSetType};
 use esp_sync::NonReentrantMutex;
@@ -163,6 +168,12 @@ use crate::heap::Heap;
 /// The global allocator instance
 #[cfg_attr(feature = "global-allocator", global_allocator)]
 pub static HEAP: EspHeap = EspHeap::empty();
+
+#[cfg(feature = "alloc-hooks")]
+unsafe extern "Rust" {
+    fn _esp_alloc_alloc(heap: &EspHeap, caps: EnumSet<MemoryCapability>, ptr: usize, size: usize);
+    fn _esp_alloc_dealloc(heap: &EspHeap, ptr: usize, size: usize);
+}
 
 const BAR_WIDTH: usize = 35;
 
@@ -463,8 +474,8 @@ impl EspHeapInner {
             }
         }
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "internal-heap-stats")] {
+        cfg_select! {
+            feature = "internal-heap-stats" => {
                 HeapStats {
                     region_stats,
                     size: free + used,
@@ -473,7 +484,8 @@ impl EspHeapInner {
                     total_allocated: self.internal_heap_stats.total_allocated,
                     total_freed: self.internal_heap_stats.total_freed,
                 }
-            } else {
+            }
+            _ => {
                 HeapStats {
                     region_stats,
                     size: free + used,
@@ -640,17 +652,25 @@ impl EspHeap {
         capabilities: EnumSet<MemoryCapability>,
         layout: Layout,
     ) -> *mut u8 {
-        self.inner
-            .with(|heap| unsafe { heap.alloc_caps(capabilities, layout) })
-    }
-}
+        let ptr = self
+            .inner
+            .with(|heap| unsafe { heap.alloc_caps(capabilities, layout) });
 
-unsafe impl GlobalAlloc for EspHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { self.alloc_caps(EnumSet::empty(), layout) }
+        #[cfg(feature = "alloc-hooks")]
+        unsafe {
+            _esp_alloc_alloc(self, capabilities, ptr.addr(), layout.size());
+        }
+
+        ptr
     }
 
+    /// Deallocate memory.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(feature = "alloc-hooks")]
+        unsafe {
+            _esp_alloc_dealloc(self, ptr.addr(), layout.size());
+        }
+
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
@@ -677,5 +697,15 @@ unsafe impl GlobalAlloc for EspHeap {
                     .saturating_add((before - this.used()) as u64);
             }
         })
+    }
+}
+
+unsafe impl GlobalAlloc for EspHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { self.alloc_caps(EnumSet::empty(), layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { self.dealloc(ptr, layout) }
     }
 }

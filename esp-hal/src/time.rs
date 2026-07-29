@@ -93,7 +93,7 @@ impl Rate {
     }
 
     #[procmacros::doc_replace]
-    /// Convert the `Rate` to an interger number of Hz.
+    /// Convert the `Rate` to an integer number of Hz.
     ///
     /// ## Example
     ///
@@ -110,7 +110,7 @@ impl Rate {
     }
 
     #[procmacros::doc_replace]
-    /// Convert the `Rate` to an interger number of kHz.
+    /// Convert the `Rate` to an integer number of kHz.
     ///
     /// ## Example
     ///
@@ -127,7 +127,7 @@ impl Rate {
     }
 
     #[procmacros::doc_replace]
-    /// Convert the `Rate` to an interger number of MHz.
+    /// Convert the `Rate` to an integer number of MHz.
     ///
     /// ## Example
     ///
@@ -248,8 +248,7 @@ impl Instant {
     ///
     /// The counter won’t measure time in sleep-mode.
     ///
-    /// The timer has a 1 microsecond resolution and will wrap after
-    /// # {wrap_after}
+    /// The timer has a 1 microsecond resolution and will wrap after __wrap_after__.
     ///
     /// <section class="warning">
     /// Note that this function returns an unreliable value before <code>esp_hal::init()</code> is
@@ -265,7 +264,7 @@ impl Instant {
     /// ```
     #[inline]
     pub fn now() -> Self {
-        implem::now()
+        now()
     }
 
     #[inline]
@@ -330,7 +329,7 @@ impl core::ops::Sub for Instant {
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
         // Avoid "Sub failed! Other > self" panics
-        Duration::from_micros(self.0.ticks().wrapping_sub(rhs.0.ticks()))
+        Duration::from_micros(self.0.as_ticks().wrapping_sub(rhs.0.as_ticks()))
     }
 }
 
@@ -383,6 +382,13 @@ impl core::hash::Hash for Duration {
     }
 }
 
+impl Default for Duration {
+    #[inline]
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 impl Duration {
     /// A duration of zero time.
     pub const ZERO: Self = Self(InnerDuration::from_ticks(0));
@@ -403,7 +409,7 @@ impl Duration {
     /// ```
     #[inline]
     pub const fn from_micros(val: u64) -> Self {
-        Self(InnerDuration::micros(val))
+        Self(InnerDuration::from_micros(val))
     }
 
     #[procmacros::doc_replace]
@@ -419,7 +425,7 @@ impl Duration {
     /// ```
     #[inline]
     pub const fn from_millis(val: u64) -> Self {
-        Self(InnerDuration::millis(val))
+        Self(InnerDuration::from_millis(val))
     }
 
     #[procmacros::doc_replace]
@@ -435,7 +441,7 @@ impl Duration {
     /// ```
     #[inline]
     pub const fn from_secs(val: u64) -> Self {
-        Self(InnerDuration::secs(val))
+        Self(InnerDuration::from_secs(val))
     }
 
     #[procmacros::doc_replace]
@@ -451,7 +457,7 @@ impl Duration {
     /// ```
     #[inline]
     pub const fn from_minutes(val: u64) -> Self {
-        Self(InnerDuration::minutes(val))
+        Self(InnerDuration::from_minutes(val))
     }
 
     #[procmacros::doc_replace]
@@ -467,14 +473,14 @@ impl Duration {
     /// ```
     #[inline]
     pub const fn from_hours(val: u64) -> Self {
-        Self(InnerDuration::hours(val))
+        Self(InnerDuration::from_hours(val))
     }
 
     delegate::delegate! {
         #[inline]
         to self.0 {
             #[procmacros::doc_replace]
-            /// Convert the `Duration` to an interger number of microseconds.
+            /// Convert the `Duration` to an integer number of microseconds.
             ///
             /// ## Example
             ///
@@ -485,11 +491,11 @@ impl Duration {
             /// let micros = duration.as_micros();
             /// # {after_snippet}
             /// ```
-            #[call(to_micros)]
+            #[call(as_micros)]
             pub const fn as_micros(&self) -> u64;
 
             #[procmacros::doc_replace]
-            /// Convert the `Duration` to an interger number of milliseconds.
+            /// Convert the `Duration` to an integer number of milliseconds.
             ///
             /// ## Example
             ///
@@ -500,11 +506,11 @@ impl Duration {
             /// let millis = duration.as_millis();
             /// # {after_snippet}
             /// ```
-            #[call(to_millis)]
+            #[call(as_millis)]
             pub const fn as_millis(&self) -> u64;
 
             #[procmacros::doc_replace]
-            /// Convert the `Duration` to an interger number of seconds.
+            /// Convert the `Duration` to an integer number of seconds.
             ///
             /// ## Example
             ///
@@ -515,11 +521,11 @@ impl Duration {
             /// let secs = duration.as_secs();
             /// # {after_snippet}
             /// ```
-            #[call(to_secs)]
+            #[call(as_secs)]
             pub const fn as_secs(&self) -> u64;
 
             #[procmacros::doc_replace]
-            /// Convert the `Duration` to an interger number of minutes.
+            /// Convert the `Duration` to an integer number of minutes.
             ///
             /// ## Example
             ///
@@ -530,11 +536,11 @@ impl Duration {
             /// let minutes = duration.as_minutes();
             /// # {after_snippet}
             /// ```
-            #[call(to_minutes)]
+            #[call(as_minutes)]
             pub const fn as_minutes(&self) -> u64;
 
             #[procmacros::doc_replace]
-            /// Convert the `Duration` to an interger number of hours.
+            /// Convert the `Duration` to an integer number of hours.
             ///
             /// ## Example
             ///
@@ -545,7 +551,7 @@ impl Duration {
             /// let hours = duration.as_hours();
             /// # {after_snippet}
             /// ```
-            #[call(to_hours)]
+            #[call(as_hours)]
             pub const fn as_hours(&self) -> u64;
         }
     }
@@ -711,14 +717,22 @@ impl core::ops::Div<Duration> for Duration {
     }
 }
 
+#[inline]
+pub(crate) fn now() -> Instant {
+    let ticks = implem::raw_counter();
+    let micros = implem::ticks_to_us(ticks);
+
+    Instant::from_ticks(micros)
+}
+
 #[cfg(esp32)]
 pub(crate) mod implem {
-    use super::Instant;
     use crate::peripherals::TIMG0;
 
     #[cfg(feature = "rt")]
     pub(crate) fn time_init() {
-        let apb = crate::Clocks::get().apb_clock.as_hz();
+        // FIXME: does this imply that clock management needs to be "rt", too?
+        let apb = crate::soc::clocks::apb_clk_frequency();
 
         let tg0 = TIMG0::regs();
 
@@ -737,7 +751,7 @@ pub(crate) mod implem {
     }
 
     #[inline]
-    pub(super) fn now() -> Instant {
+    pub(crate) fn raw_counter() -> u64 {
         // on ESP32 use LACT
         let tg0 = TIMG0::regs();
         tg0.lactupdate().write(|w| unsafe { w.update().bits(1) });
@@ -756,15 +770,58 @@ pub(crate) mod implem {
         };
         let hi = tg0.lacthi().read().bits();
 
-        let ticks = ((hi as u64) << 32u64) | lo as u64;
+        ((hi as u64) << 32u64) | lo as u64
+    }
 
-        Instant::from_ticks(ticks / 16)
+    #[inline]
+    pub(crate) fn ticks_to_us(ticks: u64) -> u64 {
+        ticks / 16
+    }
+
+    #[inline]
+    #[cfg(sleep_light_sleep)]
+    pub(crate) fn us_to_ticks(counter: u64) -> u64 {
+        counter * 16
+    }
+
+    /// Callers must ensure this function is not called concurrently.
+    #[inline]
+    #[cfg(sleep_light_sleep)]
+    pub(crate) unsafe fn update_counter(counter: u64) {
+        // On ESP32 the monotonic counter is the LACT timer of TIMG0. To set its
+        // value we stage the new 64-bit count in the load registers and then
+        // trigger a software reload, which copies the staged value into the
+        // counter immediately.
+        //
+        // A manual `LACTLOAD` while the timer is running (`en = 1`) is silently
+        // dropped when executed from the AppCpu, leaving the monotonic clock stuck
+        // (this is why the post-light-sleep time correction is lost on AppCpu). We
+        // therefore disable the timer around the load (preserving the divider) and
+        // re-enable it afterwards, mirroring `time_init`. Callers run this with
+        // interrupts disabled and the other core parked, so the brief disable is
+        // safe from concurrent reads.
+        let tg0 = TIMG0::regs();
+
+        let divider = tg0.lactconfig().read().divider().bits();
+        tg0.lactconfig().write(|w| unsafe { w.bits(0) });
+
+        tg0.lactloadhi()
+            .write(|w| unsafe { w.load_hi().bits((counter >> 32) as u32) });
+        tg0.lactloadlo()
+            .write(|w| unsafe { w.load_lo().bits(counter as u32) });
+        tg0.lactload().write(|w| unsafe { w.load().bits(1) });
+
+        tg0.lactconfig().write(|w| {
+            unsafe { w.divider().bits(divider) };
+            w.increase().bit(true);
+            w.autoreload().bit(true);
+            w.en().bit(true)
+        });
     }
 }
 
-#[cfg(soc_has_systimer)]
+#[cfg(systimer_driver_supported)]
 pub(crate) mod implem {
-    use super::Instant;
     use crate::timer::systimer::{SystemTimer, Unit};
 
     #[cfg(feature = "rt")]
@@ -773,11 +830,27 @@ pub(crate) mod implem {
     }
 
     #[inline]
-    pub(super) fn now() -> Instant {
-        let ticks = SystemTimer::unit_value(Unit::Unit0);
+    pub(crate) fn raw_counter() -> u64 {
+        SystemTimer::unit_value(Unit::Unit0)
+    }
 
-        let micros = SystemTimer::ticks_to_us(ticks);
+    #[inline]
+    pub(crate) fn ticks_to_us(ticks: u64) -> u64 {
+        SystemTimer::ticks_to_us(ticks)
+    }
 
-        Instant::from_ticks(micros)
+    #[inline]
+    #[cfg(sleep_light_sleep)]
+    pub(crate) fn us_to_ticks(counter: u64) -> u64 {
+        SystemTimer::us_to_ticks(counter)
+    }
+
+    /// Callers must ensure this function is not called concurrently.
+    #[inline]
+    #[cfg(sleep_light_sleep)]
+    pub(crate) unsafe fn update_counter(counter: u64) {
+        unsafe {
+            SystemTimer::set_unit_value(Unit::Unit0, counter);
+        }
     }
 }

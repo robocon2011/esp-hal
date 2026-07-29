@@ -35,8 +35,6 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
         return;
     }
 
-    use core::alloc::GlobalAlloc;
-
     unsafe {
         let ptr = ptr.offset(-4);
         let total_size = *(ptr as *const usize);
@@ -100,18 +98,14 @@ unsafe fn realloc_with_caps(
     new_size: usize,
     caps: enumset::EnumSet<crate::MemoryCapability>,
 ) -> *mut u8 {
-    unsafe extern "C" {
-        fn memcpy(d: *mut u8, s: *const u8, l: usize);
-    }
-
     unsafe {
         let p = malloc_with_caps(new_size, caps);
         if !p.is_null() && !ptr.is_null() {
             let len = usize::min(
-                (ptr as *const u32).sub(1).read_volatile() as usize,
+                (ptr as *const u32).sub(1).read_volatile() as usize - 4,
                 new_size,
             );
-            memcpy(p, ptr, len);
+            p.copy_from_nonoverlapping(ptr, len);
             free(ptr);
         }
         p

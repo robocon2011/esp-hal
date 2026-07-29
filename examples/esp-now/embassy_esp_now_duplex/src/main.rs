@@ -3,6 +3,8 @@
 //! Asynchronously broadcasts, receives and sends messages via esp-now in
 //! multiple embassy tasks
 
+//% CHIP_FILTER: wifi_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -37,7 +39,7 @@ macro_rules! mk_static {
     }};
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -50,13 +52,12 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     let wifi = peripherals.WIFI;
-    let (mut controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();
-    controller
-        .set_mode(esp_radio::wifi::WifiMode::Station)
-        .unwrap();
-    controller.start().unwrap();
+    let controller = mk_static!(
+        esp_radio::wifi::WifiController<'static>,
+        esp_radio::wifi::WifiController::new(wifi, Default::default()).unwrap()
+    );
 
-    let esp_now = interfaces.esp_now;
+    let esp_now = controller.esp_now();
     esp_now.set_channel(11).unwrap();
 
     println!("esp-now version {}", esp_now.version().unwrap());
@@ -68,8 +69,8 @@ async fn main(spawner: Spawner) -> ! {
         Mutex::<NoopRawMutex, _>::new(sender)
     );
 
-    spawner.spawn(listener(manager, receiver)).ok();
-    spawner.spawn(broadcaster(sender)).ok();
+    spawner.spawn(listener(manager, receiver).unwrap());
+    spawner.spawn(broadcaster(sender).unwrap());
 
     let mut ticker = Ticker::every(Duration::from_millis(500));
     loop {

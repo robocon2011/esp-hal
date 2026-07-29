@@ -10,7 +10,7 @@
 //! Depending on your target and the board you are using you have to change the
 //! pins.
 
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: i2c_master_driver_supported
 //% TAG: bmp180
 
 #![no_std]
@@ -28,7 +28,7 @@ use esp_hal::{
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);

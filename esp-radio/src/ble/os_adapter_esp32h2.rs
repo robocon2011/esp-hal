@@ -3,19 +3,13 @@ use procmacros::BuilderLite;
 use super::*;
 use crate::{
     ble::InvalidConfigError,
-    hal::{
-        clock::ModemClockController,
-        interrupt,
-        peripherals::{BT, Interrupt},
-    },
+    hal::{interrupt, peripherals::BT},
+    interrupt_dispatch::Handler,
     sys::include::esp_bt_controller_config_t,
 };
 
-pub(crate) static mut ISR_INTERRUPT_15: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
-
-pub(crate) static mut ISR_INTERRUPT_3: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
+static ISR_INTERRUPT_3: Handler = Handler::new();
+static ISR_INTERRUPT_15: Handler = Handler::new();
 
 /// Transmission Power Level
 #[derive(Default, Clone, Copy, Eq, PartialEq)]
@@ -224,8 +218,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // same priority as the wifi task, when using esp-rtos (I'm assuming it's MAX_PRIO - 2)
-            task_priority: 29,
+            task_priority: crate::preempt::max_task_priority()
+                .saturating_sub(2)
+                .min(255) as u8,
             task_stack_size: CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE as _,
             max_connections: CONFIG_BT_LE_MAX_CONNECTIONS as _,
             qa_test_mode: false,
@@ -260,6 +255,12 @@ impl Default for Config {
 
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), InvalidConfigError> {
+        crate::ble::validate_range!(
+            self,
+            task_priority,
+            0,
+            crate::preempt::max_task_priority().min(255) as u8
+        );
         crate::ble::validate_range!(self, max_connections, 1, 35);
         crate::ble::validate_range!(self, ll_rsp_dup_list_count, 1, 100);
         crate::ble::validate_range!(self, ll_adv_dup_list_count, 1, 100);
@@ -324,7 +325,7 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         ignore_wl_for_direct_adv: 0,
         cpu_freq_mhz: 96,
         enable_pcl: 0,
-        // version_num: Efuse::minor_chip_version(),
+        // version_num: esp_hal::efuse::minor_chip_version(),
         csa2_select: CONFIG_BT_LE_50_FEATURE_SUPPORT as _,
         enable_csr: 0,
         ble_aa_check: config.verify_access_address as u8,
@@ -342,15 +343,16 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         ch39_txpwr: 9,
         adv_rsv_cnt: 1,
         conn_rsv_cnt: 2,
+        priority_level_cfg: 1 << 4 | 1 << 2,
+        slv_fst_rx_lat_en: 0,
+        dl_itvl_phy_sync_en: 0,
+        scan_allow_adi_filter: 0,
         config_magic: CONFIG_MAGIC,
     }
 }
 
 pub(crate) fn bt_periph_module_enable() {
-    // stealing BT is safe, since it is passed into the initialization function of the BLE
-    // controller.
-    let mut bt = unsafe { BT::steal() };
-    bt.enable_modem_clock(true);
+    crate::radio_clocks::clocks_ll::enable_bt(true);
 }
 
 pub(crate) fn disable_sleep_mode() {
@@ -369,24 +371,16 @@ pub(super) unsafe extern "C" fn esp_intr_alloc(
         source, flags, handler, arg, ret_handle
     );
 
-    unsafe {
-        match source {
-            3 => {
-                ISR_INTERRUPT_3 = (handler, arg);
-                unwrap!(interrupt::enable(
-                    Interrupt::LP_BLE_TIMER,
-                    interrupt::Priority::Priority1
-                ));
-            }
-            15 => {
-                ISR_INTERRUPT_15 = (handler, arg);
-                unwrap!(interrupt::enable(
-                    Interrupt::BT_MAC,
-                    interrupt::Priority::Priority1
-                ));
-            }
-            _ => panic!("Unexpected interrupt source {}", source),
-        }
+    match source {
+        3 => unsafe {
+            ISR_INTERRUPT_3.set(handler, arg);
+            BT::steal().enable_lp_timer_interrupt(interrupt::Priority::Priority1);
+        },
+        15 => unsafe {
+            ISR_INTERRUPT_15.set(handler, arg);
+            BT::steal().enable_mac_interrupt(interrupt::Priority::Priority1);
+        },
+        _ => panic!("Unexpected interrupt source {}", source),
     }
 
     0
@@ -395,6 +389,28 @@ pub(super) unsafe extern "C" fn esp_intr_alloc(
 pub(super) fn ble_rtc_clk_init() {
     // stealing BT is safe, since it is passed into the initialization function of the BLE
     // controller.
-    let mut bt = unsafe { BT::steal() };
-    bt.ble_rtc_clk_init();
+    crate::radio_clocks::clocks_ll::ble_rtc_clk_init();
+}
+
+pub(super) unsafe extern "C" fn reset_modem(_mdl_opts: u8, _start: u8) {
+    todo!()
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn LP_BLE_TIMER() {
+    ISR_INTERRUPT_3.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn BT_MAC() {
+    ISR_INTERRUPT_15.dispatch();
+}
+
+pub(crate) fn shutdown_ble_isr() {
+    unsafe {
+        BT::steal().disable_lp_timer_interrupt_on_all_cores();
+        BT::steal().disable_mac_interrupt_on_all_cores();
+    }
 }

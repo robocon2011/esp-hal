@@ -10,6 +10,23 @@ pub(crate) struct Changelog {
 }
 
 impl Changelog {
+    /// Create an empty changelog with a single empty `Unreleased` section.
+    pub fn empty() -> Self {
+        Self {
+            entries: vec![ChangelogForVersion {
+                version: "Unreleased".to_string(),
+                date: None,
+                tag: None,
+                groups: vec![
+                    ChangelogGroup::new("Added"),
+                    ChangelogGroup::new("Changed"),
+                    ChangelogGroup::new("Fixed"),
+                    ChangelogGroup::new("Removed"),
+                ],
+            }],
+        }
+    }
+
     /// Parse the changelog, normalizing it in the process.
     pub fn parse(changelog: &str) -> Result<Self> {
         let mut lines = changelog.lines().peekable();
@@ -43,6 +60,63 @@ impl Changelog {
         }
 
         Ok(this)
+    }
+
+    /// Add a new entry to the `Unreleased` section.
+    ///
+    /// `group` must be one of `"Added"`, `"Changed"`, `"Fixed"`, `"Removed"`.
+    /// If the `Unreleased` section does not yet exist it is created.
+    pub fn add_entry(&mut self, group: &str, text: &str, pr: u64) {
+        let unreleased =
+            if let Some(e) = self.entries.iter_mut().find(|e| e.version == "Unreleased") {
+                e
+            } else {
+                self.entries.insert(
+                    0,
+                    ChangelogForVersion {
+                        version: "Unreleased".to_string(),
+                        date: None,
+                        tag: None,
+                        groups: vec![
+                            ChangelogGroup::new("Added"),
+                            ChangelogGroup::new("Changed"),
+                            ChangelogGroup::new("Fixed"),
+                            ChangelogGroup::new("Removed"),
+                        ],
+                    },
+                );
+                &mut self.entries[0]
+            };
+
+        let target_group = if let Some(g) = unreleased.groups.iter_mut().find(|g| g.name == group) {
+            g
+        } else {
+            let name = match group {
+                "Added" => "Added",
+                "Changed" => "Changed",
+                "Fixed" => "Fixed",
+                "Removed" => "Removed",
+                _ => return,
+            };
+            unreleased.groups.push(ChangelogGroup::new(name));
+            unreleased.groups.last_mut().unwrap()
+        };
+
+        target_group.lines.push(ChangelogLine {
+            indentation: 0,
+            line: text.to_string(),
+            prs: vec![pr as usize],
+        });
+    }
+
+    /// Return the `Unreleased` section formatted as it would appear in the
+    /// changelog, or `None` if there is no `Unreleased` section with content.
+    pub fn format_unreleased(&self) -> Option<String> {
+        let unreleased = self.entries.iter().find(|e| e.version == "Unreleased")?;
+        if unreleased.groups.iter().all(|g| g.lines.is_empty()) {
+            return None;
+        }
+        Some(unreleased.to_string())
     }
 
     /// Finalize the changelog for a new release.
@@ -545,6 +619,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.0]: https://github.com/esp-rs/esp-hal/releases/tag/v0.1.0
 [v0.2.0]: https://github.com/esp-rs/esp-hal/compare/v0.1.0...esp-hal-v0.2.0
 [Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v0.2.0...HEAD
+";
+
+        pretty_assertions::assert_eq!(changelog.to_string(), expected);
+    }
+
+    #[test]
+    fn test_add_entry_then_finalize_lands_in_version_section() {
+        // Regression test for the ordering bug in PR #5642.
+        let mut changelog = Changelog::parse(
+            "## [Unreleased]
+
+### Fixed
+
+- Pre-existing fix (#10)
+
+## [v1.1.0] - 2025-09-19
+
+[v1.1.0]: https://github.com/esp-rs/esp-hal/releases/tag/esp-hal-v1.1.0
+",
+        )
+        .unwrap();
+
+        changelog.add_entry("Added", "New API", 20);
+        changelog.add_entry("Changed", "Renamed thing", 21);
+        changelog.add_entry("Removed", "Old API", 22);
+
+        changelog.finalize(
+            Package::EspHal,
+            &semver::Version::new(1, 1, 1),
+            "2025-11-05 08:36-04".parse().unwrap(),
+        );
+
+        let expected = "# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+
+### Changed
+
+
+### Fixed
+
+
+### Removed
+
+
+## [v1.1.1] - 2025-11-05
+
+### Fixed
+
+- Pre-existing fix (#10)
+
+### Added
+
+- New API (#20)
+
+### Changed
+
+- Renamed thing (#21)
+
+### Removed
+
+- Old API (#22)
+
+## [v1.1.0] - 2025-09-19
+
+[v1.1.0]: https://github.com/esp-rs/esp-hal/releases/tag/esp-hal-v1.1.0
+[v1.1.1]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.1.0...esp-hal-v1.1.1
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-hal-v1.1.1...HEAD
 ";
 
         pretty_assertions::assert_eq!(changelog.to_string(), expected);

@@ -3,7 +3,7 @@
 //! code.
 //!
 //! Reproduction and regression test for a sneaky issue.
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: timergroup_driver_supported
 //% FEATURES: unstable embassy
 
 #![no_std]
@@ -203,10 +203,10 @@ mod timers_executors {
         }
 
         let spawner_int = executor.start(Priority::Priority3);
-        spawner_int.must_spawn(test_interrupt_executor_invoker());
+        spawner_int.spawn(test_interrupt_executor_invoker().unwrap());
 
         let spawner = embassy_executor::SendSpawner::for_current_executor().await;
-        spawner.must_spawn(e_task30ms());
+        spawner.spawn(e_task30ms().unwrap());
 
         // The test ends once the interrupt executor's task has finished
         loop {}
@@ -348,7 +348,7 @@ mod interrupt_executor {
         let response = mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
         let spawner = interrupt_executor.start(Priority::Priority3);
-        spawner.must_spawn(responder_task(signal, response));
+        spawner.spawn(responder_task(signal, response).unwrap());
 
         let thread_executor = mk_static!(Executor, Executor::new());
 
@@ -363,7 +363,7 @@ mod interrupt_executor {
 
         thread_executor.run_with_callbacks(
             |spawner| {
-                spawner.must_spawn(tester_task(signal, response));
+                spawner.spawn(tester_task(signal, response).unwrap());
             },
             callbacks,
         )
@@ -377,11 +377,11 @@ mod interrupt_executor {
         let response = mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
         let spawner = interrupt_executor.start(Priority::Priority3);
-        spawner.must_spawn(responder_task(signal, response));
+        spawner.spawn(responder_task(signal, response).unwrap());
 
         let thread_executor = mk_static!(Executor, Executor::new());
         thread_executor.run(|spawner| {
-            spawner.must_spawn(tester_task(signal, response));
+            spawner.spawn(tester_task(signal, response).unwrap());
         })
     }
 
@@ -398,12 +398,12 @@ mod interrupt_executor {
 
             let spawner = interrupt_executor.start(Priority::Priority3);
 
-            spawner.spawn(responder_task(signal, response)).unwrap();
+            spawner.spawn(responder_task(signal, response).unwrap());
         });
 
         let thread_executor = mk_static!(Executor, Executor::new());
         thread_executor.run(|spawner| {
-            spawner.must_spawn(tester_task_multi_core(signal, response));
+            spawner.spawn(tester_task_multi_core(signal, response).unwrap());
         })
     }
 
@@ -417,25 +417,25 @@ mod interrupt_executor {
         esp_rtos::start_second_core(ctx.cpu_control, ctx.sw_int1, app_core_stack, || {
             let executor = mk_static!(Executor, Executor::new());
             executor.run(|spawner| {
-                spawner.spawn(responder_task(signal, response)).ok();
+                spawner.spawn(responder_task(signal, response).unwrap());
             });
         });
 
         let thread_executor = mk_static!(Executor, Executor::new());
         thread_executor.run(|spawner| {
-            spawner.must_spawn(tester_task_multi_core(signal, response));
+            spawner.spawn(tester_task_multi_core(signal, response).unwrap());
         })
     }
 }
 
-#[cfg(any(esp32, esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+#[cfg(any(soc_has_spi3, soc_has_i2s0))]
 #[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
 mod interrupt_spi_dma {
     use embassy_time::{Duration, Instant, Timer};
     use esp_hal::{
         Blocking,
-        dma::{DmaRxBuf, DmaTxBuf},
-        dma_buffers,
+        dma_rx_buffer,
+        dma_tx_buffer,
         interrupt::{Priority, software::SoftwareInterruptControl},
         spi::{
             Mode,
@@ -451,12 +451,11 @@ mod interrupt_spi_dma {
     static STOP_INTERRUPT_TASK: AtomicBool = AtomicBool::new(false);
     static INTERRUPT_TASK_WORKING: AtomicBool = AtomicBool::new(false);
 
-    #[cfg(any(esp32, esp32s2, esp32s3))]
+    #[cfg(soc_has_spi3)]
     #[embassy_executor::task]
     async fn interrupt_driven_task(spi: esp_hal::spi::master::SpiDma<'static, Blocking>) {
-        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(128);
-        let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-        let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+        let dma_rx_buf = dma_rx_buffer!(128).unwrap();
+        let dma_tx_buf = dma_tx_buffer!(128).unwrap();
 
         let mut spi = spi.with_buffers(dma_rx_buf, dma_tx_buf).into_async();
 
@@ -475,18 +474,20 @@ mod interrupt_spi_dma {
         }
     }
 
-    #[cfg(not(any(esp32, esp32s2, esp32s3)))]
+    #[cfg(not(soc_has_spi3))]
     #[embassy_executor::task]
     async fn interrupt_driven_task(i2s_tx: esp_hal::i2s::master::I2s<'static, Blocking>) {
-        let (_, _, _, tx_descriptors) = dma_buffers!(128);
+        use esp_hal::dma_tx_stream_buffer;
 
-        let mut i2s_tx = i2s_tx.into_async().i2s_tx.build(tx_descriptors);
+        let mut buffer = dma_tx_stream_buffer!(1024, 256);
+
+        let mut i2s_tx = i2s_tx.into_async().i2s_tx.build();
 
         loop {
-            let mut buffer: [u8; 8] = [0; 8];
-
             INTERRUPT_TASK_WORKING.store(true, portable_atomic::Ordering::Relaxed);
-            i2s_tx.write_dma_async(&mut buffer).await.unwrap();
+            let res;
+            (res, i2s_tx, buffer) = i2s_tx.write(buffer).ok().unwrap().wait_async().await;
+            assert!(res.is_ok(), "I2S write transfer failed: {:?}", res.err());
             INTERRUPT_TASK_WORKING.store(false, portable_atomic::Ordering::Relaxed);
 
             if STOP_INTERRUPT_TASK.load(portable_atomic::Ordering::Relaxed) {
@@ -505,19 +506,18 @@ mod interrupt_spi_dma {
         let timg0 = TimerGroup::new(peripherals.TIMG0);
         esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-        cfg_if::cfg_if! {
-            if #[cfg(any(feature = "esp32", feature = "esp32s2"))] {
-                let dma_channel1 = peripherals.DMA_SPI2;
-                let dma_channel2 = peripherals.DMA_SPI3;
-            } else {
-                let dma_channel1 = peripherals.DMA_CH0;
-                let dma_channel2 = peripherals.DMA_CH1;
+        let (dma_channel1, dma_channel2) = cfg_select! {
+            spi_master_dma_engine = "SPI_DMA" => {
+                (peripherals.DMA_SPI2, peripherals.DMA_SPI3)
             }
-        }
+            spi_master_dma_engine = "AXI_GDMA" => {
+                (peripherals.DMA_AXI_CH0, peripherals.DMA_AXI_CH1)
+            }
+            _ => (peripherals.DMA_CH0, peripherals.DMA_CH1),
+        };
 
-        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(1024);
-        let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-        let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+        let dma_rx_buf = dma_rx_buffer!(1024).unwrap();
+        let dma_tx_buf = dma_tx_buffer!(1024).unwrap();
 
         let (_, mosi) = hil_test::common_test_pins!(peripherals);
 
@@ -534,7 +534,7 @@ mod interrupt_spi_dma {
         .with_buffers(dma_rx_buf, dma_tx_buf)
         .into_async();
 
-        #[cfg(any(esp32, esp32s2, esp32s3))]
+        #[cfg(soc_has_spi3)]
         let other_peripheral = Spi::new(
             peripherals.SPI3,
             Config::default()
@@ -544,11 +544,11 @@ mod interrupt_spi_dma {
         .unwrap()
         .with_dma(dma_channel2);
 
-        #[cfg(not(any(esp32, esp32s2, esp32s3)))]
+        #[cfg(not(soc_has_spi3))]
         let other_peripheral = esp_hal::i2s::master::I2s::new(
             peripherals.I2S0,
             dma_channel2,
-            esp_hal::i2s::master::Config::new_tdm_philips()
+            esp_hal::i2s::master::TdmConfig::new_tdm_philips()
                 .with_sample_rate(Rate::from_khz(8))
                 .with_data_format(esp_hal::i2s::master::DataFormat::Data16Channel16)
                 .with_channels(esp_hal::i2s::master::Channels::STEREO),
@@ -562,9 +562,7 @@ mod interrupt_spi_dma {
 
         let spawner = interrupt_executor.start(Priority::Priority3);
 
-        spawner
-            .spawn(interrupt_driven_task(other_peripheral))
-            .unwrap();
+        spawner.spawn(interrupt_driven_task(other_peripheral).unwrap());
 
         let start = Instant::now();
         let mut buffer: [u8; 1024] = [0; 1024];
@@ -599,13 +597,17 @@ mod interrupt_spi_dma {
             system::{Cpu, CpuControl, Stack},
         };
 
-        cfg_if::cfg_if! {
-            if #[cfg(pdma)] {
-                type DmaChannel<'a> = esp_hal::peripherals::DMA_SPI2<'a>;
-            } else {
-                type DmaChannel<'a> = esp_hal::peripherals::DMA_CH0<'a>;
-            }
-        }
+        type DmaChannel<'a> = cfg_select! {
+            spi_master_dma_engine = "SPI_DMA" => {
+                esp_hal::peripherals::DMA_SPI2<'a>
+            },
+            spi_master_dma_engine = "AHB_GDMA" => {
+                esp_hal::peripherals::DMA_CH0<'a>
+            },
+            spi_master_dma_engine = "AXI_GDMA" => {
+                esp_hal::peripherals::DMA_AXI_CH0<'a>
+            },
+        };
 
         const BUFFER_SIZE: usize = 256;
 
@@ -619,9 +621,8 @@ mod interrupt_spi_dma {
             peripherals: SpiPeripherals,
             finished: &'static Signal<CriticalSectionRawMutex, ()>,
         ) {
-            let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(3200);
-            let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-            let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+            let dma_rx_buf = dma_rx_buffer!(3200).unwrap();
+            let dma_tx_buf = dma_tx_buffer!(3200).unwrap();
 
             let mut spi = Spi::new(
                 peripherals.spi,
@@ -650,13 +651,11 @@ mod interrupt_spi_dma {
         let timg0 = TimerGroup::new(peripherals.TIMG0);
         esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-        cfg_if::cfg_if! {
-            if #[cfg(pdma)] {
-                let dma_channel = peripherals.DMA_SPI2;
-            } else {
-                let dma_channel = peripherals.DMA_CH0;
-            }
-        }
+        let dma_channel = cfg_select! {
+            spi_master_dma_engine = "SPI_DMA" => peripherals.DMA_SPI2,
+            spi_master_dma_engine = "AHB_GDMA" => peripherals.DMA_CH0,
+            spi_master_dma_engine = "AXI_GDMA" => peripherals.DMA_AXI_CH0,
+        };
 
         let transfer_finished = &*mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
@@ -681,9 +680,7 @@ mod interrupt_spi_dma {
                 let high_pri_spawner = hp_executor.start(Priority::Priority2);
 
                 // spi runs as high priority task
-                high_pri_spawner
-                    .spawn(run_spi(spi_peripherals, transfer_finished))
-                    .ok();
+                high_pri_spawner.spawn(run_spi(spi_peripherals, transfer_finished).unwrap());
             },
         );
 

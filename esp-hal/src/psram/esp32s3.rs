@@ -1,7 +1,22 @@
-use super::PsramSize;
-use crate::peripherals::{EXTMEM, IO_MUX, SPI0, SPI1};
+use core::ops::Range;
 
-const EXTMEM_ORIGIN: u32 = 0x3C000000;
+use super::{EXTMEM_ORIGIN, PsramSize};
+use crate::peripherals::{EXTMEM, IO_MUX, MMU_TABLE, SPI0, SPI1};
+
+/// PSRAM interface mode
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PsramMode {
+    /// Try to detect the PSRAM mode. While convenient, not entirely reliable.
+    #[default]
+    Auto,
+
+    /// The PSRAM is connected via Quad SPI.
+    QuadSpi,
+
+    /// The PSRAM is connected via Octal SPI.
+    OctalSpi,
+}
 
 /// Frequency of flash memory
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -22,7 +37,6 @@ pub enum FlashFreq {
 /// Frequency of PSRAM memory
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[allow(missing_docs)]
 pub enum SpiRamFreq {
     /// PSRAM frequency 40 MHz
     #[default]
@@ -53,6 +67,8 @@ pub enum SpiTimingConfigCoreClock {
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PsramConfig {
+    /// PSRAM interface mode
+    pub mode: PsramMode,
     /// PSRAM size
     pub size: PsramSize,
     /// Core timing configuration
@@ -64,34 +80,33 @@ pub struct PsramConfig {
 }
 
 /// Initialize PSRAM to be used for data.
-///
-/// Returns the start of the mapped memory and the size
 #[procmacros::ram]
-pub(crate) fn init_psram(config: PsramConfig) {
-    let mut config = config;
+pub(crate) fn init_psram(config: &mut PsramConfig) -> bool {
+    let success = match config.mode {
+        PsramMode::Auto => {
+            let mut success = octal_spi_impl::psram_init(config);
 
-    if config.core_clock.is_none() {
-        cfg_if::cfg_if! {
-            if #[cfg(psram_mode_octal)] {
-                config.core_clock = Some(if config.ram_frequency == SpiRamFreq::Freq80m {
-                    SpiTimingConfigCoreClock::SpiTimingConfigCoreClock160m
-                } else if config.ram_frequency == SpiRamFreq::Freq120m {
-                    SpiTimingConfigCoreClock::SpiTimingConfigCoreClock240m
-                } else {
-                    SpiTimingConfigCoreClock::SpiTimingConfigCoreClock80m
-                });
-            } else {
-                config.core_clock = Some( if config.ram_frequency == SpiRamFreq::Freq120m {
-                    SpiTimingConfigCoreClock::SpiTimingConfigCoreClock120m
-                } else {
-                    SpiTimingConfigCoreClock::SpiTimingConfigCoreClock80m
-                });
+            if !success {
+                success = quad_spi_impl::psram_init(config);
             }
+
+            success
         }
+        PsramMode::QuadSpi => quad_spi_impl::psram_init(config),
+        PsramMode::OctalSpi => octal_spi_impl::psram_init(config),
+    };
+
+    if !success {
+        warn!(
+            "Failed to configure PSRAM. This may indicate a missing/inoperable PSRAM chip, or an incorrect PSRAM configuration. Check if the PSRAM chip is present and the configuration is correct."
+        );
     }
 
-    utils::psram_init(&mut config);
+    success
+}
 
+#[procmacros::ram]
+pub(crate) fn map_psram(config: PsramConfig) -> Range<usize> {
     const MMU_ACCESS_SPIRAM: u32 = 1 << 15;
     const START_PAGE: u32 = 0;
 
@@ -118,70 +133,63 @@ pub(crate) fn init_psram(config: PsramConfig) {
         ) -> i32;
     }
 
-    let start = unsafe {
-        const MMU_PAGE_SIZE: u32 = 0x10000;
-        const ICACHE_MMU_SIZE: usize = 0x800;
-        const FLASH_MMU_TABLE_SIZE: usize = ICACHE_MMU_SIZE / core::mem::size_of::<u32>();
-        const MMU_INVALID: u32 = 1 << 14;
-        const DR_REG_MMU_TABLE: u32 = 0x600C5000;
+    const MMU_PAGE_SIZE: u32 = property!("mmu.page_size");
 
-        // calculate the PSRAM start address to map
-        // the linker scripts can produce a gap between mapped IROM and DROM segments
-        // bigger than a flash page - i.e. we will see an unmapped memory slot
-        // start from the end and find the last mapped flash page
-        //
-        // More general information about the MMU can be found here:
-        // https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/system/mm.html#introduction
-        let mmu_table_ptr = DR_REG_MMU_TABLE as *const u32;
-        let mut mapped_pages = 0;
+    fn mmu_entry_is_valid(entry_id: usize) -> bool {
+        !MMU_TABLE::regs().entry(entry_id).read().invalid().bit()
+    }
 
-        // the bootloader is using the last page to access flash internally
-        // (e.g. to read the app descriptor) so we just skip that
-        for i in (0..(FLASH_MMU_TABLE_SIZE - 1)).rev() {
-            if mmu_table_ptr.add(i).read_volatile() != MMU_INVALID {
-                mapped_pages = (i + 1) as u32;
-                break;
-            }
+    // calculate the PSRAM start address to map
+    // the linker scripts can produce a gap between mapped IROM and DROM segments
+    // bigger than a flash page - i.e. we will see an unmapped memory slot
+    // start from the end and find the last mapped flash page
+    //
+    // More general information about the MMU can be found here:
+    // https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/system/mm.html#introduction
+    let mut mapped_pages = 0;
+
+    // the bootloader is using the last page to access flash internally
+    // (e.g. to read the app descriptor) so we just skip that
+    let flash_mmu_table_size: usize = MMU_TABLE::regs().entry_iter().count();
+    for i in (0..(flash_mmu_table_size - 1)).rev() {
+        if mmu_entry_is_valid(i) {
+            mapped_pages = (i + 1) as u32;
+            break;
         }
-        let start = EXTMEM_ORIGIN + (MMU_PAGE_SIZE * mapped_pages);
-        debug!("PSRAM start address = {:x}", start);
+    }
+    let start = EXTMEM_ORIGIN as u32 + (MMU_PAGE_SIZE * mapped_pages);
+    debug!("PSRAM start address = {:x}", start);
 
-        // If we need use SPIRAM, we should use data cache.
-        Cache_Suspend_DCache();
+    // If we need use SPIRAM, we should use data cache.
+    unsafe { Cache_Suspend_DCache() };
 
-        let cache_dbus_mmu_set_res = cache_dbus_mmu_set(
+    let cache_dbus_mmu_set_res = unsafe {
+        cache_dbus_mmu_set(
             MMU_ACCESS_SPIRAM,
             start,
             START_PAGE << 16,
             64,
             config.size.get() as u32 / 1024 / 64, // number of pages to map
             0,
-        );
-
-        EXTMEM::regs().dcache_ctrl1().modify(|_, w| {
-            w.dcache_shut_core0_bus()
-                .clear_bit()
-                .dcache_shut_core1_bus()
-                .clear_bit()
-        });
-
-        Cache_Resume_DCache(0);
-
-        // panic AFTER resuming the cache
-        if cache_dbus_mmu_set_res != 0 {
-            panic!("cache_dbus_mmu_set failed");
-        }
-
-        start
+        )
     };
 
-    unsafe {
-        super::MAPPED_PSRAM.memory_range = start as usize..start as usize + config.size.get();
+    EXTMEM::regs().dcache_ctrl1().modify(|_, w| {
+        w.dcache_shut_core0_bus().clear_bit();
+        w.dcache_shut_core1_bus().clear_bit()
+    });
+
+    unsafe { Cache_Resume_DCache(0) };
+
+    // panic AFTER resuming the cache
+    if cache_dbus_mmu_set_res != 0 {
+        panic!("cache_dbus_mmu_set failed");
     }
+
+    start as usize..start as usize + config.size.get()
 }
 
-#[cfg(psram_mode_quad)]
-pub(crate) mod utils {
+pub(crate) mod quad_spi_impl {
     use procmacros::ram;
 
     use super::*;
@@ -192,7 +200,7 @@ pub(crate) mod utils {
     const CS_PSRAM_SEL: u8 = 1 << 1;
 
     #[ram]
-    pub(crate) fn psram_init(config: &mut super::PsramConfig) {
+    pub(crate) fn psram_init(config: &mut PsramConfig) -> bool {
         psram_gpio_config();
         psram_set_cs_timing();
 
@@ -215,32 +223,44 @@ pub(crate) mod utils {
                 CS_PSRAM_SEL, // cs bit mask
                 false,
             );
+            if dev_id == 0xffffff {
+                debug!(
+                    "Unknown PSRAM chip ID: {:x}. PSRAM chip not found or not supported. Check if the interface mode is configured correctly.",
+                    dev_id
+                );
+                return false;
+            }
+
             info!("chip id = {:x}", dev_id);
 
-            let size = if dev_id != 0xffffff {
-                const PSRAM_ID_EID_S: u32 = 16;
-                const PSRAM_ID_EID_M: u32 = 0xff;
-                const PSRAM_EID_SIZE_M: u32 = 0x07;
-                const PSRAM_EID_SIZE_S: u32 = 5;
+            const PSRAM_ID_EID_S: u32 = 16;
+            const PSRAM_ID_EID_M: u32 = 0xff;
+            const PSRAM_EID_SIZE_M: u32 = 0x07;
+            const PSRAM_EID_SIZE_S: u32 = 5;
 
-                let size_id = ((((dev_id) >> PSRAM_ID_EID_S) & PSRAM_ID_EID_M) >> PSRAM_EID_SIZE_S)
-                    & PSRAM_EID_SIZE_M;
+            let size_id = ((((dev_id) >> PSRAM_ID_EID_S) & PSRAM_ID_EID_M) >> PSRAM_EID_SIZE_S)
+                & PSRAM_EID_SIZE_M;
 
-                const PSRAM_EID_SIZE_32MBITS: u32 = 1;
-                const PSRAM_EID_SIZE_64MBITS: u32 = 2;
+            const PSRAM_EID_SIZE_32MBITS: u32 = 1;
+            const PSRAM_EID_SIZE_64MBITS: u32 = 2;
 
-                match size_id {
-                    PSRAM_EID_SIZE_64MBITS => 64 / 8 * 1024 * 1024,
-                    PSRAM_EID_SIZE_32MBITS => 32 / 8 * 1024 * 1024,
-                    _ => 16 / 8 * 1024 * 1024,
-                }
-            } else {
-                0
+            let size = match size_id {
+                PSRAM_EID_SIZE_64MBITS => 64 / 8 * 1024 * 1024,
+                PSRAM_EID_SIZE_32MBITS => 32 / 8 * 1024 * 1024,
+                _ => 16 / 8 * 1024 * 1024,
             };
 
             info!("size is {}", size);
 
             config.size = PsramSize::Size(size);
+        }
+
+        if config.core_clock.is_none() {
+            config.core_clock = Some(if config.ram_frequency == SpiRamFreq::Freq120m {
+                SpiTimingConfigCoreClock::SpiTimingConfigCoreClock120m
+            } else {
+                SpiTimingConfigCoreClock::SpiTimingConfigCoreClock80m
+            });
         }
 
         // SPI1: send psram reset command
@@ -257,6 +277,9 @@ pub(crate) mod utils {
         // Back to the high speed mode. Flash/PSRAM clocks are set to the clock that
         // user selected. SPI0/1 registers are all set correctly
         mspi_timing_enter_high_speed_mode(true, config);
+
+        info!("PSRAM initialized successfully in Quad SPI mode");
+        true
     }
 
     const PSRAM_CS_IO: u8 = 26;
@@ -762,8 +785,7 @@ pub(crate) mod utils {
     }
 }
 
-#[cfg(psram_mode_octal)]
-pub(crate) mod utils {
+pub(crate) mod octal_spi_impl {
     use procmacros::ram;
 
     use super::*;
@@ -1053,7 +1075,7 @@ pub(crate) mod utils {
     }
 
     #[ram]
-    pub(crate) fn psram_init(config: &mut PsramConfig) {
+    pub(crate) fn psram_init(config: &mut PsramConfig) -> bool {
         mspi_pin_init();
         init_psram_pins();
         set_psram_cs_timing();
@@ -1087,11 +1109,11 @@ pub(crate) mod utils {
         print_psram_info(&mode_reg);
 
         if mode_reg.vendor_id() != OCT_PSRAM_VENDOR_ID {
-            warn!(
-                "PSRAM ID read error: {:x}, PSRAM chip not found or not supported, or wrong PSRAM line mode",
+            debug!(
+                "Unknown PSRAM vendor ID: {:x}. PSRAM chip not found or not supported. Check if the interface mode is configured correctly.",
                 mode_reg.vendor_id()
             );
-            return;
+            return false;
         }
 
         let psram_size = match mode_reg.density() {
@@ -1104,6 +1126,15 @@ pub(crate) mod utils {
         };
         info!("{} bytes of PSRAM", psram_size);
 
+        if config.core_clock.is_none() {
+            config.core_clock = Some(if config.ram_frequency == SpiRamFreq::Freq80m {
+                SpiTimingConfigCoreClock::SpiTimingConfigCoreClock160m
+            } else if config.ram_frequency == SpiRamFreq::Freq120m {
+                SpiTimingConfigCoreClock::SpiTimingConfigCoreClock240m
+            } else {
+                SpiTimingConfigCoreClock::SpiTimingConfigCoreClock80m
+            });
+        }
         if config.size.is_auto() {
             config.size = PsramSize::Size(psram_size);
         }
@@ -1126,6 +1157,9 @@ pub(crate) mod utils {
         // spi_flash_set_vendor_required_regs();
 
         config_psram_spi_phases();
+
+        info!("PSRAM initialized successfully in Octal SPI mode");
+        true
     }
 
     // Configure PSRAM SPI0 phase related registers here according to the PSRAM chip

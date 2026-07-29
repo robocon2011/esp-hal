@@ -27,7 +27,7 @@ use crate::InternalMemory;
 use crate::wait_queue::WaitQueue;
 use crate::{
     SCHEDULER,
-    run_queue::{Priority, RunQueue},
+    run_queue::{Priority, RunQueue, RunSchedulerOn},
     scheduler::SchedulerState,
 };
 
@@ -390,6 +390,50 @@ pub(crate) struct Task {
     pub(crate) heap_allocated: bool,
 }
 
+pub(crate) trait ContextExt {
+    fn set_tp(&mut self, tp: u32);
+
+    fn sp(&self) -> u32;
+
+    fn set_sp(&mut self, sp: u32);
+}
+
+impl ContextExt for CpuContext {
+    fn set_tp(&mut self, tp: u32) {
+        cfg_select! {
+            xtensa => {
+                self.THREADPTR = tp;
+            }
+            riscv => {
+                self.tp = tp as usize;
+            }
+            _ => {}
+        }
+    }
+
+    fn sp(&self) -> u32 {
+        cfg_select! {
+            xtensa => {
+                self.A1
+            }
+            _ => {
+                self.sp as u32
+            }
+        }
+    }
+
+    fn set_sp(&mut self, sp: u32) {
+        cfg_select! {
+            xtensa => {
+                self.A1 = sp;
+            }
+            _ => {
+                self.sp = sp as usize;
+            }
+        }
+    }
+}
+
 #[cfg(feature = "esp-radio")]
 extern "C" fn task_wrapper(task_fn: extern "C" fn(*mut c_void), param: *mut c_void) {
     task_fn(param);
@@ -497,7 +541,7 @@ impl Task {
         }
     }
 
-    pub(crate) fn ensure_no_stack_overflow(&self) {
+    pub(crate) fn ensure_no_stack_overflow(&self, _sp: usize) {
         #[cfg(sw_task_overflow_detection)]
         assert_eq!(
             // This cast is safe to do from MaybeUninit<u32> because this is the word we've written
@@ -507,6 +551,22 @@ impl Task {
             "Stack overflow detected in {:?}",
             self as *const Task
         );
+
+        #[cfg(stack_pointer_range_check)]
+        {
+            let len = self.stack.len();
+            let data_ptr = self.stack.cast::<MaybeUninit<u32>>();
+            let stack_bottom = data_ptr as usize;
+            let stack_top = data_ptr.wrapping_add(len) as usize;
+            assert!(
+                _sp > stack_bottom && _sp <= stack_top,
+                "Stack overflow detected in {:?}. Stack pointer: {:x}, Task stack range: {:x} ..= {:x}",
+                self as *const Task,
+                _sp,
+                stack_bottom,
+                stack_top
+            );
+        }
     }
 
     pub(crate) fn set_up_stack_watchpoint(&self) {
@@ -574,13 +634,10 @@ pub(super) fn allocate_main_task(
     // part of a static object so taking the pointer is fine.
     let main_task_ptr = NonNull::from(&scheduler.per_cpu[current_cpu].main_task);
 
-    cfg_if::cfg_if! {
-        if #[cfg(xtensa)] {
-            scheduler.per_cpu[current_cpu].main_task.cpu_context.THREADPTR = main_task_ptr.as_ptr() as u32;
-        } else if #[cfg(riscv)] {
-            scheduler.per_cpu[current_cpu].main_task.cpu_context.tp = main_task_ptr.as_ptr() as usize;
-        }
-    }
+    scheduler.per_cpu[current_cpu]
+        .main_task
+        .cpu_context
+        .set_tp(main_task_ptr.as_ptr() as u32);
 
     write_thread_pointer(main_task_ptr.as_ptr());
 
@@ -649,6 +706,26 @@ pub(super) fn schedule_task_deletion(task: Option<NonNull<Task>>) {
     }
 }
 
+pub(crate) fn trigger_scheduler(run_scheduler: RunSchedulerOn) {
+    match run_scheduler {
+        RunSchedulerOn::DontRun => {}
+        RunSchedulerOn::RunOnCore(_core) => {
+            cfg_select! {
+                multi_core => {
+                    if _core == Cpu::current() {
+                        yield_task()
+                    } else {
+                        schedule_other_core()
+                    }
+                }
+                _ => {
+                    yield_task()
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 #[cfg(multi_core)]
 pub(crate) fn schedule_other_core() {
@@ -657,7 +734,4 @@ pub(crate) fn schedule_other_core() {
         Cpu::ProCpu => unsafe { SoftwareInterrupt::<'static, 1>::steal() }.raise(),
         Cpu::AppCpu => unsafe { SoftwareInterrupt::<'static, 0>::steal() }.raise(),
     }
-
-    // It takes a bit for the software interrupt to be serviced, but since it's happening on the
-    // other core, we don't need to wait.
 }

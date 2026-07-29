@@ -29,3 +29,9 @@ release_plan.jsonc
 
 # Ignore the generated semver baselines
 api-baseline/
+
+.mcp.json
+.cursor/
+
+# Ignore compile tests
+compile-tests/

@@ -4,7 +4,7 @@
 //! PINS
 //! GPIO4 for ADC1
 
-//% CHIPS: esp32c2 esp32c3 esp32c6 esp32h2
+//% CHIP_FILTER: adc_driver_supported && !esp32 && !esp32s2 && !esp32s3
 
 #![no_std]
 #![no_main]
@@ -17,6 +17,7 @@ use esp_hal::{
     Async,
     analog::adc::{
         Adc,
+        AdcCalBasic,
         AdcCalScheme,
         AdcChannel,
         AdcConfig,
@@ -31,6 +32,8 @@ use esp_hal::{
 };
 use esp_println::println;
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
 trait Sensor {
     async fn measure(&mut self) -> u16;
 }
@@ -40,24 +43,24 @@ trait Converter {
     fn raw_to_metering(raw_value: u16) -> u16;
 }
 
-pub struct AdcSensor<'d, ADCI, PIN, CS, MC> {
-    adc: Adc<'d, ADCI, Async>,
-    pin: AdcPin<PIN, ADCI, CS>,
+pub struct AdcSensor<'d, ADCX, PIN, CS, MC> {
+    adc: Adc<'d, ADCX, Async>,
+    pin: AdcPin<PIN, ADCX, CS>,
     _phantom: PhantomData<MC>,
 }
 
-impl<'d, ADCI, PIN, CS, MC> AdcSensor<'d, ADCI, PIN, CS, MC> {
-    pub fn new(adc: Adc<'d, ADCI, Async>, pin: AdcPin<PIN, ADCI, CS>) -> Self {
+impl<'d, ADCX, PIN, CS, MC> AdcSensor<'d, ADCX, PIN, CS, MC> {
+    pub fn new(adc: Adc<'d, ADCX, Async>, pin: AdcPin<PIN, ADCX, CS>) -> Self {
         let _phantom = PhantomData::<MC> {};
         Self { adc, pin, _phantom }
     }
 }
 
-impl<'d, ADCI, PIN, CS, MC> Sensor for AdcSensor<'d, ADCI, PIN, CS, MC>
+impl<'d, ADCX, PIN, CS, MC> Sensor for AdcSensor<'d, ADCX, PIN, CS, MC>
 where
-    ADCI: RegisterAccess + Instance + 'd,
+    ADCX: RegisterAccess + Instance + 'd,
     PIN: AdcChannel,
-    CS: AdcCalScheme<ADCI>,
+    CS: AdcCalScheme<ADCX>,
     MC: Converter,
 {
     async fn measure(&mut self) -> u16 {
@@ -76,7 +79,7 @@ impl Converter for Identity {
     }
 }
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -86,7 +89,11 @@ async fn main(_spawner: Spawner) {
 
     let mut adc1_config = AdcConfig::new();
     let analog_pin1 = peripherals.GPIO4;
-    let pin1 = adc1_config.enable_pin(analog_pin1, Attenuation::_11dB);
+    let pin1 = adc1_config
+        .enable_pin_with_cal::<_, AdcCalBasic<esp_hal::peripherals::ADC1<'static>>>(
+            analog_pin1,
+            Attenuation::_11dB,
+        );
     let adc1 = Adc::new(peripherals.ADC1, adc1_config).into_async();
     let mut id = AdcSensor::<_, _, _, Identity>::new(adc1, pin1);
 

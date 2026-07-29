@@ -19,9 +19,10 @@ use crate::TraceEvents;
 #[cfg(feature = "embassy")]
 use crate::timer::embassy::TimerQueue;
 use crate::{
-    run_queue::{Priority, RunQueue, RunSchedulerOn},
+    run_queue::{Priority, RunQueue},
     task::{
         self,
+        ContextExt,
         CpuContext,
         IdleFn,
         Task,
@@ -45,9 +46,6 @@ pub(crate) struct SchedulerState {
     /// A list of tasks ready to run
     pub(crate) run_queue: RunQueue,
 
-    /// Pointer to the task that is scheduled for deletion.
-    pub(crate) to_delete: TaskList<TaskDeleteListElement>,
-
     pub(crate) time_driver: Option<TimeDriver>,
 
     pub(crate) per_cpu: [CpuState; Cpu::COUNT],
@@ -64,6 +62,9 @@ pub(crate) struct CpuState {
     #[cfg(multi_core)]
     current_task: *mut Task,
 
+    /// Pointer to the task that is scheduled for deletion.
+    pub(crate) to_delete: TaskList<TaskDeleteListElement>,
+
     // This context will be filled out by the first context switch.
     // We allocate the main task statically, because there is always a main task. If deleted, we
     // simply don't deallocate this.
@@ -75,6 +76,7 @@ impl CpuState {
         Self {
             initialized: false,
             idle_context: CpuContext::new(),
+            to_delete: TaskList::new(),
 
             #[cfg(multi_core)]
             current_task: core::ptr::null_mut(),
@@ -117,7 +119,6 @@ impl SchedulerState {
         Self {
             all_tasks: TaskList::new(),
             run_queue: RunQueue::new(),
-            to_delete: TaskList::new(),
 
             time_driver: None,
 
@@ -137,12 +138,6 @@ impl SchedulerState {
     pub(crate) fn set_current_task(&mut self, cpu: Cpu, task: Option<TaskPtr>) {
         self.per_cpu[cpu as usize].current_task =
             task.map(|task| task.as_ptr()).unwrap_or_default();
-    }
-
-    #[inline]
-    #[cfg(multi_core)]
-    pub(crate) fn try_get_current_task(&self, cpu: Cpu) -> Option<TaskPtr> {
-        NonNull::new(self.per_cpu[cpu as usize].current_task)
     }
 
     pub(crate) fn setup(&mut self, time_driver: TimeDriver, idle_hook: IdleFn) {
@@ -180,24 +175,19 @@ impl SchedulerState {
         task.heap_allocated = true;
         let mut task_ptr = NonNull::from(Box::leak(task));
 
-        cfg_if::cfg_if! {
-            if #[cfg(xtensa)] {
-                unsafe { task_ptr.as_mut().cpu_context.THREADPTR = task_ptr.as_ptr() as u32; }
-            } else if #[cfg(riscv)] {
-                unsafe { task_ptr.as_mut().cpu_context.tp = task_ptr.as_ptr() as usize; }
-            }
-        }
+        unsafe {
+            task_ptr
+                .as_mut()
+                .cpu_context
+                .set_tp(task_ptr.as_ptr() as u32)
+        };
 
         #[cfg(feature = "rtos-trace")]
         rtos_trace::trace::task_new(task_ptr.rtos_trace_id());
 
         self.all_tasks.push(task_ptr);
-        match self.run_queue.mark_task_ready(&self.per_cpu, task_ptr) {
-            RunSchedulerOn::DontRun => {}
-            RunSchedulerOn::CurrentCore => task::yield_task(),
-            #[cfg(multi_core)]
-            RunSchedulerOn::OtherCore => task::schedule_other_core(),
-        }
+        let run_scheduler = self.run_queue.mark_task_ready(&self.per_cpu, task_ptr);
+        task::trigger_scheduler(run_scheduler);
 
         debug!("Task '{}' created: {:?}", name, task_ptr);
 
@@ -206,21 +196,9 @@ impl SchedulerState {
 
     #[cold]
     #[inline(never)]
-    fn delete_marked_tasks(&mut self) {
-        let mut to_delete = core::mem::take(&mut self.to_delete);
-
-        while let Some(task_ptr) = to_delete.pop() {
+    fn delete_marked_tasks(&mut self, cpu: Cpu) {
+        while let Some(task_ptr) = self.per_cpu[cpu as usize].to_delete.pop() {
             assert!(task_ptr.state() == TaskState::Deleted);
-
-            #[cfg(multi_core)]
-            if Cpu::other()
-                .filter_map(|cpu| self.try_get_current_task(cpu))
-                .any(|task| task == task_ptr)
-            {
-                // We can't delete a task that is currently running on another CPU.
-                self.to_delete.push(task_ptr);
-                continue;
-            }
 
             trace!("delete_marked_tasks {:?}", task_ptr);
             self.delete_task(task_ptr);
@@ -231,16 +209,30 @@ impl SchedulerState {
         #[cfg(feature = "rtos-trace")]
         rtos_trace::trace::marker_begin(TraceEvents::RunSchedule as u32);
 
-        if !self.to_delete.is_empty() {
-            self.delete_marked_tasks();
-        }
-
         let cpu = Cpu::current();
         let current_cpu = cpu as usize;
 
+        if !self.per_cpu[cpu as usize].to_delete.is_empty() {
+            self.delete_marked_tasks(cpu);
+        }
+
+        let current_sp: u32;
+        cfg_select! {
+            xtensa => {
+                unsafe { core::arch::asm!("mov {0}, sp", out(reg) current_sp); }
+            }
+            _ => {
+                unsafe { core::arch::asm!("mv {0}, sp", out(reg) current_sp); }
+            }
+        }
+
         let current_task = NonNull::new(read_thread_pointer());
         if let Some(current_task) = current_task {
-            unsafe { current_task.as_ref().ensure_no_stack_overflow() };
+            unsafe {
+                current_task
+                    .as_ref()
+                    .ensure_no_stack_overflow(current_sp as usize)
+            };
 
             if current_task.state() == TaskState::Ready {
                 // Current task is still ready, mark it as such.
@@ -296,20 +288,11 @@ impl SchedulerState {
                 // be pinned to the current CPU. If we're switching out the main task, however, we
                 // can't rely on its saved context - use the current stack pointer which will still
                 // point to the right stack, just to another place we can use within it.
-                let idle_sp = if current_context.is_null()
-                    || current_context == &raw mut self.per_cpu[current_cpu].main_task.cpu_context
+                let idle_sp = if current_context
+                    == &raw mut self.per_cpu[current_cpu].main_task.cpu_context
                 {
                     // We're using the current task's stack, for which the watchpoint is already set
                     // up.
-
-                    let current_sp;
-                    cfg_if::cfg_if! {
-                        if #[cfg(xtensa)] {
-                            unsafe { core::arch::asm!("mov {0}, sp", out(reg) current_sp); }
-                        } else {
-                            unsafe { core::arch::asm!("mv {0}, sp", out(reg) current_sp); }
-                        }
-                    }
                     current_sp
                 } else {
                     // We're using the main task's stack.
@@ -317,22 +300,10 @@ impl SchedulerState {
                         .main_task
                         .set_up_stack_watchpoint();
 
-                    cfg_if::cfg_if! {
-                        if #[cfg(xtensa)] {
-                            self.per_cpu[current_cpu].main_task.cpu_context.A1
-                        } else {
-                            self.per_cpu[current_cpu].main_task.cpu_context.sp
-                        }
-                    }
+                    self.per_cpu[current_cpu].main_task.cpu_context.sp()
                 };
 
-                cfg_if::cfg_if! {
-                    if #[cfg(xtensa)] {
-                        self.per_cpu[current_cpu].idle_context.A1 = idle_sp;
-                    } else {
-                        self.per_cpu[current_cpu].idle_context.sp = idle_sp;
-                    }
-                }
+                self.per_cpu[current_cpu].idle_context.set_sp(idle_sp);
 
                 #[cfg(feature = "rtos-trace")]
                 rtos_trace::trace::system_idle();
@@ -381,7 +352,9 @@ impl SchedulerState {
 
         if is_current {
             if task_to_delete.state() != TaskState::Deleted {
-                self.to_delete.push(task_to_delete);
+                self.per_cpu[Cpu::current() as usize]
+                    .to_delete
+                    .push(task_to_delete);
                 task_to_delete.set_state(TaskState::Deleted);
             }
 
@@ -403,16 +376,22 @@ impl SchedulerState {
         let timer_queue = unwrap!(self.time_driver.as_mut());
         timer_queue.timer_queue.remove(task);
 
-        match self.run_queue.mark_task_ready(&self.per_cpu, task) {
-            RunSchedulerOn::DontRun => {}
-            RunSchedulerOn::CurrentCore => task::yield_task(),
-            #[cfg(multi_core)]
-            RunSchedulerOn::OtherCore => task::schedule_other_core(),
-        }
+        let run_scheduler = self.run_queue.mark_task_ready(&self.per_cpu, task);
+        task::trigger_scheduler(run_scheduler);
     }
 
     fn delete_task(&mut self, mut to_delete: TaskPtr) {
-        unsafe { to_delete.as_ref().ensure_no_stack_overflow() };
+        unsafe {
+            cfg_select! {
+                xtensa => {
+                    let saved_sp = to_delete.as_ref().cpu_context.A1 as usize;
+                }
+                _ => {
+                    let saved_sp = to_delete.as_ref().cpu_context.sp;
+                }
+            }
+            to_delete.as_ref().ensure_no_stack_overflow(saved_sp)
+        };
 
         debug!("Dropping task: {:x}", to_delete.as_ptr() as usize);
         unsafe {
@@ -445,10 +424,11 @@ impl SchedulerState {
             let task = unsafe { task.as_ref() };
             let in_queue = task.in_run_or_wait_queue;
 
-            cfg_if::cfg_if! {
-                if #[cfg(feature = "esp-radio")] {
+            cfg_select! {
+                feature = "esp-radio" => {
                     let in_waitqueue = task.current_wait_queue.is_some();
-                } else {
+                }
+                _ => {
                     let in_waitqueue = false;
                 }
             }
@@ -469,6 +449,12 @@ impl SchedulerState {
         if task_in_run_queue {
             self.resume_task(task);
         }
+    }
+
+    #[cfg(all(multi_core, sleep_light_sleep))]
+    pub(crate) fn cpu_idle(&self, cpu: Cpu) -> bool {
+        let per_cpu = &self.per_cpu[cpu as usize];
+        !per_cpu.initialized || per_cpu.current_task.is_null()
     }
 }
 

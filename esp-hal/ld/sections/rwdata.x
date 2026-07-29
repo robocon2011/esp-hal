@@ -13,6 +13,10 @@
     *(.rodata..Lanon .rodata..Lanon.*)
   #ENDIF
 
+  #IF ESP_HAL_CONFIG_USE_RWDATA_LD_HOOK
+    INCLUDE "rwdata_hook.x"
+  #ENDIF
+
   *(.sdata .sdata.* .sdata2 .sdata2.*);
   *(.data .data.*);
   *(.data1)
@@ -57,4 +61,6 @@ _sidata = LOADADDR(.data);
   *(.noinit .noinit.*)
   *(.uninit .uninit.*)
   . = ALIGN(4);
+
+  _noinit_end = .;
 } > RWDATA

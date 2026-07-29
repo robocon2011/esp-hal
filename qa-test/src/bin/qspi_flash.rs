@@ -16,13 +16,21 @@
 //! - IO3  => GPIO13
 //! - CS   => GPIO14
 //!
+//! The following wiring is assumed for ESP32-P4:
+//! - SCLK => GPIO3
+//! - MISO => GPIO2
+//! - MOSI => GPIO4
+//! - IO2  => GPIO5
+//! - IO3  => GPIO6
+//! - CS   => GPIO8
+//!
 //! Depending on your target and the board you are using you have to change the
 //! pins.
 //!
 //! Connect a flash chip (GD25Q64C was used) and make sure QE in the status
 //! register is set.
 
-//% CHIPS: esp32 esp32c2 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: spi_master_supports_dma
 //% TAG: flashchip
 
 #![no_std]
@@ -31,8 +39,8 @@
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
-    dma::{DmaRxBuf, DmaTxBuf},
-    dma_buffers,
+    dma_rx_buffer,
+    dma_tx_buffer,
     main,
     spi::{
         Mode,
@@ -48,35 +56,41 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "esp32")] {
-            let sclk = peripherals.GPIO12;
-            let miso = peripherals.GPIO2;
-            let mosi = peripherals.GPIO4;
-            let sio2 = peripherals.GPIO5;
-            let sio3 = peripherals.GPIO13;
-            let cs = peripherals.GPIO14;
-        } else {
-            let sclk = peripherals.GPIO0;
-            let miso = peripherals.GPIO1;
-            let mosi = peripherals.GPIO2;
-            let sio2 = peripherals.GPIO3;
-            let sio3 = peripherals.GPIO4;
-            let cs = peripherals.GPIO5;
-        }
-    }
+    let (sclk, miso, mosi, sio2, sio3, cs) = cfg_select! {
+        feature = "esp32" => (
+            peripherals.GPIO12,
+            peripherals.GPIO2,
+            peripherals.GPIO4,
+            peripherals.GPIO5,
+            peripherals.GPIO13,
+            peripherals.GPIO14,
+        ),
+        feature = "esp32p4" => (
+            peripherals.GPIO3,
+            peripherals.GPIO2,
+            peripherals.GPIO4,
+            peripherals.GPIO5,
+            peripherals.GPIO6,
+            peripherals.GPIO8,
+        ),
+        _ => (
+            peripherals.GPIO0,
+            peripherals.GPIO1,
+            peripherals.GPIO2,
+            peripherals.GPIO3,
+            peripherals.GPIO4,
+            peripherals.GPIO5,
+        ),
+    };
 
-    cfg_if::cfg_if! {
-        if #[cfg(any(feature = "esp32", feature = "esp32s2"))] {
-            let dma_channel = peripherals.DMA_SPI2;
-        } else {
-            let dma_channel = peripherals.DMA_CH0;
-        }
-    }
+    let dma_channel = cfg_select! {
+        spi_master_dma_engine = "SPI_DMA" => peripherals.DMA_SPI2,
+        spi_master_dma_engine = "AXI_GDMA" => peripherals.DMA_AXI_CH0,
+        _ => peripherals.DMA_CH0,
+    };
 
-    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(320, 256);
-    let mut dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-    let mut dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+    let mut dma_rx_buf = dma_rx_buffer!(320).unwrap();
+    let mut dma_tx_buf = dma_tx_buffer!(256).unwrap();
 
     let mut spi = Spi::new(
         peripherals.SPI2,
@@ -98,7 +112,7 @@ fn main() -> ! {
     // write enable
     dma_tx_buf.set_length(0);
     let transfer = spi
-        .half_duplex_write(
+        .half_duplex_write_buffer(
             DataMode::SingleTwoDataLines,
             Command::_8Bit(0x06, DataMode::SingleTwoDataLines),
             Address::None,
@@ -113,7 +127,7 @@ fn main() -> ! {
 
     // erase sector
     let transfer = spi
-        .half_duplex_write(
+        .half_duplex_write_buffer(
             DataMode::SingleTwoDataLines,
             Command::_8Bit(0x20, DataMode::SingleTwoDataLines),
             Address::_24Bit(0x000000, DataMode::SingleTwoDataLines),
@@ -128,7 +142,7 @@ fn main() -> ! {
 
     // write enable
     let transfer = spi
-        .half_duplex_write(
+        .half_duplex_write_buffer(
             DataMode::SingleTwoDataLines,
             Command::_8Bit(0x06, DataMode::SingleTwoDataLines),
             Address::None,
@@ -146,7 +160,7 @@ fn main() -> ! {
     dma_tx_buf.as_mut_slice().fill(b'!');
     dma_tx_buf.as_mut_slice()[0..][..5].copy_from_slice(&b"Hello"[..]);
     let transfer = spi
-        .half_duplex_write(
+        .half_duplex_write_buffer(
             DataMode::Quad,
             Command::_8Bit(0x32, DataMode::SingleTwoDataLines),
             Address::_24Bit(0x000000, DataMode::SingleTwoDataLines),
@@ -162,7 +176,7 @@ fn main() -> ! {
     loop {
         // quad fast read
         let transfer = spi
-            .half_duplex_read(
+            .half_duplex_read_buffer(
                 DataMode::Quad,
                 Command::_8Bit(0xeb, DataMode::SingleTwoDataLines),
                 Address::_32Bit(0x000000 << 8, DataMode::Quad),

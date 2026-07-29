@@ -16,8 +16,9 @@
 Bare-metal (`no_std`) hardware abstraction layer for Espressif devices. Currently supports the following devices:
 
 - ESP32 Series: _ESP32_
-- ESP32-C Series: _ESP32-C2, ESP32-C3, ESP32-C6_
+- ESP32-C Series: _ESP32-C2, ESP32-C3, ESP32-C5, ESP32-C6, ESP32-C61_
 - ESP32-H Series: _ESP32-H2_
+- ESP32-P Series: _ESP32-P4_
 - ESP32-S Series: _ESP32-S2, ESP32-S3_
 
 Additionally provides support for programming the low-power RISC-V cores found on the _ESP32-C6_, _ESP32-S2_, and _ESP32-S3_ via the [esp-lp-hal] package.
@@ -61,13 +62,28 @@ All active development will occur on `main`.
 
 We will only backport fixes to the _latest_ minor release in a major version. For example, this means we will apply patches (bug fixes) to `1.1.x` until `1.2.0` is released, at which point all patches are only backported to the `1.2.x` series of releases.
 
-If you are a user of `unstable` APIs, we will never push breaking changes in a patch release. However, `unstable` changes _will_ make there way into minor releases. This means that as an `unstable` user updating from `1.1.x` to `1.2.x` _may_ introduce breaking changes. If you depend on `unstable`, we recommend defining your esp-hal dependency as follows:
+If you are a user of `unstable` APIs, we will never push breaking changes in a patch release. However, `unstable` changes _will_ make their way into minor releases. This means that as an `unstable` user updating from `1.1.x` to `1.2.x` _may_ introduce breaking changes. If you depend on `unstable`, we recommend defining your esp-hal dependency as follows:
 
 ```toml
 esp-hal = { version = "~1.1" }
 ```
 
-Using the [`~` operator](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#tilde-requirements) will prevent cargo auto updating to minor versions, allowing you to use `cargo update` without the possiblity of breaking your project.
+Using the [`~` operator](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#tilde-requirements) will prevent cargo auto updating to minor versions, allowing you to use `cargo update` without the possibility of breaking your project.
+
+## Release policy
+
+We follow a few general guidelines regarding releases:
+
+- Releases happen organically alongside development rather than on a fixed schedule. The table below outlines our general approach to each release type and when one might be cut.
+- During the `rc` phase of a release:
+    - We aim to leave them in the wild for testing for at least one week per release.
+    - If a considerable change (like a new addition) is added, we must extend the `rc` by at least another release.
+
+| Release Type | Cadence    | Pre-release Requirement                         |
+| ------------ | ---------- | ----------------------------------------------- |
+| Patch        | Frequent   | None                                            |
+| Minor        | Periodic   | `rc` release required                           |
+| Major        | Infrequent | Full pre-release cycle (`alpha` may be skipped) |
 
 ## AI Contribution Policy
 

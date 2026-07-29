@@ -2,6 +2,8 @@
 //!
 //! Sniffs for beacon frames.
 
+//% CHIP_FILTER: wifi_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -18,19 +20,17 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     interrupt::software::SoftwareInterruptControl,
-    main,
     timer::timg::TimerGroup,
 };
 use esp_println::println;
-use esp_radio::wifi;
 use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static KNOWN_SSIDS: Mutex<RefCell<BTreeSet<String>>> = Mutex::new(RefCell::new(BTreeSet::new()));
 
-#[main]
-fn main() -> ! {
+#[esp_hal::main]
+async fn main(_spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -41,14 +41,12 @@ fn main() -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // We must initialize some kind of interface and start it.
-    let (mut controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    // The sniffer borrows the controller, so we only need the controller here —
+    // no station/AP `Interface` is required for promiscuous capture.
+    let controller =
+        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default()).unwrap();
 
-    controller.set_mode(wifi::WifiMode::Station).unwrap();
-    controller.start().unwrap();
-
-    let mut sniffer = interfaces.sniffer;
+    let mut sniffer = controller.sniffer();
     sniffer.set_promiscuous_mode(true).unwrap();
     sniffer.set_receive_cb(|packet| {
         let _ = match_frames! {

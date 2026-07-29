@@ -18,7 +18,7 @@ cargo install probe-rs-tools \
   --force --locked
 ```
 
-Target device **MUST** connected via its USB-Serial-JTAG port, or if unavailable (eg. ESP32, ESP32-C2, ESP32-S2) then you must connect a compatible debug probe such as an [ESP-Prog].
+Target device **MUST** be connected via its USB-Serial-JTAG port, or if unavailable (eg. ESP32, ESP32-C2, ESP32-S2) then you must connect a compatible debug probe such as an [ESP-Prog].
 
 You can run all tests for a given device by running the following command from the workspace root:
 
@@ -46,7 +46,7 @@ Some tests will require physical connections, please see the current [configurat
 [ESP-Prog]: https://docs.espressif.com/projects/esp-dev-kits/en/latest/other/esp-prog/user_guide.html
 [configuration in our runners]: #running-tests-remotes-ie-on-self-hosted-runners
 
-### Running Tests Remotes (ie. on Self-Hosted Runners)
+### Running Tests Remotely (ie. on Self-Hosted Runners)
 The [`hil.yml`] workflow builds the test suite for all our available targets and executes them.
 
 Our self-hosted runners have the following setup:
@@ -72,7 +72,7 @@ Our self-hosted runners have the following setup:
     - `GPIO2` and `GPIO3` are connected.
   - RPi: Raspbian 12 configured with the following [setup]
 - ESP32-C61 (`esp32c61-usb`):
-  - Devkit: `ESP32-C61-DevKitC-1 V1.0` connected via USB-Serial-JTAG (`USB` port) and UART (`UART` port).
+  - Devkit: `ESP32-C61-DevKitC-1 V2.0` connected via USB-Serial-JTAG (`USB` port) and UART (`UART` port).
     - `GPIO6` and `GPIO7` are I2C pins.
     - `GPIO2` and `GPIO3` are connected.
   - RPi: Raspbian 12 configured with the following [setup]
@@ -82,9 +82,9 @@ Our self-hosted runners have the following setup:
     - `GPIO2` and `GPIO3` are connected.
   - RPi: Raspbian 12 configured with the following [setup]
 - ESP32-P4 (`esp32p4`):
-  - Devkit: `ESP32-P4 EV Board 1.5.2` connected via USB-Serial-JTAG (`USB` port).
+  - Devkit: `ESP32-P4 EV Board 1.6 (rev 3.1)` connected via USB-Serial-JTAG (`USB` port).
     - `GPIO2` and `GPIO3` are I2C pins.
-    - `GPIO7` and `GPIO8` are connected.
+    - `GPIO5` and `GPIO6` are connected.
   - RPi: Raspbian 12 configured with the following [setup]
 - ESP32-S2 (`esp32s2-jtag`):
   - Devkit: `ESP32-S2-Saola-1` connected via UART (`UART` port).
@@ -97,6 +97,12 @@ Our self-hosted runners have the following setup:
     - `GPIO2` and `GPIO3` are I2C pins.
     - `GPIO9` and `GPIO10` are connected.
   - RPi: Raspbian 12 configured with the following [setup]
+- ESP32-S31 (`esp32s31-jtag`):
+  - Devkit: `ESP32-S31_QFN80_Test_Board` connected via UART (`USB-UART` port).
+    - `GPIO6` and `GPIO7` are I2C pins.
+    - `GPIO2` and `GPIO3` are connected.
+  - Probe: `ESP-Prog` connected with the [following connections][connection_s31]
+  - RPi: Raspbian 12 configured with the following [setup]
 - ESP32 (`esp32-jtag`):
   - Devkit: `ESP32-DevKitC-V4` connected via UART (`UART` port).
     - `GPIO32` and `GPIO33` are I2C pins.
@@ -104,6 +110,7 @@ Our self-hosted runners have the following setup:
   - Probe: `ESP-Prog` connected with the [following connections][connection_esp32]
   - RPi: Raspbian 12 configured with the following [setup]
 
+[connection_s31]: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s31/api-guides/jtag-debugging/configure-other-jtag.html#configure-hardware
 [connection_c2]: https://docs.espressif.com/projects/esp-idf/en/stable/esp32c2/api-guides/jtag-debugging/configure-other-jtag.html#configure-hardware
 [connection_s2]: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-guides/jtag-debugging/configure-other-jtag.html#configure-hardware
 [connection_esp32]: https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/jtag-debugging/configure-other-jtag.html#configure-hardware.html#configure-hardware
@@ -137,16 +144,34 @@ sudo reboot
 ## Adding New Tests
 
 1. Create a new integration test file (`tests/$PERIPHERAL.rs`)
-2. Add a corresponding `[[test]]` entry to `Cargol.toml` (**MUST** set `harness = false`)
+2. Add a corresponding `[[test]]` entry to `Cargo.toml` (**MUST** set `harness = false`)
 3. Write the tests
 4. Document any necessary physical connections on boards connected to self-hosted runners
-5. Add a header in the test stating which targets support the given tests. Eg:
+5. Add a header in the test stating which targets support the given tests. The `//% CHIP_FILTER:`
+   line is a boolean expression evaluated per chip, where a symbol is either a chip name, a boolean
+   cfg name (exactly as it appears in `#[cfg(...)]`), or a key-value cfg name that can be compared
+   with `==` / `!=` and a quoted string. It supports `&&`, `||`, `!` and parentheses, so you
+   can do any of the following:
 ```rust
-//! AES Test
+//! Test Name
 
-//% CHIPS: esp32 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+// An explicit list of chips (OR them together):
+//% CHIP_FILTER: esp32 || esp32c3 || esp32c6 || esp32h2 || esp32s2 || esp32s3
+
+// Every chip whose driver/peripheral is supported (preferred — no need to touch this when a new
+// chip gains support):
+//% CHIP_FILTER: i2c_master_driver_supported
+
+// A capability, but excluding a chip that is otherwise capable yet incompatible with this test:
+//% CHIP_FILTER: spi_slave_supports_dma && !esp32
+
+// Combine capabilities and group with parentheses:
+//% CHIP_FILTER: adc_driver_supported && (esp32c6 || esp32h2)
+
+// Filter by a key-value cfg symbol (when a boolean flag is not enough):
+//% CHIP_FILTER: riscv && interrupt_controller != "clic"
 ```
-If the test is supported by all the targets, you can omit the header.
+If the test is supported by all the targets, you can omit the header. See [`xtask/README.md`](../xtask/README.md) for the full description of the metadata keys.
 
 6. Write some documentation at the top of the `tests/$PERIPHERAL.rs` file with the pins being used and the required connections, if applicable.
 
@@ -158,7 +183,7 @@ you want to run. Eg:
 ```rust
 //! AES Test
 
-//% CHIPS: esp32 esp32c3 esp32c6 esp32h2 esp32s2 esp32s3
+//% CHIP_FILTER: esp32 || esp32c3 || esp32c6 || esp32h2 || esp32s2 || esp32s3
 //% FEATURES: defmt
 ```
 

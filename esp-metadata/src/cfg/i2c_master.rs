@@ -5,6 +5,7 @@ use crate::{cfg::I2cMasterProperties, generate_for_each_macro};
 
 /// Instance configuration, used in [device.i2c_master.instances]
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct I2cMasterInstanceConfig {
     /// The name of the instance in the `esp_hal::system::Peripheral` enum
     pub sys_instance: String,
@@ -23,8 +24,11 @@ pub(crate) fn generate_i2c_master_peripherals(i2c: &I2cMasterProperties) -> Toke
     let i2c_master_instance_cfgs = i2c
         .instances
         .iter()
-        .map(|instance| {
+        .enumerate()
+        .map(|(index, instance)| {
             let instance_config = &instance.instance_config;
+
+            let id = crate::number(index);
 
             let instance = format_ident!("{}", instance.name.to_uppercase());
 
@@ -35,7 +39,7 @@ pub(crate) fn generate_i2c_master_peripherals(i2c: &I2cMasterProperties) -> Toke
             // The order and meaning of these tokens must match their use in the
             // `for_each_i2c_master!` call.
             quote! {
-                #instance, #sys, #scl, #sda
+                #id, #instance, #sys, #scl, #sda
             }
         })
         .collect::<Vec<_>>();
@@ -50,15 +54,15 @@ pub(crate) fn generate_i2c_master_peripherals(i2c: &I2cMasterProperties) -> Toke
         ///
         /// This macro has one option for its "Individual matcher" case:
         ///
-        /// Syntax: `($instance:ident, $sys:ident, $scl:ident, $sda:ident)`
+        /// Syntax: `($id:literal, $instance:ident, $sys:ident, $scl:ident, $sda:ident)`
         ///
         /// Macro fragments:
-        ///
+        /// - `$id`: the index of the I2C instance
         /// - `$instance`: the name of the I2C instance
         /// - `$sys`: the name of the instance as it is in the `esp_hal::system::Peripheral` enum.
         /// - `$scl`, `$sda`: peripheral signal names.
         ///
-        /// Example data: `(I2C0, I2cExt0, I2CEXT0_SCL, I2CEXT0_SDA)`
+        /// Example data: `(0, I2C0, I2cExt0, I2CEXT0_SCL, I2CEXT0_SDA)`
         #for_each
     }
 }

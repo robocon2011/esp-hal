@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 pub use self::calibration::*;
 use super::{AdcCalScheme, AdcCalSource, AdcChannel, AdcConfig, AdcPin, Attenuation};
 #[cfg(esp32s3)]
-use crate::efuse::{AdcCalibUnit, Efuse};
+use crate::efuse::AdcCalibUnit;
 use crate::{
     peripherals::{APB_SARADC, SENS},
     soc::regi2c,
@@ -15,49 +15,50 @@ mod calibration;
 
 pub(super) const NUM_ATTENS: usize = 10;
 
-cfg_if::cfg_if! {
-    if #[cfg(esp32s3)] {
+cfg_select! {
+    esp32s3 => {
         const ADC_VAL_MASK: u16 = 0xfff;
         const ADC_CAL_CNT_MAX: u16 = 32;
         const ADC_CAL_CHANNEL: u16 = 15;
     }
+    _ => {}
 }
 
-impl<ADCI> AdcConfig<ADCI>
+impl<ADCX> AdcConfig<ADCX>
 where
-    ADCI: RegisterAccess,
+    ADCX: RegisterAccess,
 {
     /// Calibrate ADC with specified attenuation and voltage source
     pub fn adc_calibrate(atten: Attenuation, source: AdcCalSource) -> u16
     where
-        ADCI: super::CalibrationAccess,
+        ADCX: super::CalibrationAccess,
     {
         let mut adc_max: u16 = 0;
         let mut adc_min: u16 = u16::MAX;
         let mut adc_sum: u32 = 0;
 
-        ADCI::enable_vdef(true);
+        ADCX::enable_vdef(true);
 
         // Start sampling
-        ADCI::set_en_pad(ADCI::ADC_CAL_CHANNEL as u8);
-        ADCI::set_attenuation(ADCI::ADC_CAL_CHANNEL as usize, atten as u8);
+        ADCX::set_en_pad(ADCX::ADC_CAL_CHANNEL as u8);
+        ADCX::set_attenuation(ADCX::ADC_CAL_CHANNEL as usize, atten as u8);
 
         // Connect calibration source
-        ADCI::connect_cal(source, true);
+        ADCX::connect_cal(source, true);
 
-        ADCI::calibration_init();
-        ADCI::set_init_code(0);
+        ADCX::calibration_init();
+        ADCX::set_init_code(0);
 
-        for _ in 0..ADCI::ADC_CAL_CNT_MAX {
+        for _ in 0..ADCX::ADC_CAL_CNT_MAX {
             // Trigger ADC sampling
-            ADCI::start_sample();
+            ADCX::start_sample();
 
-            // Wait until ADC1 sampling is done
-            while !ADCI::is_done() {}
+            // Wait until ADC sampling is done
+            while !ADCX::is_done() {}
 
-            let adc = ADCI::read_data() & ADCI::ADC_VAL_MASK;
+            let adc = ADCX::read_data() & ADCX::ADC_VAL_MASK;
 
-            ADCI::reset();
+            ADCX::reset();
 
             adc_sum += adc as u32;
             adc_max = adc.max(adc_max);
@@ -65,10 +66,10 @@ where
         }
 
         let cal_val =
-            (adc_sum - adc_max as u32 - adc_min as u32) as u16 / (ADCI::ADC_CAL_CNT_MAX - 2);
+            (adc_sum - adc_max as u32 - adc_min as u32) as u16 / (ADCX::ADC_CAL_CNT_MAX - 2);
 
         // Disconnect calibration source
-        ADCI::connect_cal(source, false);
+        ADCX::connect_cal(source, false);
 
         cal_val
     }
@@ -329,13 +330,13 @@ pub struct Adc<'d, ADC, Dm: crate::DriverMode> {
     _phantom: PhantomData<(Dm, &'d mut ())>,
 }
 
-impl<'d, ADCI> Adc<'d, ADCI, crate::Blocking>
+impl<'d, ADCX> Adc<'d, ADCX, crate::Blocking>
 where
-    ADCI: RegisterAccess + 'd,
+    ADCX: RegisterAccess + 'd,
 {
     /// Configure a given ADC instance using the provided configuration, and
     /// initialize the ADC for use
-    pub fn new(adc_instance: ADCI, config: AdcConfig<ADCI>) -> Self {
+    pub fn new(adc_instance: ADCX, config: AdcConfig<ADCX>) -> Self {
         let guard = GenericPeripheralGuard::new();
         let sensors = SENS::regs();
 
@@ -344,14 +345,14 @@ where
 
         for (channel, attenuation) in attenuations.iter().enumerate() {
             if let Some(attenuation) = attenuation {
-                ADCI::set_attenuation(channel, *attenuation as u8);
+                ADCX::set_attenuation(channel, *attenuation as u8);
             }
         }
 
         // Set controller to RTC
-        ADCI::clear_dig_force();
-        ADCI::set_start_force();
-        ADCI::set_en_pad_force();
+        ADCX::clear_dig_force();
+        ADCX::set_start_force();
+        ADCX::set_en_pad_force();
         sensors.sar_hall_ctrl().modify(|_, w| {
             w.xpd_hall_force().set_bit();
             w.hall_phase_force().set_bit()
@@ -401,19 +402,19 @@ where
 
     /// Start and wait for a conversion on the specified pin and return the
     /// result
-    pub fn read_blocking<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCI, CS>) -> u16
+    pub fn read_blocking<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCX, CS>) -> u16
     where
         PIN: AdcChannel,
-        CS: AdcCalScheme<ADCI>,
+        CS: AdcCalScheme<ADCX>,
     {
         self.start_sample(pin);
 
         // Wait for ADC to finish conversion
-        while !ADCI::is_done() {}
+        while !ADCX::is_done() {}
 
         // Get converted value
-        let converted_value = ADCI::read_data();
-        ADCI::reset();
+        let converted_value = ADCX::read_data();
+        ADCX::reset();
 
         // Postprocess converted value according to calibration scheme used for pin
         pin.cal_scheme.adc_val(converted_value)
@@ -426,11 +427,11 @@ where
     /// underlies the pin.
     pub fn read_oneshot<PIN, CS>(
         &mut self,
-        pin: &mut super::AdcPin<PIN, ADCI, CS>,
+        pin: &mut super::AdcPin<PIN, ADCX, CS>,
     ) -> nb::Result<u16, ()>
     where
         PIN: super::AdcChannel,
-        CS: super::AdcCalScheme<ADCI>,
+        CS: super::AdcCalScheme<ADCX>,
     {
         if let Some(active_channel) = self.active_channel {
             // There is conversion in progress:
@@ -447,14 +448,14 @@ where
         }
 
         // Wait for ADC to finish conversion
-        let conversion_finished = ADCI::is_done();
+        let conversion_finished = ADCX::is_done();
         if !conversion_finished {
             return Err(nb::Error::WouldBlock);
         }
 
         // Get converted value
-        let converted_value = ADCI::read_data();
-        ADCI::reset();
+        let converted_value = ADCX::read_data();
+        ADCX::reset();
 
         // Postprocess converted value according to calibration scheme used for pin
         let converted_value = pin.cal_scheme.adc_val(converted_value);
@@ -465,52 +466,52 @@ where
         Ok(converted_value)
     }
 
-    fn start_sample<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCI, CS>)
+    fn start_sample<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCX, CS>)
     where
         PIN: AdcChannel,
-        CS: AdcCalScheme<ADCI>,
+        CS: AdcCalScheme<ADCX>,
     {
         // Set ADC unit calibration according used scheme for pin
         let init_code = pin.cal_scheme.adc_cal();
         if self.last_init_code != init_code {
-            ADCI::calibration_init();
-            ADCI::set_init_code(init_code);
+            ADCX::calibration_init();
+            ADCX::set_init_code(init_code);
             self.last_init_code = init_code;
         }
 
-        ADCI::set_en_pad(pin.pin.adc_channel());
+        ADCX::set_en_pad(pin.pin.adc_channel());
 
-        ADCI::clear_start_sample();
-        ADCI::start_sample();
+        ADCX::clear_start_sample();
+        ADCX::start_sample();
     }
 }
 
 #[cfg(esp32s3)]
 impl super::AdcCalEfuse for crate::peripherals::ADC1<'_> {
     fn init_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_init_code(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_init_code(AdcCalibUnit::ADC1, atten)
     }
 
     fn cal_mv(atten: Attenuation) -> u16 {
-        Efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC1, atten)
     }
 
     fn cal_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_cal_code(AdcCalibUnit::ADC1, atten)
+        crate::efuse::rtc_calib_cal_code(AdcCalibUnit::ADC1, atten)
     }
 }
 
 #[cfg(esp32s3)]
 impl super::AdcCalEfuse for crate::peripherals::ADC2<'_> {
     fn init_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_init_code(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_init_code(AdcCalibUnit::ADC2, atten)
     }
 
     fn cal_mv(atten: Attenuation) -> u16 {
-        Efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_cal_mv(AdcCalibUnit::ADC2, atten)
     }
 
     fn cal_code(atten: Attenuation) -> Option<u16> {
-        Efuse::rtc_calib_cal_code(AdcCalibUnit::ADC2, atten)
+        crate::efuse::rtc_calib_cal_code(AdcCalibUnit::ADC2, atten)
     }
 }

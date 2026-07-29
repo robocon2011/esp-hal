@@ -9,8 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Initial support for ESP32-P4 (#5523, #5535)
+- Add ESP32-S31 support (#5922)
+
+### Changed
+
+
+### Fixed
+
+
+### Removed
+
+
+## [v0.3.0] - 2026-04-16
+
+### Added
+
 - Provide implementation for the `_getreent` syscall when the `alloc` feature is enabled (#4473)
 - Provide implementation for the `_malloc_r` and `_free_r` syscalls when the `alloc` feature is enabled (#4484)
+- Support for ESP32-C5 (#4884)
+- `ESP_RTOS_CONFIG_STACK_POINTER_RANGE_CHECK` to enable another way of stack-overflow detection. Enabled by default (#5227)
+- Support for ESP32-C61 (#5240)
 
 ### Changed
 
@@ -30,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a memory leak of 48 bytes when deleting esp-radio timers (#4541)
 - Fixed a rare crash on Xtensa MCUs (#4580, #4591)
 - RISC-V: the idle hook no longer prevents a debugger from reading memory (#4782)
+- Fixed a bug causing core 1 to not be able to wake up core 0 when started using `CpuControl::start_app_core` (#4890)
 
 ### Removed
 
@@ -66,4 +86,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v0.1.0]: https://github.com/esp-rs/esp-hal/releases/tag/esp-rtos-v0.1.0
 [v0.1.1]: https://github.com/esp-rs/esp-hal/compare/esp-rtos-v0.1.0...esp-rtos-v0.1.1
 [v0.2.0]: https://github.com/esp-rs/esp-hal/compare/esp-rtos-v0.1.1...esp-rtos-v0.2.0
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-rtos-v0.2.0...HEAD
+[v0.3.0]: https://github.com/esp-rs/esp-hal/compare/esp-rtos-v0.2.0...esp-rtos-v0.3.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-rtos-v0.3.0...HEAD

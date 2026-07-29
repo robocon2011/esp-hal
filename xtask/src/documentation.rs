@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs::{self, create_dir_all},
     io::Write,
     path::{Path, PathBuf},
@@ -8,18 +7,55 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use clap::ValueEnum;
 use esp_metadata::Config;
-use minijinja::Value;
 use serde::{Deserialize, Serialize};
+use somni_expr::somni_struct;
+use somni_template::{Env, Iter, SomniStruct, Syntax, Template, TemplateTypes};
 use strum::IntoEnumIterator;
 
-use crate::{Chip, Package, cargo::CargoArgsBuilder, windows_safe_path};
+use crate::{
+    Chip,
+    Package,
+    cargo::{CargoArgsBuilder, CargoCommandBatcher},
+    windows_safe_path,
+};
+
+/// A single row of template metadata (a struct value handed to the templates).
+type Meta = SomniStruct<TemplateTypes>;
 
 // ----------------------------------------------------------------------------
 // Build Documentation
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct Manifest {
-    versions: HashSet<semver::Version>,
+    versions: Vec<String>,
+}
+
+impl Manifest {
+    fn insert_version(&mut self, version: impl Into<String>) {
+        let version = version.into();
+        if !self.versions.contains(&version) {
+            self.versions.push(version);
+            self.normalize_versions();
+        }
+    }
+
+    fn normalize_versions(&mut self) {
+        self.versions.sort_by_key(|v| {
+            let trimmed = v.trim();
+            let semver = semver::Version::parse(trimmed).ok();
+            let rank = match trimmed.to_lowercase().as_str() {
+                "main" => 0,
+                "git" => 1,
+                _ => 2,
+            };
+            (
+                semver.is_none(),
+                std::cmp::Reverse(semver),
+                rank,
+                trimmed.to_lowercase(),
+            )
+        });
+    }
 }
 
 /// Build the documentation for the specified packages and chips.
@@ -65,7 +101,7 @@ pub fn build_documentation(
 
         // Update the package manifest to include the latest version:
         let version = crate::package_version(workspace, *package)?;
-        manifest.versions.insert(version.clone());
+        manifest.insert_version(version.to_string());
 
         // Build the documentation for the package:
         if chips.is_empty() {
@@ -76,9 +112,15 @@ pub fn build_documentation(
             }
         }
 
+        let package_output_path = output_path.join(package.to_string());
+
+        // Create the package subdirectory if it doesn't exist
+        fs::create_dir_all(&package_output_path)
+            .with_context(|| format!("Failed to create {}", package_output_path.display()))?;
+
         // Write out the package manifest JSON file:
         fs::write(
-            output_path.join(package.to_string()).join("manifest.json"),
+            package_output_path.join("manifest.json"),
             serde_json::to_string(&manifest)
                 .with_context(|| format!("Failed to parse {manifest:?}"))?,
         )
@@ -144,7 +186,9 @@ fn build_documentation_for_package(
         )
     })?;
 
-    // create "/latest" redirect - assuming that the current version is the latest
+    // create "/latest" redirect - assuming that the current version is the latest.
+    //
+    // Hosted docs rely on nginx to rewrite `/latest/...` deep links to `/latest/?path=...`.
     let latest_path = if package.chip_features_matter() {
         output_path
             .parent()
@@ -158,21 +202,38 @@ fn build_documentation_for_package(
     log::info!("Creating latest version redirect at {:?}", latest_path);
     create_dir_all(latest_path.clone())
         .with_context(|| format!("Failed to create dir in {}", latest_path.display()))?;
+    let latest_html = latest_redirect_html(workspace, package, &version)
+        .with_context(|| format!("Failed to render latest redirect for {}", package))?;
     std::fs::File::create(latest_path.clone().join("index.html"))?
-        .write_all(
-            format!(
-                "<meta http-equiv=\"refresh\" content=\"0; url=../{}/\" />",
-                if package.chip_features_matter() {
-                    version.to_string()
-                } else {
-                    format!("{}/{}", version, package.to_string().replace('-', "_"))
-                }
-            )
-            .as_bytes(),
-        )
+        .write_all(latest_html.as_bytes())
         .with_context(|| format!("Failed to create or write to {}", latest_path.display()))?;
 
     Ok(())
+}
+
+/// Relative URL from `latest/index.html` to this package's versioned docs root.
+fn latest_redirect_base(package: &Package, version: &semver::Version) -> String {
+    if package.chip_features_matter() {
+        format!("../{}/", version)
+    } else {
+        format!("../{}/{}/", version, package.to_string().replace('-', "_"))
+    }
+}
+
+/// Renders `latest/index.html`, which redirects into the semver docs.
+fn latest_redirect_html(
+    workspace: &Path,
+    package: &Package,
+    version: &semver::Version,
+) -> Result<String> {
+    let base = latest_redirect_base(package, version);
+    let resources_path = workspace.join("resources");
+
+    render_template(&resources_path, "latest_redirect.html.somni", {
+        let mut env = Env::new();
+        env.value("base", base.as_str());
+        env
+    })
 }
 
 fn cargo_doc(workspace: &Path, package: Package, chip: Option<Chip>) -> Result<PathBuf> {
@@ -228,14 +289,14 @@ fn cargo_doc_without_pre_processing(
     };
 
     let mut features = vec![];
-    let doc_features = if let Some(chip) = &chip {
+    let doc_config = if let Some(chip) = &chip {
         features.push(chip.to_string());
-        package.doc_feature_rules(Config::for_chip(chip))
+        package.doc_config_rules(Config::for_chip(chip))
     } else {
-        package.doc_feature_rules(&Config::empty())
+        package.doc_config_rules(&Config::empty())
     };
-    if let Some(doc_features) = doc_features {
-        features.extend(doc_features);
+    if let Some(doc_config) = &doc_config {
+        features.extend(doc_config.features.clone());
     }
 
     // Build up an array of command-line arguments to pass to `cargo`:
@@ -254,20 +315,36 @@ fn cargo_doc_without_pre_processing(
     // Special case: `esp-metadata` requires `std`, and we get some really confusing
     // errors if we try to pass `-Zbuild-std=core`:
     if package.needs_build_std() {
-        builder = builder.arg("-Zbuild-std=alloc,core");
+        builder.add_arg("-Zbuild-std=alloc,core");
     }
 
-    let args = builder.build();
-    log::debug!("{args:#?}");
+    let rustdocflags = [
+        "--cfg docsrs",
+        "--cfg not_really_docsrs",
+        // Activating this would redirect *all* rand_core version to 0.10.0, which is wrong.
+        // "--extern-html-root-takes-precedence",
+        // While we could use --extern-html-root-url to remap rand_core links, it doesn't seem to
+        // support multiple versions of the same crate. We could redirect everything to 0.10.0,
+        // which isn't ideal.
+        // "--extern-html-root-url rand_core-09=https://docs.rs/rand_core/0.9.5/",
+    ]
+    .join(" ");
 
-    let mut envs = vec![("RUSTDOCFLAGS", "--cfg docsrs --cfg not_really_docsrs")];
+    if let Some(doc_config) = &doc_config {
+        for (key, value) in &doc_config.env {
+            builder.add_env_var(key, value);
+        }
+    }
+    builder.add_env_var("RUSTDOCFLAGS", &rustdocflags);
     // Special case: `esp-storage` requires the optimization level to be 2 or 3:
     if package == Package::EspStorage {
-        envs.push(("CARGO_PROFILE_DEBUG_OPT_LEVEL", "3"));
+        builder.add_env_var("CARGO_PROFILE_DEBUG_OPT_LEVEL", "3");
     }
 
-    // Execute `cargo doc` from the package root:
-    crate::cargo::run_with_env(&args, &package_path, envs, false)?;
+    let command = CargoCommandBatcher::build_one_for_cargo(&builder);
+    log::debug!("{command:#?}");
+    crate::cargo::run_with_env(&command.command, &package_path, command.env_vars, false)
+        .with_context(|| format!("Failed to run `cargo doc` for {}", package_name))?;
 
     // Build up the path at which the built documentation can be found:
     let mut docs_path = if let Ok(target_path) = std::env::var("CARGO_TARGET_DIR") {
@@ -286,7 +363,7 @@ fn cargo_doc_without_pre_processing(
 
 /// Pre-process the Cargo.toml file
 ///
-/// This will keep the orignal as "Cargo.toml_original"
+/// This will keep the original as "Cargo.toml_original"
 ///
 /// This will check for `#DOC_IF <condition>` lines - evaluating the condition to false will turn
 /// any documenting comments into non-documenting comments until a `#DOC_ENDIF` line is encountered.
@@ -324,7 +401,10 @@ fn pre_process_cargo_toml(chip: Option<Chip>, package_path: &PathBuf) -> Result<
     let mut engine = somni_expr::Context::new();
     engine.add_function("has", move |cond: &str| -> bool {
         if let Some(chip_cfg) = chip_cfg {
-            chip_cfg.all().iter().any(|symbol| cond == symbol)
+            chip_cfg
+                .all()
+                .iter()
+                .any(|symbol| cond == symbol.replace('.', "_"))
         } else {
             false
         }
@@ -430,11 +510,14 @@ fn patch_documentation_index_for_package(
 
         let base_url = base_url.clone().unwrap_or_default();
         let resources_path = workspace.join("resources");
-        let html = render_template(
-            &resources_path,
-            "select.html.jinja",
-            minijinja::context! { base_url => base_url, package => package, version => version },
-        )?;
+
+        let html = render_template(&resources_path, "select.html.somni", {
+            let mut env = Env::new();
+            env.value("base_url", base_url)
+                .value("package", package.to_string())
+                .value("version", version.to_string());
+            env
+        })?;
 
         let node = elem.as_node();
         node.append(kuchikiki::parse_html().one(html));
@@ -448,6 +531,36 @@ fn patch_documentation_index_for_package(
 
 // ----------------------------------------------------------------------------
 // Build Documentation Index
+
+/// Returns the highest stable (non-prerelease) `semver::Version` found among the version-named
+/// directories under `package_docs_path`. Used to avoid defaulting to pre-releases when a stable
+/// version exists alongside a pre-release.
+fn latest_stable_docs_version(package_docs_path: &Path) -> Option<semver::Version> {
+    let mut best: Option<semver::Version> = None;
+    let entries = fs::read_dir(package_docs_path).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Skip non-directory entries
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path.file_name()?.to_string_lossy();
+        // Parse the version from the directory name
+        let Ok(ver) = name.parse::<semver::Version>() else {
+            continue;
+        };
+        // Skip pre-release versions
+        if !ver.pre.is_empty() {
+            continue;
+        }
+        // If multiple stable versions exist, return the highest one
+        best = Some(match best {
+            None => ver,
+            Some(b) => ver.max(b),
+        });
+    }
+    best
+}
 
 /// Build the documentation index for all packages.
 pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> Result<()> {
@@ -472,11 +585,10 @@ pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> 
             continue;
         }
 
-        let package_docs_path = docs_path.join(package.to_string());
-        let mut device_doc_paths = Vec::new();
+        let package_docs_path = docs_path.join(package.as_ref());
 
         // Each path we iterate over should be the directory for a given version of
-        // the package's documentation: (except latest)
+        // the package's documentation (non-semver names, e.g. `latest`, are skipped).
         if !package_docs_path.exists() {
             log::warn!(
                 "Package documentation path does not exist: '{}', skipping",
@@ -496,22 +608,13 @@ pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> 
                 continue;
             }
 
-            if version_path.file_name().unwrap() == "latest" {
-                continue;
-            }
-
+            // Collect all chip directories in this version's docs
+            let mut chips = vec![];
             for path in fs::read_dir(&version_path)
                 .with_context(|| format!("Failed to read {}", version_path.display()))?
             {
                 let path = path?.path();
                 if path.is_dir() {
-                    device_doc_paths.push(path);
-                }
-            }
-
-            let mut chips = device_doc_paths
-                .iter()
-                .map(|path| {
                     let chip = path
                         .components()
                         .next_back()
@@ -519,20 +622,41 @@ pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> 
                         .as_os_str()
                         .to_string_lossy();
 
-                    Chip::from_str(&chip, true).unwrap()
-                })
-                .collect::<Vec<_>>();
+                    match Chip::from_str(&chip, true) {
+                        Ok(chip) => chips.push(chip),
+                        Err(e) => {
+                            log::warn!("Folder name is not a valid chip name: {chip} - {e}");
+                        }
+                    }
+                }
+            }
 
             chips.sort();
 
-            let meta = generate_documentation_meta_for_package(workspace, *package, &chips)?;
+            let channel = version_path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            let current_version = match channel.parse::<semver::Version>() {
+                Ok(v) => v,
+                Err(_) => {
+                    log::debug!(
+                        "Skipping package doc directory (not semver): {}",
+                        version_path.display()
+                    );
+                    continue;
+                }
+            };
+
+            let meta = generate_documentation_meta_for_package(*package, &chips, current_version)?;
 
             // Render the template to HTML and write it out to the desired path:
-            let html = render_template(
-                &resources_path,
-                "package_index.html.jinja",
-                minijinja::context! { metadata => meta },
-            )?;
+            let html = render_template(&resources_path, "package_index.html.somni", {
+                let mut env = Env::new();
+                env.value("package", package.to_string().replace('-', "_"))
+                    .value("metadata", Iter(meta));
+                env
+            })?;
             let path = version_path.join("index.html");
             fs::write(&path, html).context("Failed to write index.html")?;
             log::info!("Created {}", path.display());
@@ -545,25 +669,26 @@ pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> 
         docs_path.join("esp-rs.svg"),
     )
     .context("Failed to copy esp-rs.svg")?;
+    fs::copy(
+        resources_path.join("esp-rs-grey-bg.svg"),
+        docs_path.join("esp-rs-grey-bg.svg"),
+    )
+    .context("Failed to copy esp-rs-grey-bg.svg")?;
 
     let meta = generate_documentation_meta_for_index(workspace)?;
 
     // Render the template to HTML and write it out to the desired path:
-    let html = render_template(
-        &resources_path,
-        "index.html.jinja",
-        minijinja::context! { metadata => meta },
-    )?;
+    let html = render_template(&resources_path, "index.html.somni", {
+        let mut env = Env::new();
+        env.value("metadata", Iter(meta));
+        env
+    })?;
     let path = docs_path.join("index.html");
     fs::write(&path, html).context("Failed to write index.html")?;
     log::info!("Created {}", path.display());
 
-    // Render the 404 template:
-    let html = render_template(
-        &resources_path,
-        "404.html.jinja",
-        minijinja::context! { metadata => meta },
-    )?;
+    // Render the 404 template (it has no placeholders to fill in):
+    let html = render_template(&resources_path, "404.html.somni", Env::new())?;
     let path = docs_path.join("404.html");
     fs::write(&path, html).context("Failed to write 404.html")?;
     log::info!("Created {}", path.display());
@@ -572,27 +697,37 @@ pub fn build_documentation_index(workspace: &Path, packages: &mut [Package]) -> 
 }
 
 fn generate_documentation_meta_for_package(
-    workspace: &Path,
     package: Package,
     chips: &[Chip],
-) -> Result<Vec<Value>> {
-    let version = crate::package_version(workspace, package)?;
-
+    doc_tree_version: semver::Version,
+) -> Result<Vec<Meta>> {
     let mut metadata = Vec::new();
+    let types = &mut TemplateTypes::default();
+
+    let name = package.to_string();
+    let crate_name = name.replace('-', "_");
+    let version = doc_tree_version.to_string();
 
     for chip in chips {
         // Ensure that the package/chip combination provided are valid:
-        package.validate_package_chip(chip)?;
+        if let Err(err) = package.validate_package_chip(chip) {
+            log::warn!("{err}");
+            continue;
+        }
 
         // Build the context object required for rendering this particular build's
         // information on the documentation index:
-        metadata.push(minijinja::context! {
-            name => package,
-            version => version,
-            chip => chip.to_string(),
-            chip_pretty => chip.pretty_name(),
-            package => package.to_string().replace('-', "_"),
-        });
+        let chip_name = chip.to_string();
+        metadata.push(somni_struct!(
+            types,
+            Meta {
+                name: name.as_str(),
+                version: version.as_str(),
+                chip: chip_name.as_str(),
+                chip_pretty: chip.pretty_name(),
+                package: crate_name.as_str(),
+            }
+        ));
     }
 
     log::debug!("Generated metadata for package '{package}': {metadata:#?}");
@@ -600,8 +735,10 @@ fn generate_documentation_meta_for_package(
     Ok(metadata)
 }
 
-fn generate_documentation_meta_for_index(workspace: &Path) -> Result<Vec<Value>> {
+fn generate_documentation_meta_for_index(workspace: &Path) -> Result<Vec<Meta>> {
     let mut metadata = Vec::new();
+    let docs_path = workspace.join("docs");
+    let types = &mut TemplateTypes::default();
 
     for package in Package::iter() {
         // Not all packages have documentation built:
@@ -609,7 +746,9 @@ fn generate_documentation_meta_for_index(workspace: &Path) -> Result<Vec<Value>>
             continue;
         }
 
-        let version = crate::package_version(workspace, package)?;
+        let cargo_version = crate::package_version(workspace, package)?;
+        let package_docs_path = docs_path.join(package.as_ref());
+        let version = latest_stable_docs_version(&package_docs_path).unwrap_or(cargo_version);
 
         let url = if package.chip_features_matter() {
             format!("{package}/{version}/index.html")
@@ -618,11 +757,16 @@ fn generate_documentation_meta_for_index(workspace: &Path) -> Result<Vec<Value>>
             format!("{package}/{version}/{crate_name}/index.html")
         };
 
-        metadata.push(minijinja::context! {
-            name => package,
-            version => version,
-            url => url,
-        });
+        let name = package.to_string();
+        let version = version.to_string();
+        metadata.push(somni_struct!(
+            types,
+            Meta {
+                name: name.as_str(),
+                version: version.as_str(),
+                url: url.as_str(),
+            }
+        ));
     }
 
     log::debug!("Generated metadata for documentation index: {metadata:#?}");
@@ -660,18 +804,259 @@ fn fetch_manifest(base_url: &Option<String>, package: &Package) -> Result<Manife
     Ok(manifest)
 }
 
-fn render_template<C>(resources: &Path, template: &str, ctx: C) -> Result<String>
-where
-    C: serde::Serialize,
-{
+fn render_template(resources: &Path, template: &str, env: Env) -> Result<String> {
     let source = fs::read_to_string(resources.join(template))
         .context(format!("Failed to read {template}"))?;
 
-    let mut env = minijinja::Environment::empty();
-    env.add_template(template, &source)?;
+    let tmpl = Template::compile(&source, &Syntax::brackets())
+        .map_err(|err| anyhow::anyhow!("{}", err.display_with(&source)))
+        .with_context(|| format!("Failed to compile {template}"))?;
 
-    let tmpl = env.get_template(template)?;
-    let html = tmpl.render(ctx)?;
+    tmpl.render(env)
+        .map_err(|err| anyhow::anyhow!("{}", err.display_with(&source)))
+        .with_context(|| format!("Failed to render {template}"))
+}
 
-    Ok(html)
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use somni_expr::somni_struct;
+    use somni_template::{Env, Iter, TemplateTypes};
+    use tempfile::TempDir;
+
+    use super::{
+        Manifest,
+        generate_documentation_meta_for_package,
+        latest_redirect_base,
+        latest_redirect_html,
+        latest_stable_docs_version,
+        render_template,
+    };
+
+    fn workspace() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+    }
+
+    fn mkdir(root: &Path, name: &str) {
+        fs::create_dir_all(root.join(name)).unwrap();
+    }
+
+    #[test]
+    fn picks_highest_stable_and_ignores_prerelease_and_nonsemver_names() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mkdir(root, "0.9.0");
+        mkdir(root, "1.0.0");
+        mkdir(root, "1.1.0-rc.0");
+        mkdir(root, "2.0.0");
+        mkdir(root, "latest");
+        mkdir(root, "main");
+        assert_eq!(
+            latest_stable_docs_version(root),
+            Some("2.0.0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_only_prereleases() {
+        let tmp = TempDir::new().unwrap();
+        mkdir(tmp.path(), "1.0.0-beta.0");
+        mkdir(tmp.path(), "1.1.0-rc.0");
+        assert_eq!(latest_stable_docs_version(tmp.path()), None);
+    }
+
+    #[test]
+    fn returns_none_for_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(latest_stable_docs_version(tmp.path()), None);
+    }
+
+    #[test]
+    fn skips_files_and_unparseable_dir_names() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mkdir(root, "1.0.0");
+        fs::write(root.join("not-a-dir"), b"x").unwrap();
+        mkdir(root, "not-a-version");
+        assert_eq!(
+            latest_stable_docs_version(root),
+            Some("1.0.0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn latest_redirect_base_paths() {
+        let v = semver::Version::parse("2.1.0").unwrap();
+        assert_eq!(
+            latest_redirect_base(&crate::Package::EspHal, &v),
+            "../2.1.0/"
+        );
+        assert_eq!(
+            latest_redirect_base(&crate::Package::EspAlloc, &v),
+            "../2.1.0/esp_alloc/"
+        );
+    }
+
+    /// Small integration check for the redirect template.
+    #[test]
+    fn latest_redirect_html_matches_latest_redirect_base() {
+        let ws = workspace();
+        let ver = semver::Version::parse("1.0.0").unwrap();
+        let pkg = crate::Package::EspHal;
+
+        let html = latest_redirect_html(ws, &pkg, &ver).unwrap();
+        let base = latest_redirect_base(&pkg, &ver);
+
+        assert!(html.contains(&format!("var base = \"{base}\"")));
+        assert!(html.contains(&format!("content=\"0; url={base}\"")));
+    }
+
+    /// The version select box is embedded in a page full of braces, so make sure the
+    /// surrounding JavaScript survives templating untouched.
+    #[test]
+    fn version_select_renders() {
+        let html = render_template(&workspace().join("resources"), "select.html.somni", {
+            let mut env = Env::new();
+            env.value("base_url", "https://docs.espressif.com/projects/rust")
+                .value("package", "esp-hal")
+                .value("version", "1.0.0");
+            env
+        })
+        .unwrap();
+
+        assert!(
+            html.contains(r#"<option value="1.0.0" selected="selected">1.0.0</option>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"const manifestUrl = "https://docs.espressif.com/projects/rust/esp-hal/manifest.json";"#
+            ),
+            "{html}"
+        );
+        assert!(html.contains(".then(({ versions }) => {"), "{html}");
+    }
+
+    #[test]
+    fn package_index_renders_a_row_per_chip() {
+        let ws = workspace();
+        let meta = generate_documentation_meta_for_package(
+            crate::Package::EspHal,
+            &[crate::Chip::Esp32c6, crate::Chip::Esp32s3],
+            semver::Version::parse("1.0.0").unwrap(),
+        )
+        .unwrap();
+
+        let html = render_template(&ws.join("resources"), "package_index.html.somni", {
+            let mut env = Env::new();
+            env.value("package", "esp_hal")
+                .value("metadata", Iter(meta));
+            env
+        })
+        .unwrap();
+
+        assert!(
+            html.contains("<title>esp_hal Documentation</title>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a href="esp32c6/esp_hal/index.html">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a href="esp32s3/esp_hal/index.html">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"crate-version\">1.0.0</span>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn index_renders_a_row_per_package() {
+        // `generate_documentation_meta_for_index` resolves manifests relative to the current
+        // directory, which is the crate root under `cargo test`, so build the rows by hand.
+        let types = &mut TemplateTypes::default();
+        let meta = vec![
+            somni_struct!(
+                types,
+                Meta {
+                    name: "esp-hal",
+                    version: "1.0.0",
+                    url: "esp-hal/1.0.0/index.html",
+                }
+            ),
+            somni_struct!(
+                types,
+                Meta {
+                    name: "esp-alloc",
+                    version: "0.9.0",
+                    url: "esp-alloc/0.9.0/esp_alloc/index.html",
+                }
+            ),
+        ];
+
+        let html = render_template(&workspace().join("resources"), "index.html.somni", {
+            let mut env = Env::new();
+            env.value("metadata", Iter(meta));
+            env
+        })
+        .unwrap();
+
+        assert!(
+            html.contains(r#"<a href="esp-hal/1.0.0/index.html">esp-hal</a>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a href="esp-alloc/0.9.0/esp_alloc/index.html">esp-alloc</a>"#),
+            "{html}"
+        );
+        assert!(html.contains("<code>esp-hal</code>"), "{html}");
+    }
+
+    #[test]
+    fn test_manifest_sorting_and_dedup() {
+        let mut manifest = Manifest::default();
+        let input = vec![
+            "main",
+            "1.0.0-beta.1",
+            "0.9.0",
+            "1.2.0",
+            "1.1.1",
+            "1.1.0",
+            "1.1.0-rc.1",
+            "1.1.0-rc.0",
+            "1.1.0-beta.0",
+            "git",
+            "1.0.0",
+            "nightly",
+            "1.0.0-beta.0",
+            "main", // Duplicated main
+        ];
+
+        for v in input {
+            manifest.insert_version(v);
+        }
+
+        assert_eq!(
+            manifest.versions,
+            vec![
+                "1.2.0",
+                "1.1.1",
+                "1.1.0",
+                "1.1.0-rc.1",
+                "1.1.0-rc.0",
+                "1.1.0-beta.0",
+                "1.0.0",
+                "1.0.0-beta.1",
+                "1.0.0-beta.0",
+                "0.9.0",   // Semver descending
+                "main",    // Rank 0
+                "git",     // Rank 1
+                "nightly"  // Rank 2 + alphabetical
+            ]
+        );
+    }
 }

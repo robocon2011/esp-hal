@@ -43,8 +43,8 @@ pub trait AdcHasCurveCal {
 /// This scheme also includes basic calibration ([`super::AdcCalBasic`]) and
 /// line fitting ([`AdcCalLine`]).
 #[derive(Clone, Copy)]
-pub struct AdcCalCurve<ADCI> {
-    line: AdcCalLine<ADCI>,
+pub struct AdcCalCurve<ADCX> {
+    line: AdcCalLine<ADCX>,
 
     /// Coefficients of the error estimation polynomial.
     ///
@@ -57,19 +57,19 @@ pub struct AdcCalCurve<ADCI> {
     /// subtracted from linear calibration's output to get the final reading.
     coeff: &'static [CurveCoeff],
 
-    _phantom: PhantomData<ADCI>,
+    _phantom: PhantomData<ADCX>,
 }
 
-impl<ADCI> crate::private::Sealed for AdcCalCurve<ADCI> {}
+impl<ADCX> crate::private::Sealed for AdcCalCurve<ADCX> {}
 
-impl<ADCI> AdcCalScheme<ADCI> for AdcCalCurve<ADCI>
+impl<ADCX> AdcCalScheme<ADCX> for AdcCalCurve<ADCX>
 where
-    ADCI: AdcCalEfuse + AdcHasLineCal + AdcHasCurveCal + CalibrationAccess,
+    ADCX: AdcCalEfuse + AdcHasLineCal + AdcHasCurveCal + CalibrationAccess,
 {
     fn new_cal(atten: Attenuation) -> Self {
-        let line = AdcCalLine::<ADCI>::new_cal(atten);
+        let line = AdcCalLine::<ADCX>::new_cal(atten);
 
-        let coeff = ADCI::CURVES_COEFFS
+        let coeff = ADCX::CURVES_COEFFS
             .iter()
             .find(|item| item.atten == atten)
             .expect("No curve coefficients for given attenuation")
@@ -126,7 +126,7 @@ macro_rules! coeff_tables {
     };
 }
 
-#[cfg(any(esp32c3, esp32c6, esp32h2, esp32s3))]
+#[cfg(any(esp32c3, esp32c5, esp32c6, esp32h2, esp32s3))]
 mod impls {
     use super::*;
 
@@ -171,6 +171,32 @@ mod impls {
                 0.0000000000042046,
             ],
         ];
+
+        /// Error curve coefficients derived from <https://github.com/espressif/esp-idf/blob/c602e55/components/esp_adc/esp32c5/curve_fitting_coefficients.c>
+        #[cfg(esp32c5)]
+        CURVES_COEFFS1 [
+            _0dB => [
+                -0.2941017829027464,
+                0.0007368674918527,
+                0.0,
+            ],
+            _2p5dB => [
+                -0.3224276125615327,
+                0.0005325658467636,
+                0.0,
+            ],
+            _6dB => [
+                -0.3307554632960901,
+                0.000409244304226,
+                0.0,
+            ],
+            _11dB => [
+                1.463642578413965,
+                -0.003349642363147,
+                0.0000011676836451,
+            ],
+        ];
+
 
         /// Error curve coefficients derived from <https://github.com/espressif/esp-idf/blob/903af13e8/components/esp_adc/esp32c6/curve_fitting_coefficients.c>
         #[cfg(esp32c6)]

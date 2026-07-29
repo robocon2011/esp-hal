@@ -30,7 +30,6 @@
 
 // TODO: some clock sources don't _really_ need refcount. This needs analysis to see which nodes can
 //       be simplified. (Probably the ones that only have one user, or those that are always on).
-// TODO: optimize out 1-variant clock multiplexers?
 // TODO: ClockConfig doc comment should be tailored to the specific chip
 // TODO: finalize public API
 // TODO: define clock IDs and maintain active clocks as a bitmap
@@ -39,9 +38,8 @@
 
 use std::{any::Any, collections::HashMap, str::FromStr};
 
-use anyhow::Result;
-use convert_case::{Case, Casing, StateConverter};
-use indexmap::IndexMap;
+use anyhow::{Context, Result};
+use indexmap::{IndexMap, IndexSet};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use serde::{
@@ -49,25 +47,40 @@ use serde::{
     Deserializer,
     de::{self, SeqAccess, Visitor},
 };
+use somni_expr::error::MarkInSource;
 use somni_parser::{ast, lexer::Token, parser::DefaultTypeSet};
 
 use crate::cfg::{
     clock_tree::{
-        divider::Divider,
-        expr_compiler::ExprCompiler,
+        expr_compiler::{ExprCompiler, Operand},
+        generic::Generic,
         mux::Multiplexer,
         source::{DerivedClockSource, Source},
     },
-    soc::ProcessedClockData,
+    soc::{ClockTreeNodeInstance, ProcessedClockData},
 };
 
-mod divider;
 mod expr_compiler;
+mod generic;
 mod mux;
-mod peripheral_source;
 mod source;
 
-pub(crate) use peripheral_source::PeripheralClockSource;
+/// Returns the name of the config type generated for a node.
+///
+/// `group` is the template group the node belongs to, or an empty string for standalone nodes.
+pub(crate) fn config_type_name(group: &str, node: &str) -> Ident {
+    use convert_case::{Case, Casing};
+
+    let type_name = if group.is_empty() {
+        node.to_string()
+    } else {
+        format!("{group}_{node}")
+    }
+    .from_case(Case::Constant)
+    .to_case(Case::Pascal);
+
+    format_ident!("{type_name}Config")
+}
 
 #[derive(Clone)]
 pub(crate) struct Function {
@@ -75,12 +88,26 @@ pub(crate) struct Function {
     pub implementation: TokenStream,
 }
 
+pub(crate) enum SourceFrequencySignature {
+    Skip,
+    Parameterless(TokenStream),
+    Selector {
+        param_type: TokenStream,
+        param_name: Ident,
+        body: TokenStream,
+    },
+}
+
 pub(crate) struct ClockNodeFunctions {
+    pub impl_type: Option<Ident>,
+
     pub request: Function,
     pub release: Function,
     pub apply_config: Function,
+    pub current_config: Function,
 
     pub frequency: Function,
+    pub source_frequency: Function,
     pub hal_functions: Vec<TokenStream>,
 }
 
@@ -89,84 +116,45 @@ impl ClockNodeFunctions {
         let request_impl = &self.request.implementation;
         let release_impl = &self.release.implementation;
         let apply_impl = &self.apply_config.implementation;
+        let current_config_impl = &self.current_config.implementation;
         let frequency_impl = &self.frequency.implementation;
+        let source_frequency_impl = &self.source_frequency.implementation;
 
         quote! {
             #apply_impl
+            #current_config_impl
             #request_impl
             #release_impl
             #frequency_impl
+            #source_frequency_impl
         }
     }
-}
-
-/// Represents the clock input options for a peripheral.
-#[derive(Debug, Clone, Deserialize)]
-pub enum PeripheralClockTreeEntry {
-    /// Defines clock tree items relevant for the current peripheral.
-    Definition(Vec<ClockTreeItem>),
-
-    /// References a clock tree defined in another peripheral. This peripheral will inherit the
-    /// clock tree from the referenced peripheral.
-    Reference(String),
-}
-
-impl Default for PeripheralClockTreeEntry {
-    fn default() -> Self {
-        PeripheralClockTreeEntry::Definition(Vec::new())
-    }
-}
-
-// Based on https://serde.rs/string-or-struct.html
-pub(super) fn ref_or_def<'de, D>(deserializer: D) -> Result<PeripheralClockTreeEntry, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct PeripheralClockTreeEntryVisitor;
-
-    impl<'de> Visitor<'de> for PeripheralClockTreeEntryVisitor {
-        type Value = PeripheralClockTreeEntry;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("string or list")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<PeripheralClockTreeEntry, E>
-        where
-            E: de::Error,
-        {
-            Ok(PeripheralClockTreeEntry::Reference(value.to_string()))
-        }
-
-        fn visit_seq<S>(self, list: S) -> Result<PeripheralClockTreeEntry, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            // `SeqAccessDeserializer` is a wrapper that turns a `SeqAccess`
-            // into a `Deserializer`, allowing it to be used as the input to T's
-            // `Deserialize` implementation. T then deserializes itself using
-            // the entries from the map visitor.
-            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(list))
-                .map(PeripheralClockTreeEntry::Definition)
-        }
-    }
-
-    deserializer.deserialize_any(PeripheralClockTreeEntryVisitor)
 }
 
 pub struct ValidationContext<'c> {
-    pub tree: &'c [ClockTreeItem],
+    pub tree: &'c [&'c ClockTreeNodeInstance],
 }
 
-impl ValidationContext<'_> {
-    pub fn has_clock(&self, clk: &str) -> bool {
-        self.clock(clk).is_some()
+impl<'c> ValidationContext<'c> {
+    pub fn has_clock(&self, instance: &ClockTreeNodeInstance, clk: &str) -> bool {
+        self.clock(instance, clk).is_some()
     }
 
-    fn clock(&self, clk: &str) -> Option<&ClockTreeItem> {
+    fn clock(&self, instance: &ClockTreeNodeInstance, clk: &str) -> Option<&ClockTreeNodeInstance> {
+        let local_clk = format!("{}_{}", instance.group_instance, clk);
         self.tree
             .iter()
-            .find(|item| item.as_dyn_ref().name_str() == clk)
+            .cloned()
+            .find(|item| [&local_clk, clk].contains(&item.name_str().as_str()))
+    }
+
+    pub(crate) fn run_validation(&self) -> Result<()> {
+        for node in self.tree {
+            node.validate_source_data(self)
+                .with_context(|| format!("Invalid clock tree item: {}", node.name_str()))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -178,31 +166,35 @@ pub(crate) struct DependencyGraph {
 }
 
 impl DependencyGraph {
-    pub fn build_from(clock_tree: &[Box<dyn ClockTreeNodeType>]) -> Self {
+    pub fn empty() -> Self {
+        Self {
+            graph: IndexMap::new(),
+            reverse_graph: IndexMap::new(),
+        }
+    }
+
+    pub(super) fn build_from(clock_tree: &ProcessedClockData) -> Self {
         let mut dependency_graph = IndexMap::new();
         let mut reverse_dependency_graph = IndexMap::new();
 
-        for node in clock_tree.iter() {
+        for node in clock_tree.clock_tree.values() {
+            dependency_graph.insert(node.name.clone(), Vec::new());
+            reverse_dependency_graph.insert(node.name.clone(), Vec::new());
+        }
+
+        for node in clock_tree.clock_tree.values() {
             let node_name = node.name_str();
-            dependency_graph
-                .entry(node_name.clone())
-                .or_insert_with(Vec::new);
-            reverse_dependency_graph
-                .entry(node_name.clone())
-                .or_insert_with(Vec::new);
 
-            for input in node.input_clocks() {
-                let graph_node = dependency_graph
-                    .entry(input.clone())
-                    .or_insert_with(Vec::new);
-
+            for input in node.input_clocks(clock_tree) {
+                let graph_node = &mut dependency_graph[&input];
                 if !graph_node.contains(node_name) {
                     graph_node.push(node_name.clone());
                 }
-                reverse_dependency_graph
-                    .entry(node_name.clone())
-                    .or_insert_with(Vec::new)
-                    .push(input);
+
+                let reverse_node = &mut reverse_dependency_graph[node_name];
+                if !reverse_node.contains(&input) {
+                    reverse_node.push(input);
+                }
             }
         }
 
@@ -230,6 +222,30 @@ impl DependencyGraph {
     pub fn iter(&self) -> impl Iterator<Item = String> {
         topological_sort(&self.reverse_graph)
     }
+
+    /// Returns the nearest configurable nodes directly downstream of `node`, in topological order.
+    /// The search stops at each configurable node found (does not look through them).
+    pub fn configurable_children_of(&self, node: &str, tree: &ProcessedClockData) -> Vec<String> {
+        let mut found: IndexSet<String> = IndexSet::new();
+        let mut visited: IndexSet<String> = IndexSet::new();
+        let mut queue: Vec<String> = self.users(node).to_vec();
+        while let Some(n) = queue.pop() {
+            if !visited.insert(n.clone()) {
+                continue;
+            }
+            match tree.try_get_node(&n) {
+                Some(inst) if inst.is_configurable() => {
+                    found.insert(n);
+                }
+                _ => {
+                    for user in self.users(&n) {
+                        queue.push(user.clone());
+                    }
+                }
+            }
+        }
+        self.iter().filter(|n| found.contains(n.as_str())).collect()
+    }
 }
 
 fn topological_sort(dep_graph: &IndexMap<String, Vec<String>>) -> impl Iterator<Item = String> {
@@ -251,31 +267,45 @@ fn topological_sort(dep_graph: &IndexMap<String, Vec<String>>) -> impl Iterator<
     sorted.into_iter()
 }
 
+#[derive(Debug)]
 pub(crate) struct ManagementProperties {
     pub name: Ident,
-    pub state_ty: Option<Ident>,
+    pub state_ty: Option<TokenStream>,
     pub refcounted: bool,
     pub has_enable: bool,
 
     /// This clock node is considered always running.
     pub always_on: bool,
+
+    /// This clock node holds a wake lock while it is enabled.
+    pub wake_locking: bool,
+
+    pub receiver: Option<TokenStream>,
+    pub accessor: Option<TokenStream>,
 }
 
 impl ManagementProperties {
+    /// Name of the node's current configuration field in the ClockTree struct.
     pub fn field_name(&self) -> Ident {
         self.name.clone()
     }
 
-    pub fn type_name(&self) -> Option<Ident> {
+    pub fn type_name(&self) -> Option<TokenStream> {
         self.state_ty.clone()
     }
 
-    pub fn refcount_field_name(&self) -> Option<Ident> {
+    pub fn refcount_field(&self) -> Option<Ident> {
         if self.refcounted {
             Some(format_ident!("{}_refcount", self.name))
         } else {
             None
         }
+    }
+
+    pub fn refcount_accessor(&self) -> Option<TokenStream> {
+        let receiver = self.receiver.as_ref().into_iter();
+        self.refcount_field()
+            .map(|field| quote! { clocks.#field #([#receiver as usize])* })
     }
 
     pub fn has_enable(&self) -> bool {
@@ -285,98 +315,247 @@ impl ManagementProperties {
     pub fn always_on(&self) -> bool {
         self.always_on
     }
+
+    pub fn wake_locking(&self) -> bool {
+        self.wake_locking
+    }
+
+    /// For peripheral clocks, returns a receiver expression (`self`).
+    pub fn receiver(&self) -> &[TokenStream] {
+        self.receiver.as_slice()
+    }
+
+    /// Returns an expression that accesses the node's current configuration field in the ClockTree
+    /// struct. This function takes the node's instance as the receiver and uses it to index into
+    /// the configuration array.
+    pub fn indexed_config_accessor(&self) -> TokenStream {
+        let node_field = &self.name;
+        let receiver = self.receiver.as_ref().into_iter();
+        quote! { clocks.#node_field #([#receiver as usize])* }
+    }
+
+    /// Returns an expression that accesses the index's current configuration field in the ClockTree
+    /// struct. This function hardcodes the node's actual variant.
+    pub fn instance_config_accessor(&self) -> TokenStream {
+        let node_field = &self.name;
+        let accessor = self.accessor.as_ref().into_iter();
+        quote! { self.#node_field #([#accessor])* }
+    }
 }
 
+/// The range of values an expression or a clock node's output can take.
+///
+/// Bounds are used to decide where 32-bit arithmetic is enough, and where the generated code has
+/// to compute in 64 bits to avoid overflowing. They are conservative: a wider range than the real
+/// one only costs a few casts in the generated code, a narrower one would generate code that
+/// overflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Bounds {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl Bounds {
+    /// The bounds of a value we know nothing about, other than that it is a `u32`.
+    pub const UNKNOWN: Self = Self {
+        min: 0,
+        max: u32::MAX as u64,
+    };
+
+    pub fn exact(value: u64) -> Self {
+        Self {
+            min: value,
+            max: value,
+        }
+    }
+
+    pub fn new(min: u64, max: u64) -> Self {
+        Self { min, max }
+    }
+
+    /// Widens `self` to also contain `other`.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+
+    pub fn fits_in_u32(self) -> bool {
+        self.max <= u32::MAX as u64
+    }
+
+    /// Clamps the bounds to the `u32` range in which frequencies are stored.
+    pub fn as_frequency(self) -> Self {
+        Self {
+            min: self.min.min(u32::MAX as u64),
+            max: self.max.min(u32::MAX as u64),
+        }
+    }
+
+    /// Returns the bounds of `self <op> other`, where `op` is one of the supported arithmetic
+    /// operators. Returns `None` for operators that don't produce a number.
+    pub fn apply_operator(self, operator: &str, other: Self) -> Option<Self> {
+        // Saturate instead of overflowing: a saturated bound is still an upper bound, and it means
+        // the generated code is widened, which is what we want for an expression this extreme.
+        let bounds = match operator {
+            "+" => Self::new(
+                self.min.saturating_add(other.min),
+                self.max.saturating_add(other.max),
+            ),
+            "-" => Self::new(
+                self.min.saturating_sub(other.max),
+                self.max.saturating_sub(other.min),
+            ),
+            "*" => Self::new(
+                self.min.saturating_mul(other.min),
+                self.max.saturating_mul(other.max),
+            ),
+            // A zero divisor panics at runtime, so assume the divisor is at least 1.
+            "/" => Self::new(self.min / other.max.max(1), self.max / other.min.max(1)),
+            "%" => Self::new(0, self.max.min(other.max.saturating_sub(1))),
+            _ => return None,
+        };
+
+        Some(bounds)
+    }
+}
+
+/// Common interface for clock node types.
 pub(crate) trait ClockTreeNodeType: Any {
+    fn name(&self) -> &str;
+
+    /// Returns the range of frequencies this node can output.
+    ///
+    /// The default implementation gives up and returns [`Bounds::UNKNOWN`].
+    fn output_bounds(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _tree: &ProcessedClockData,
+    ) -> Bounds {
+        Bounds::UNKNOWN
+    }
+
     /// Returns which clock nodes' configurations are affected when this node is configured.
+    // TODO: pass instance to apply template naming scheme to returned clocks
+    // (e.g. FUNCTION_CLOCK -> UART0_FUNCTION_CLOCK)
     fn affected_nodes<'s>(&'s self) -> Vec<&'s str> {
         vec![]
     }
 
-    fn input_clocks(&self) -> Vec<String> {
+    fn input_clocks(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _tree: &ProcessedClockData,
+    ) -> Vec<String> {
         vec![]
     }
 
     fn always_on(&self) -> bool {
         false
     }
-    fn validate_source_data(&self, ctx: &ValidationContext<'_>) -> Result<()>;
+    fn wake_locking(&self) -> bool {
+        false
+    }
+    fn validate_source_data(
+        &self,
+        instance: &ClockTreeNodeInstance,
+        ctx: &ValidationContext<'_>,
+    ) -> Result<()>;
     fn is_configurable(&self) -> bool;
-    fn config_apply_function(&self, tree: &ProcessedClockData) -> TokenStream;
-    fn config_apply_impl_function(&self, _tree: &ProcessedClockData) -> TokenStream {
-        quote! {}
+    fn config_apply_function(
+        &self,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
+    ) -> TokenStream;
+
+    fn node_frequency_impl(
+        &self,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
+        frequency_receiver: &[TokenStream],
+    ) -> TokenStream;
+
+    /// Returns true when `config_frequency` must take an `instance` parameter because its
+    /// frequency formula reads a per-instance upstream node's cached frequency.
+    fn config_frequency_needs_instance(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _tree: &ProcessedClockData,
+    ) -> bool {
+        false
     }
 
-    fn node_frequency_impl(&self, _tree: &ProcessedClockData) -> TokenStream;
-
-    fn name_str<'a>(&'a self) -> &'a String;
-    fn name<'a>(&'a self) -> StateConverter<'a, String> {
-        self.name_str().from_case(Case::Ada)
+    /// Returns true when a configurable node's output frequency is a direct alias of a single
+    /// upstream node, so a dedicated frequency cache would only duplicate that upstream value.
+    fn skips_frequency_cache(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _tree: &ProcessedClockData,
+    ) -> bool {
+        false
     }
 
-    /// Returns the name of the clock configuration type. The corresponding field in the
-    /// `ClockConfig` struct will have this type.
-    fn config_type_name(&self) -> Option<Ident> {
-        if self.is_configurable() {
-            let item = self.name().to_case(Case::Pascal);
-            Some(quote::format_ident!("{}Config", item))
-        } else {
-            None
-        }
+    fn has_configures(&self) -> bool {
+        false
+    }
+
+    fn node_source_frequency_impl(
+        &self,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
+    ) -> SourceFrequencySignature {
+        let _ = (instance, tree);
+        SourceFrequencySignature::Skip
     }
 
     /// Returns the documentation for the clock configuration, which will be placed on the
     /// `ClockConfig` field.
-    fn config_documentation(&self) -> Option<String> {
-        Some(format!(" `{}` configuration.", self.name_str()))
+    fn config_documentation(&self, instance: &ClockTreeNodeInstance) -> Option<String> {
+        Some(format!(" `{}` configuration.", instance.name_str()))
     }
 
-    fn apply_configuration(&self, _expr: &Expression, _tree: &ProcessedClockData) -> TokenStream {
-        if self.is_configurable() {
+    fn validate_configures_expr(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _expr: &ConfiguresExpression,
+    ) -> Result<()> {
+        anyhow::bail!("Configures expressions are not supported")
+    }
+
+    fn apply_configuration(
+        &self,
+        instance: &ClockTreeNodeInstance,
+        _expr: &ConfiguresExpression,
+        _tree: &ProcessedClockData,
+    ) -> TokenStream {
+        if instance.is_configurable() {
             unimplemented!();
         } else {
             quote! {}
         }
     }
 
-    fn config_type(&self) -> Option<TokenStream>;
-    fn config_docline(&self) -> Option<String>;
-
-    fn config_apply_function_name(&self) -> Ident {
-        let name = self.name().to_case(Case::Snake);
-        format_ident!("configure_{}", name)
-    }
-
-    fn frequency_function_name(&self) -> Ident {
-        let name = self.name().to_case(Case::Snake);
-        format_ident!("{}_frequency", name)
-    }
-
-    fn request_fn_name(&self) -> Ident {
-        let name = self.name().to_case(Case::Snake);
-        format_ident!("request_{}", name)
-    }
-
-    fn release_fn_name(&self) -> Ident {
-        let name = self.name().to_case(Case::Snake);
-        format_ident!("release_{}", name)
-    }
-
-    fn enable_fn_name(&self) -> Ident {
-        let name = self.name().to_case(Case::Snake);
-        format_ident!("enable_{}", name)
-    }
+    fn config_type(&self, instance: &ClockTreeNodeInstance) -> TokenStream;
 
     fn request_direct_dependencies(
         &self,
-        node: &dyn ClockTreeNodeType,
+        instance: &ClockTreeNodeInstance,
         tree: &ProcessedClockData,
     ) -> TokenStream;
     fn release_direct_dependencies(
         &self,
-        node: &dyn ClockTreeNodeType,
+        instance: &ClockTreeNodeInstance,
         tree: &ProcessedClockData,
     ) -> TokenStream;
+
+    /// Generates `property!` branches for the node's configurable parameters.
+    ///
+    /// `group` is the name of the template group the node belongs to, or an empty string for
+    /// standalone nodes. It is needed to reconstruct the names of the generated config types.
+    fn property_macro_branches(&self, _path: &str, _group: &str) -> TokenStream {
+        quote! {}
+    }
 }
 
 /// Represents a clock tree item.
@@ -389,153 +568,38 @@ pub enum ClockTreeItem {
     #[serde(rename = "source")]
     Source(Source),
 
-    #[serde(rename = "divider")]
-    Divider(Divider),
+    #[serde(rename = "generic")]
+    Generic(Generic),
 
     #[serde(rename = "derived")]
     Derived(DerivedClockSource),
 }
 
 impl ClockTreeItem {
-    pub(crate) fn as_dyn_ref(&self) -> &dyn ClockTreeNodeType {
+    pub(crate) fn name(&self) -> &str {
         match self {
-            ClockTreeItem::Multiplexer(mux) => mux,
-            ClockTreeItem::Source(src) => src,
-            ClockTreeItem::Divider(div) => div,
-            ClockTreeItem::Derived(drv) => drv,
+            ClockTreeItem::Multiplexer(mux) => mux.name.as_str(),
+            ClockTreeItem::Source(src) => src.name.as_str(),
+            ClockTreeItem::Generic(div) => div.name.as_str(),
+            ClockTreeItem::Derived(drv) => drv.source_options.name.as_str(),
         }
     }
 
-    pub(crate) fn node_functions(
-        node: &dyn ClockTreeNodeType,
-        tree: &ProcessedClockData,
-    ) -> ClockNodeFunctions {
-        let ty_name = node.config_type_name();
+    pub(crate) fn boxed(&self) -> Box<dyn ClockTreeNodeType> {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => Box::new(mux.clone()),
+            ClockTreeItem::Source(src) => Box::new(src.clone()),
+            ClockTreeItem::Generic(div) => Box::new(div.clone()),
+            ClockTreeItem::Derived(drv) => Box::new(drv.clone()),
+        }
+    }
 
-        let request_fn_name = node.request_fn_name();
-        let release_fn_name = node.release_fn_name();
-        let properties = tree.properties(node);
-        let refcount_name = properties.refcount_field_name();
-        let enable_fn_name = node.enable_fn_name();
-        let enable_fn_impl_name = format_ident!("{}_impl", enable_fn_name);
-        let always_on = properties.always_on();
-
-        let request_direct_dependencies = node.request_direct_dependencies(node, tree);
-        let release_direct_dependencies = node.release_direct_dependencies(node, tree);
-
-        // Only configurables have an apply fn
-        let apply_fn = ty_name.as_ref().map(|_| node.config_apply_function(tree));
-        let apply_fn_impl = ty_name
-            .as_ref()
-            .map(|_| node.config_apply_impl_function(tree))
-            .unwrap_or_default();
-        let frequency_function_impl = node.node_frequency_impl(tree);
-        let frequency_function_name = node.frequency_function_name();
-
-        let enable_trace = format!("Enabling {}", node.name_str());
-        let disable_trace = format!("Disabling {}", node.name_str());
-
-        let request_trace = format!("Requesting {}", node.name_str());
-        let release_trace = format!("Releasing {}", node.name_str());
-
-        ClockNodeFunctions {
-            request: Function {
-                _name: request_fn_name.to_string(),
-                implementation: if always_on {
-                    quote! {
-                        fn #request_fn_name(_clocks: &mut ClockTree) { }
-                    }
-                } else if refcount_name.is_some() {
-                    quote! {
-                        pub fn #request_fn_name(clocks: &mut ClockTree) {
-                            trace!(#request_trace);
-                            if increment_reference_count(&mut clocks.#refcount_name) {
-                                trace!(#enable_trace);
-                                #request_direct_dependencies
-                                #enable_fn_impl_name(clocks, true);
-                            }
-                        }
-                    }
-                } else if properties.has_enable() {
-                    quote! {
-                        pub fn #request_fn_name(clocks: &mut ClockTree) {
-                            trace!(#request_trace);
-                            trace!(#enable_trace);
-                            #request_direct_dependencies
-                            #enable_fn_impl_name(clocks, true);
-                        }
-                    }
-                } else {
-                    quote! {
-                        pub fn #request_fn_name(clocks: &mut ClockTree) {
-                            trace!(#request_trace);
-                            #request_direct_dependencies
-                        }
-                    }
-                },
-            },
-            release: Function {
-                _name: release_fn_name.to_string(),
-                implementation: if always_on {
-                    quote! {
-                        fn #release_fn_name(_clocks: &mut ClockTree) { }
-                    }
-                } else if refcount_name.is_some() {
-                    quote! {
-                        pub fn #release_fn_name(clocks: &mut ClockTree) {
-                            trace!(#release_trace);
-                            if decrement_reference_count(&mut clocks.#refcount_name) {
-                                trace!(#disable_trace);
-                                #enable_fn_impl_name(clocks, false);
-                                #release_direct_dependencies
-                            }
-                        }
-                    }
-                } else if properties.has_enable() {
-                    quote! {
-                        pub fn #release_fn_name(clocks: &mut ClockTree) {
-                            trace!(#release_trace);
-                            trace!(#disable_trace);
-                            #enable_fn_impl_name(clocks, false);
-                            #release_direct_dependencies
-                        }
-                    }
-                } else {
-                    quote! {
-                        pub fn #release_fn_name(clocks: &mut ClockTree) {
-                            trace!(#release_trace);
-                            #release_direct_dependencies
-                        }
-                    }
-                },
-            },
-
-            apply_config: Function {
-                _name: node.config_apply_function_name().to_string(),
-                implementation: quote! { #apply_fn },
-            },
-
-            frequency: Function {
-                _name: frequency_function_name.to_string(),
-                implementation: quote! {
-                    pub fn #frequency_function_name(clocks: &mut ClockTree) -> u32 {
-                        #frequency_function_impl
-                    }
-                },
-            },
-
-            hal_functions: vec![
-                if !always_on && (refcount_name.is_some() || properties.has_enable()) {
-                    quote! {
-                        fn #enable_fn_impl_name(_clocks: &mut ClockTree, _en: bool) {
-                            todo!()
-                        }
-                    }
-                } else {
-                    quote! {}
-                },
-                apply_fn_impl,
-            ],
+    pub(crate) fn property_macro_branches(&self, path: &str, group: &str) -> TokenStream {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => mux.property_macro_branches(path, group),
+            ClockTreeItem::Source(src) => src.property_macro_branches(path, group),
+            ClockTreeItem::Generic(div) => div.property_macro_branches(path, group),
+            ClockTreeItem::Derived(drv) => drv.property_macro_branches(path, group),
         }
     }
 }
@@ -574,39 +638,24 @@ where
 /// - Divider = value
 #[derive(Debug, Clone)]
 pub struct ConfiguresExpression {
-    target: String,
-    value: Expression,
+    effect: ConfiguresEffect,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfiguresEffect {
+    node: String,
+    property: Option<String>,
+    value: ast::RightHandExpression<DefaultTypeSet>,
 }
 
 impl ConfiguresExpression {
-    fn validate_source_data(&self, ctx: &ValidationContext<'_>) -> Result<()> {
-        let Some(clock) = ctx.clock(&self.target) else {
-            anyhow::bail!("Clock source {} not found", self.target);
-        };
+    pub(crate) fn effect(&self) -> &ConfiguresEffect {
+        &self.effect
+    }
 
-        let clock_name = clock.as_dyn_ref().name().to_case(Case::Ada);
-        match clock {
-            ClockTreeItem::Multiplexer(multiplexer) => {
-                if let Some(name) = self.value.as_name() {
-                    if !multiplexer.variant_names().any(|v| v == name) {
-                        anyhow::bail!("Multiplexer `{clock_name}` does not have variant `{name}`");
-                    }
-                } else {
-                    anyhow::bail!(
-                        "Multiplexer config expression for `{clock_name}` must be a name"
-                    );
-                }
-            }
-            ClockTreeItem::Divider(divider) => {
-                anyhow::ensure!(
-                    divider.is_configurable(),
-                    "Divider `{clock_name}` is not configurable",
-                )
-            }
-            _ => anyhow::bail!("Cannot configure source clock {}", self.target),
-        }
-
-        Ok(())
+    pub(crate) fn name(&self, token: Token) -> &str {
+        token.source(&self.source)
     }
 }
 
@@ -624,17 +673,57 @@ impl FromStr for ConfiguresExpression {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (target, value_str) = s.split_once('=').ok_or_else(|| {
-            format!("The config expression must be in the format 'target = value'")
-        })?;
-        let value = somni_parser::parser::parse_expression(value_str)
+        let value = somni_parser::parser::parse_expression(s)
             .map_err(|e| format!("Failed to parse expression: {}", e))?;
-        Ok(ConfiguresExpression {
-            target: target.trim().to_string(),
-            value: Expression {
-                source: value_str.to_string(),
-                expr: value,
+
+        let effect = match &value {
+            ast::Expression::Assignment {
+                left_expr,
+                operator: _,
+                right_expr,
+            } => ConfiguresEffect {
+                // NODE = VALUE
+                node: if let ast::LeftHandExpression::Name { variable } = left_expr {
+                    variable.source(s).to_string()
+                } else {
+                    return Err(format!("Invalid config expression: {}", s));
+                },
+                property: None,
+                value: right_expr.clone(),
             },
+            ast::Expression::Expression {
+                expression: ast::RightHandExpression::FunctionCall { name, arguments },
+            } if name.source(s) == "configure" => {
+                // configure(NODE, property, VALUE)
+                if arguments.len() != 3 {
+                    return Err(format!("Invalid config expression: {}", s));
+                }
+                let ast::RightHandExpression::Variable { variable } = &arguments[0] else {
+                    return Err(format!(
+                        "Node name in configure expression must be an identifier: {s}"
+                    ));
+                };
+                let node = variable.source(s).to_string();
+
+                let ast::RightHandExpression::Variable { variable } = &arguments[1] else {
+                    return Err(format!(
+                        "Property name in configure expression must be an identifier: {s}"
+                    ));
+                };
+                let property = Some(variable.source(s).to_string());
+
+                ConfiguresEffect {
+                    node,
+                    property,
+                    value: arguments[2].clone(),
+                }
+            }
+            _ => return Err(format!("Invalid config expression: {}", s)),
+        };
+
+        Ok(ConfiguresExpression {
+            effect,
+            source: s.to_string(),
         })
     }
 }
@@ -655,6 +744,23 @@ fn human_readable_frequency(mut output: u64) -> (u64, &'static str) {
 pub struct ValuesExpression(Vec<ValueFragment>);
 
 impl ValuesExpression {
+    /// Returns the range of values the parameter can take.
+    fn bounds(&self) -> Bounds {
+        let mut bounds = None;
+        for fragment in self.0.iter() {
+            let fragment = match fragment {
+                ValueFragment::FixedFrequency(value) => Bounds::exact(*value as u64),
+                ValueFragment::Range(min, max) => Bounds::new(*min as u64, *max as u64),
+            };
+            bounds = Some(match bounds {
+                Some(bounds) => Bounds::union(bounds, fragment),
+                None => fragment,
+            });
+        }
+
+        bounds.unwrap_or(Bounds::UNKNOWN)
+    }
+
     fn as_enum_values(&self) -> Option<Vec<u32>> {
         let frequencies = self
             .0
@@ -673,14 +779,10 @@ impl ValuesExpression {
     }
 
     fn as_range(&self) -> Option<(u32, u32)> {
-        if self.0.len() != 1 {
-            None
+        if let [ValueFragment::Range(min, max)] = self.0.as_slice() {
+            Some((*min, *max))
         } else {
-            let ValueFragment::Range(min, max) = self.0[0] else {
-                return None;
-            };
-
-            Some((min, max))
+            None
         }
     }
 }
@@ -718,10 +820,20 @@ impl FromStr for ValueFragment {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         fn parse_number(s: &str) -> Result<u32, String> {
-            s.replace('_', "")
-                .trim()
-                .parse()
-                .map_err(|e| format!("Invalid number: {}", e))
+            let s = s.replace('_', "");
+            let s = s.trim();
+
+            let result = if s.starts_with("0x") {
+                u32::from_str_radix(&s[2..], 16)
+            } else if s.starts_with("0o") {
+                u32::from_str_radix(&s[2..], 8)
+            } else if s.starts_with("0b") {
+                u32::from_str_radix(&s[2..], 2)
+            } else {
+                s.parse()
+            };
+
+            result.map_err(|e| format!("Failed to parse {s}: {e}"))
         }
 
         if let Some((start, end_incl)) = s.split_once("..=") {
@@ -739,22 +851,38 @@ impl FromStr for ValueFragment {
     }
 }
 
+// Asserts that will be run before configuring a node.
+//
+// Referring to a node by name resolves to its output frequency. `property(NODE)` resolves to the
+// node's property value.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RejectExpression(Expression);
 impl RejectExpression {
     fn to_rust<'a>(
-        &self,
-        config_fields: &[(&'a str, Ident)],
-        mut variables: HashMap<&'a str, TokenStream>,
+        &'a self,
+        mut variables: HashMap<&'a str, Operand>,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
     ) -> TokenStream {
         let mut patterns = vec![];
 
-        for (var, config_field) in config_fields {
-            patterns.push(quote! { let Some(#config_field) = clocks.#config_field });
-            variables.insert(var, quote! { #config_field.value() });
-        }
+        self.0.visit_variables(|var| {
+            if !variables.contains_key(var) {
+                // Referring to a node by name resolves to its output frequency.
+                let node = instance.resolve_node(tree, var);
+                let freq_fn = node.frequency_function_name();
+                variables.insert(
+                    var,
+                    Operand::new(quote! { #freq_fn() }, node.output_bounds(tree)),
+                );
 
-        let reject_expr = self.0.to_rust(variables);
+                // Only run the assert if the referenced nodes have been configured
+                let config_field = node.properties.indexed_config_accessor();
+                patterns.push(quote! { #config_field.is_some() });
+            }
+        });
+
+        let reject_expr = self.0.to_rust(variables, instance, tree);
 
         let assert_reject = quote! {
             assert!(!(#reject_expr));
@@ -775,7 +903,7 @@ impl RejectExpression {
 #[derive(Debug, Clone)]
 pub(crate) struct Expression {
     source: String,
-    expr: ast::Expression<DefaultTypeSet>,
+    expr: ast::RightHandExpression<DefaultTypeSet>,
 }
 
 impl Expression {
@@ -784,10 +912,7 @@ impl Expression {
     }
 
     fn expr(&self) -> &ast::RightHandExpression<DefaultTypeSet> {
-        match &self.expr {
-            ast::Expression::Assignment { .. } => unimplemented!("Assignments are not supported"),
-            ast::Expression::Expression { expression } => expression,
-        }
+        &self.expr
     }
 
     fn visit_variables<'s>(&'s self, mut f: impl FnMut(&'s str)) {
@@ -805,25 +930,102 @@ impl Expression {
                     visit_variables(&operands[0], f);
                     visit_variables(&operands[1], f);
                 }
-                ast::RightHandExpression::FunctionCall { .. } => {
-                    panic!("Function calls are not supported")
+                ast::RightHandExpression::FunctionCall { name: _, arguments } => {
+                    // This will ensure the user knows the node is referenced in the expression. A
+                    // bit of a convention over specification, though.
+                    visit_variables(&arguments[0], f);
                 }
+                _ => unimplemented!("Unsupported expression: {:#?}", expr),
             }
         }
 
         visit_variables(self.expr(), &mut |token| f(self.lookup(token)))
     }
 
-    fn as_name(&self) -> Option<&str> {
-        if let ast::RightHandExpression::Variable { variable } = self.expr() {
-            Some(self.lookup(*variable))
-        } else {
-            None
-        }
+    fn to_rust(
+        &self,
+        variables: HashMap<&str, Operand>,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
+    ) -> TokenStream {
+        ExprCompiler::new(&variables).compile_expression(self, instance, tree)
     }
 
-    fn to_rust(&self, variables: HashMap<&str, TokenStream>) -> TokenStream {
-        ExprCompiler::new(&variables).compile_expression(self)
+    /// Solves the expression at codegen time, with every variable bound to a fixed value.
+    ///
+    /// Returns `None` if the expression can't be solved, e.g. because it divides by zero or calls
+    /// a function.
+    fn solve(&self, values: &IndexMap<&str, u64>) -> Option<u64> {
+        let mut ctx = somni_expr::Context::new();
+        for (name, value) in values.iter() {
+            ctx.add_variable(name, *value);
+        }
+
+        ctx.evaluate_parsed::<u64>(
+            &self.source,
+            &ast::Expression::Expression {
+                expression: self.expr.clone(),
+            },
+        )
+        .ok()
+    }
+
+    /// Returns the range of values the expression can evaluate to.
+    ///
+    /// The expression is solved at every combination of its variables' extremes. This is more
+    /// accurate than propagating bounds through the operators one by one, because a variable that
+    /// appears multiple times (like `a` in `SOURCE * a / (N * a + b)`) takes the same value in
+    /// every place it appears.
+    fn bounds(&self, variables: &IndexMap<&str, Bounds>) -> Bounds {
+        // Solving 2^n times is only reasonable for the handful of variables a clock node has.
+        if variables.len() > 8 {
+            return Bounds::UNKNOWN;
+        }
+
+        let mut bounds: Option<Bounds> = None;
+        for corner in 0..1u32 << variables.len() {
+            let values = variables
+                .iter()
+                .enumerate()
+                .map(|(index, (name, variable))| {
+                    let value = if corner & (1 << index) == 0 {
+                        variable.min
+                    } else {
+                        variable.max
+                    };
+                    (*name, value)
+                })
+                .collect::<IndexMap<_, _>>();
+
+            if let Some(value) = self.solve(&values) {
+                let value = Bounds::exact(value);
+                bounds = Some(match bounds {
+                    Some(bounds) => bounds.union(value),
+                    None => value,
+                });
+            }
+        }
+
+        bounds.unwrap_or(Bounds::UNKNOWN)
+    }
+
+    /// Returns the bounds of the expression, looking up the bounds of any variable that isn't
+    /// listed in `known` as a clock node's output.
+    fn bounds_in_tree<'s>(
+        &'s self,
+        known: &IndexMap<&'s str, Bounds>,
+        instance: &ClockTreeNodeInstance,
+        tree: &ProcessedClockData,
+    ) -> Bounds {
+        let mut variables = known.clone();
+
+        self.visit_variables(|variable| {
+            if !variables.contains_key(variable) {
+                variables.insert(variable, instance.upstream_bounds(tree, variable));
+            }
+        });
+
+        self.bounds(&variables)
     }
 }
 
@@ -833,7 +1035,73 @@ impl<'de> Deserialize<'de> for Expression {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let expr = somni_parser::parser::parse_expression::<DefaultTypeSet>(&s).unwrap();
-        Ok(Expression { source: s, expr })
+        match somni_parser::parser::parse_expression::<DefaultTypeSet>(&s) {
+            Ok(ast::Expression::Expression { expression }) => Ok(Expression {
+                source: s,
+                expr: expression,
+            }),
+
+            Ok(_) => Err(de::Error::custom("Assignments are not supported")),
+            Err(err) => Err(de::Error::custom(format!(
+                "Invalid expression: {}",
+                MarkInSource(&s, err.location, "Expression error", &err.error)
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expression(source: &str) -> Expression {
+        let ast::Expression::Expression { expression } =
+            somni_parser::parser::parse_expression::<DefaultTypeSet>(source).unwrap()
+        else {
+            unreachable!()
+        };
+
+        Expression {
+            source: source.to_string(),
+            expr: expression,
+        }
+    }
+
+    #[test]
+    fn operator_bounds_are_conservative() {
+        let a = Bounds::new(2, 10);
+        let b = Bounds::new(3, 4);
+
+        assert_eq!(a.apply_operator("+", b), Some(Bounds::new(5, 14)));
+        assert_eq!(a.apply_operator("-", b), Some(Bounds::new(0, 7)));
+        assert_eq!(a.apply_operator("*", b), Some(Bounds::new(6, 40)));
+        assert_eq!(a.apply_operator("/", b), Some(Bounds::new(0, 3)));
+        assert_eq!(a.apply_operator("%", b), Some(Bounds::new(0, 3)));
+
+        // Comparisons don't produce a number.
+        assert_eq!(a.apply_operator("<", b), None);
+    }
+
+    #[test]
+    fn division_by_a_possibly_zero_value_assumes_a_divisor_of_one() {
+        let bounds = Bounds::new(0, 100).apply_operator("/", Bounds::new(0, 4));
+        assert_eq!(bounds, Some(Bounds::new(0, 100)));
+    }
+
+    #[test]
+    fn expression_bounds_account_for_repeated_variables() {
+        let expr = expression("(sclk * div_a) / (div_num * div_a + div_b)");
+
+        let variables = IndexMap::from_iter([
+            ("sclk", Bounds::new(40_000_000, 240_000_000)),
+            ("div_num", Bounds::new(2, 256)),
+            ("div_a", Bounds::new(1, 63)),
+            ("div_b", Bounds::new(0, 63)),
+        ]);
+
+        // The largest output is reached at div_num = 2, div_b = 0, for any div_a. Solving the
+        // expression keeps div_a consistent between the two places it appears, so the result
+        // isn't inflated to sclk * 63.
+        assert_eq!(expr.bounds(&variables), Bounds::new(125_391, 120_000_000));
     }
 }

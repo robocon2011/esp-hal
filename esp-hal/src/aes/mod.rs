@@ -156,10 +156,10 @@ impl<'d> Aes<'d> {
     pub fn new(aes: AES<'d>) -> Self {
         let guard = GenericPeripheralGuard::new();
 
-        #[cfg_attr(not(aes_dma), expect(unused_mut))]
+        #[cfg_attr(not(aes_supports_dma), expect(unused_mut))]
         let mut this = Self { aes, _guard: guard };
 
-        #[cfg(aes_dma)]
+        #[cfg(aes_supports_dma)]
         this.write_dma(false);
 
         this
@@ -191,20 +191,22 @@ impl<'d> Aes<'d> {
     }
 
     fn start(&self) {
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 self.regs().start().write(|w| w.start().set_bit());
-            } else {
+            }
+            _ => {
                 self.regs().trigger().write(|w| w.trigger().set_bit());
             }
         }
     }
 
     fn is_idle(&mut self) -> bool {
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 self.regs().idle().read().idle().bit_is_set()
-            } else {
+            }
+            _ => {
                 self.regs().state().read().state().bits() == 0
             }
         }
@@ -216,12 +218,19 @@ impl<'d> Aes<'d> {
         }
     }
 
+    /// Clears all key registers, no key material should be left in the peripheral.
+    #[cfg(clear_crypto_secrets)]
+    fn clear_key(&mut self) {
+        self.write_key(&[0; 32]);
+    }
+
     fn write_block(&mut self, block: &[u8]) {
         for (i, word) in read_words(block).enumerate() {
-            cfg_if::cfg_if! {
-                if #[cfg(aes_has_split_text_registers)] {
+            cfg_select! {
+                aes_has_split_text_registers => {
                     self.regs().text_in(i).write(|w| unsafe { w.bits(word) });
-                } else {
+                }
+                _ => {
                     self.regs().text(i).write(|w| unsafe { w.bits(word) });
                 }
             }
@@ -229,10 +238,11 @@ impl<'d> Aes<'d> {
     }
 
     fn read_block(&self, block: &mut [u8]) {
-        cfg_if::cfg_if! {
-            if #[cfg(aes_has_split_text_registers)] {
+        cfg_select! {
+            aes_has_split_text_registers => {
                 write_words(block, |i| self.regs().text_out(i).read().bits());
-            } else {
+            }
+            _ => {
                 write_words(block, |i| self.regs().text(i).read().bits());
             }
         }
@@ -242,7 +252,7 @@ impl<'d> Aes<'d> {
         self.regs().mode().write(|w| unsafe { w.bits(mode as _) });
     }
 
-    #[cfg(aes_dma)]
+    #[cfg(aes_supports_dma)]
     fn write_dma(&mut self, enable_dma: bool) {
         self.regs()
             .dma_enable()
@@ -256,6 +266,11 @@ impl<'d> Aes<'d> {
         self.start();
         while !(self.is_idle()) {}
         self.read_block(block);
+
+        // The `key` is dropped, but the hardware retains a copy in the key registers, clear them
+        // too.
+        #[cfg(clear_crypto_secrets)]
+        self.clear_key();
     }
 
     /// Encrypts the given buffer with the given key.
@@ -321,6 +336,9 @@ impl<'d> Aes<'d> {
                 }
             }
         }
+
+        #[cfg(clear_crypto_secrets)]
+        self.clear_key();
     }
 }
 
@@ -339,13 +357,13 @@ pub enum Endianness {
 /// transfer, which can significantly speed up operations when dealing with
 /// large data volumes. It supports various cipher modes such as ECB, CBC, OFB,
 /// CTR, CFB8, and CFB128.
-#[cfg(aes_dma)]
+#[cfg(aes_supports_dma)]
 pub mod dma {
     use core::{mem::ManuallyDrop, ptr::NonNull};
 
     use procmacros::{handler, ram};
 
-    #[cfg(psram_dma)]
+    #[cfg(dma_can_access_psram)]
     use crate::dma::ManualWritebackBuffer;
     use crate::{
         Blocking,
@@ -363,14 +381,13 @@ pub mod dma {
         },
         dma::{
             Channel,
-            DmaChannelFor,
             DmaDescriptor,
+            DmaEligiblePeripheral,
             DmaError,
-            DmaPeripheral,
             DmaRxBuffer,
             DmaTxBuffer,
             NoBuffer,
-            PeripheralDmaChannel,
+            aligned::InternalMemory,
             prepare_for_rx,
             prepare_for_tx,
         },
@@ -405,7 +422,7 @@ pub mod dma {
 
     // If we can process from PSRAM, we need 2 extra descriptors. One will store the unaligned head,
     // one will store the unaligned tail.
-    const OUT_DESCR_COUNT: usize = 1 + 2 * cfg!(psram_dma) as usize;
+    const OUT_DESCR_COUNT: usize = 1 + 2 * cfg!(dma_can_access_psram) as usize;
 
     /// A DMA capable AES instance.
     #[instability::unstable]
@@ -413,14 +430,14 @@ pub mod dma {
         /// The underlying [`Aes`](super::Aes) driver
         pub aes: super::Aes<'d>,
 
-        channel: Channel<Blocking, PeripheralDmaChannel<AES<'d>>>,
+        channel: Channel<Blocking, AesErased<'d>>,
     }
 
     impl<'d> super::Aes<'d> {
         /// Enable DMA for the current instance of the AES driver
-        pub fn with_dma(self, channel: impl DmaChannelFor<AES<'d>>) -> AesDma<'d> {
-            let channel = Channel::new(channel.degrade());
-            channel.runtime_ensure_compatible(&self.aes);
+        pub fn with_dma(self, channel: impl AesDmaChannel<'d>) -> AesDma<'d> {
+            let channel = Channel::new(channel.into());
+            channel.runtime_ensure_compatible(self.aes.dma_peripheral());
             AesDma { aes: self, channel }
         }
     }
@@ -463,7 +480,7 @@ pub mod dma {
             TXBUF: DmaTxBuffer,
             RXBUF: DmaRxBuffer,
         {
-            let peri = self.dma_peripheral();
+            let peri = self.aes.aes.dma_peripheral();
 
             if let Err(error) = unsafe { self.channel.tx.prepare_transfer(peri, &mut input) }
                 .and_then(|_| unsafe { self.channel.rx.prepare_transfer(peri, &mut output) })
@@ -526,10 +543,6 @@ pub mod dma {
 
         fn reset_aes(&self) {
             PeripheralClockControl::reset(Peripheral::Aes);
-        }
-
-        fn dma_peripheral(&self) -> DmaPeripheral {
-            DmaPeripheral::Aes
         }
 
         fn enable_dma(&self, enable: bool) {
@@ -677,7 +690,7 @@ pub mod dma {
             // cipher's state.
         },
         stop: |driver| {
-            // Drop the AES driver to conserve power when there is nothig to do (or when the driver
+            // Drop the AES driver to conserve power when there is nothing to do (or when the driver
             // was stopped).
             let driver = unsafe { AesDmaBackend::from_raw(driver) };
             driver.deinitialize()
@@ -695,8 +708,9 @@ pub mod dma {
 
     #[procmacros::doc_replace(
         "dma_channel" => {
-            cfg(esp32s2) => "let dma_channel = peripherals.DMA_CRYPTO;",
-            _ => "let dma_channel = peripherals.DMA_CH0;"
+            cfg(aes_dma_engine = "CRYPTO_DMA") => "DMA_CRYPTO",
+            cfg(aes_dma_engine = "AXI_GDMA") => "DMA_AXI_CH0",
+            _ => "DMA_CH0"
         }
     )]
     /// DMA-enabled AES processing backend.
@@ -714,9 +728,8 @@ pub mod dma {
     /// ```rust, no_run
     /// # {before_snippet}
     /// use esp_hal::aes::{AesContext, Operation, cipher_modes::Ecb, dma::AesDmaBackend};
-    /// #
-    /// # {dma_channel}
-    /// let mut aes = AesDmaBackend::new(peripherals.AES, dma_channel);
+    ///
+    /// let mut aes = AesDmaBackend::new(peripherals.AES, peripherals.__dma_channel__);
     /// // Start the backend, which allows processing AES operations.
     /// let _backend = aes.start();
     ///
@@ -729,9 +742,7 @@ pub mod dma {
     /// let input_buffer: [u8; 16] = *b"message\0\0\0\0\0\0\0\0\0";
     /// let mut output_buffer: [u8; 16] = [0; 16];
     ///
-    /// let operation_handle = ecb_encrypt
-    ///     .process(&input_buffer, &mut output_buffer)
-    ///     .unwrap();
+    /// let operation_handle = ecb_encrypt.process(&input_buffer, &mut output_buffer)?;
     /// operation_handle.wait_blocking();
     ///
     /// // output_buffer now contains the ciphertext
@@ -747,13 +758,12 @@ pub mod dma {
     /// ```
     pub struct AesDmaBackend<'d> {
         peri: AES<'d>,
-        dma: PeripheralDmaChannel<AES<'d>>,
+        dma: AesErased<'d>,
         state: DriverState<'d>,
 
-        #[cfg(psram_dma)]
+        #[cfg(dma_can_access_psram)]
         unaligned_data_buffers: [Option<ManualWritebackBuffer>; 2],
-        input_descriptors: [DmaDescriptor; 1],
-        output_descriptors: [DmaDescriptor; OUT_DESCR_COUNT],
+        descriptors: InternalMemory<[DmaDescriptor; OUT_DESCR_COUNT + 1]>,
     }
 
     // The DMA descriptors prevent auto-implementing Sync and Send, but they can be treated as Send
@@ -767,8 +777,9 @@ pub mod dma {
     impl<'d> AesDmaBackend<'d> {
         #[procmacros::doc_replace(
             "dma_channel" => {
-                cfg(esp32s2) => "let dma_channel = peripherals.DMA_CRYPTO;",
-                _ => "let dma_channel = peripherals.DMA_CH0;"
+                cfg(aes_dma_engine = "CRYPTO_DMA") => "DMA_CRYPTO",
+                cfg(aes_dma_engine = "AXI_GDMA") => "DMA_AXI_CH0",
+                _ => "DMA_CH0"
             }
         )]
         /// Creates a new DMA-enabled AES backend.
@@ -781,27 +792,26 @@ pub mod dma {
         /// # {before_snippet}
         /// use esp_hal::aes::dma::AesDmaBackend;
         ///
-        /// # {dma_channel}
-        /// let mut aes = AesDmaBackend::new(peripherals.AES, dma_channel);
+        /// let mut aes = AesDmaBackend::new(peripherals.AES, peripherals.__dma_channel__);
         /// # {after_snippet}
         /// ```
-        pub fn new(aes: AES<'d>, dma: impl DmaChannelFor<AES<'d>>) -> Self {
+        pub fn new(aes: AES<'d>, dma: impl AesDmaChannel<'d>) -> Self {
             Self {
                 peri: aes,
-                dma: dma.degrade(),
+                dma: dma.into(),
                 state: DriverState::None,
 
-                #[cfg(psram_dma)]
+                #[cfg(dma_can_access_psram)]
                 unaligned_data_buffers: [const { None }; 2],
-                input_descriptors: [DmaDescriptor::EMPTY; 1],
-                output_descriptors: [DmaDescriptor::EMPTY; OUT_DESCR_COUNT],
+                descriptors: InternalMemory::new([DmaDescriptor::EMPTY; OUT_DESCR_COUNT + 1]),
             }
         }
 
         #[procmacros::doc_replace(
             "dma_channel" => {
-                cfg(esp32s2) => "let dma_channel = peripherals.DMA_CRYPTO;",
-                _ => "let dma_channel = peripherals.DMA_CH0;"
+                cfg(aes_dma_engine = "CRYPTO_DMA") => "DMA_CRYPTO",
+                cfg(aes_dma_engine = "AXI_GDMA") => "DMA_AXI_CH0",
+                _ => "DMA_CH0"
             }
         )]
         /// Registers the DMA-driven AES driver to process AES operations.
@@ -814,8 +824,7 @@ pub mod dma {
         /// # {before_snippet}
         /// use esp_hal::aes::dma::AesDmaBackend;
         ///
-        /// # {dma_channel}
-        /// let mut aes = AesDmaBackend::new(peripherals.AES, dma_channel);
+        /// let mut aes = AesDmaBackend::new(peripherals.AES, peripherals.__dma_channel__);
         /// let _handle = aes.start();
         /// # {after_snippet}
         /// ```
@@ -838,14 +847,7 @@ pub mod dma {
                     let dma = unsafe { self.dma.clone_unchecked() };
                     let driver = super::Aes::new(peri).with_dma(dma);
 
-                    driver
-                        .aes
-                        .aes
-                        .bind_peri_interrupt(interrupt_handler.handler());
-                    driver
-                        .aes
-                        .aes
-                        .enable_peri_interrupt(interrupt_handler.priority());
+                    driver.aes.aes.bind_peri_interrupt(interrupt_handler);
 
                     driver
                 }
@@ -939,22 +941,13 @@ pub mod dma {
                     driver.clear_interrupt();
 
                     // Write out PSRAM data if needed:
-                    #[cfg(psram_dma)]
+                    #[cfg(dma_can_access_psram)]
                     for buffer in self.unaligned_data_buffers.iter_mut() {
                         // Avoid copying the write_back buffer
-                        if let Some(buffer) = buffer.as_ref() {
+                        if let Some(buffer) = buffer.as_mut() {
                             buffer.write_back();
                         }
                         *buffer = None;
-                    }
-                    #[cfg(psram_dma)]
-                    if crate::psram::psram_range().contains(&item.buffers.output.addr().get()) {
-                        unsafe {
-                            crate::soc::cache_writeback_addr(
-                                item.buffers.output.addr().get() as u32,
-                                item.buffers.output.len() as u32,
-                            );
-                        }
                     }
 
                     // Now process the remainder:
@@ -995,11 +988,12 @@ pub mod dma {
             work_item: &mut AesOperation,
         ) -> Result<(), AesDma<'d>> {
             let input_len = work_item.buffers.input.len();
+            let (input_dscr, output_dscr) = self.descriptors.get_mut().into_inner().split_at_mut(1);
             let (input_buffer, data_len) = unsafe {
                 // This unwrap is infallible as AES-DMA devices don't have TX DMA alignment
                 // requirements.
                 unwrap!(prepare_for_tx(
-                    &mut self.input_descriptors,
+                    input_dscr,
                     work_item.buffers.input,
                     BLOCK_SIZE,
                 ))
@@ -1013,8 +1007,8 @@ pub mod dma {
 
             let (output_buffer, rx_data_len) = unsafe {
                 prepare_for_rx(
-                    &mut self.output_descriptors,
-                    #[cfg(psram_dma)]
+                    output_dscr,
+                    #[cfg(dma_can_access_psram)]
                     &mut self.unaligned_data_buffers,
                     // Truncate data based on how much the TX buffer can read.
                     NonNull::slice_from_raw_parts(work_item.buffers.output.cast::<u8>(), data_len),
@@ -1211,6 +1205,29 @@ pub mod dma {
             }
         }
     }
+
+    /// DMA channel trait for the AES peripheral.
+    ///
+    /// Implemented for every channel type capable of serving AES.
+    #[diagnostic::on_unimplemented(
+        message = "The DMA channel cannot be used with the AES peripheral",
+        label = "This DMA channel"
+    )]
+    pub trait AesDmaChannel<'d>: crate::private::Sealed + Into<AesErased<'d>> {}
+
+    with_aes_dma_engine! {
+        ($engine:tt, $any_channel:ident) => {
+            type AesErased<'d> = crate::dma::$any_channel<'d>;
+
+            crate::macros::impl_dma_channel_trait! {
+                $engine,
+                peri = AES,
+                ($peri:path, $ch:path) => {
+                    impl<'d> AesDmaChannel<'d> for $ch {}
+                }
+            }
+        };
+    }
 }
 
 use crate::work_queue::{
@@ -1355,7 +1372,7 @@ const BLOCKING_AES_VTABLE: VTable<AesOperation> = VTable {
         // manner and so they can't be cancelled.
     },
     stop: |driver| {
-        // Drop the AES driver to conserve power when there is nothig to do (or when the driver was
+        // Drop the AES driver to conserve power when there is nothing to do (or when the driver was
         // stopped).
         let driver = unsafe { AesBackend::from_raw(driver) };
         driver.deinitialize()
@@ -1384,9 +1401,7 @@ const BLOCKING_AES_VTABLE: VTable<AesOperation> = VTable {
 /// let input_buffer: [u8; 16] = *b"message\0\0\0\0\0\0\0\0\0";
 /// let mut output_buffer: [u8; 16] = [0; 16];
 ///
-/// let operation_handle = ecb_encrypt
-///     .process(&input_buffer, &mut output_buffer)
-///     .unwrap();
+/// let operation_handle = ecb_encrypt.process(&input_buffer, &mut output_buffer)?;
 /// operation_handle.wait_blocking();
 ///
 /// // output_buffer now contains the ciphertext
@@ -1592,7 +1607,7 @@ impl AesContext {
     /// // the length of the data is a multiple of the block (16 bytes) size.
     /// let mut buffer: [u8; 16] = *b"message\0\0\0\0\0\0\0\0\0";
     ///
-    /// let operation_handle = ecb_encrypt.process_in_place(&mut buffer).unwrap();
+    /// let operation_handle = ecb_encrypt.process_in_place(&mut buffer)?;
     /// operation_handle.wait_blocking();
     ///
     /// // Instead of the plaintext message, buffer now contains the ciphertext.

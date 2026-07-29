@@ -50,20 +50,20 @@
 //! would be slightly more complicated to prevent the user from breaking things.
 //! (If the user were to clear the interrupt status, we would need to re-enable
 //! it, for PinFuture to detect the completion).
-//!
-//! TODO: currently, direct-binding a GPIO interrupt handler will completely
-//! break the async API. We will need to expose a way to handle async events.
 
 use portable_atomic::{AtomicPtr, Ordering};
-use procmacros::ram;
 use strum::EnumCount;
 
-#[cfg(feature = "rt")]
-use crate::interrupt::{self, DEFAULT_INTERRUPT_HANDLER};
 use crate::{
-    gpio::{AnyPin, GPIO_LOCK, GpioBank, InputPin, set_int_enable},
-    interrupt::Priority,
-    peripherals::{GPIO, Interrupt},
+    gpio::{AnyPin, GPIO_LOCK, GpioBank, InputPin, low_level::set_int_enable},
+    ram,
+};
+#[cfg(feature = "rt")]
+use crate::{
+    handler,
+    interrupt::{self, DEFAULT_INTERRUPT_HANDLER},
+    peripherals::Interrupt,
+    system::Cpu,
 };
 
 /// Convenience constant for `Option::None` pin
@@ -102,41 +102,19 @@ pub(crate) fn bind_default_interrupt_handler() {
 
     // The vector table doesn't contain a custom entry. Still, the
     // peripheral interrupt may already be bound to something else.
-    for cpu in cores() {
-        if interrupt::bound_cpu_interrupt_for(cpu, Interrupt::GPIO).is_some() {
-            info!("Not using default GPIO interrupt handler: peripheral interrupt already in use");
-            return;
+    let mut is_mapped = false;
+    for cpu in Cpu::all() {
+        if interrupt::mapped_to(cpu, Interrupt::GPIO).is_some() {
+            is_mapped = true;
         }
     }
 
-    unsafe {
-        interrupt::bind_interrupt(
-            Interrupt::GPIO,
-            interrupt::IsrCallback::new(default_gpio_interrupt_handler),
-        )
-    };
-
-    // By default, we use lowest priority
-    set_interrupt_priority(Interrupt::GPIO, Priority::min());
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(esp32)] {
-        // On ESP32, the interrupt fires on the core that started listening for a pin event.
-        fn cores() -> impl Iterator<Item = crate::system::Cpu> {
-            crate::system::Cpu::all()
-        }
-    } else {
-        fn cores() -> [crate::system::Cpu; 1] {
-            [crate::system::Cpu::current()]
-        }
+    if is_mapped {
+        info!("Not using default GPIO interrupt handler: peripheral interrupt already in use");
+        return;
     }
-}
 
-pub(super) fn set_interrupt_priority(interrupt: Interrupt, priority: Priority) {
-    for cpu in cores() {
-        unwrap!(crate::interrupt::enable_on_cpu(cpu, interrupt, priority));
-    }
+    super::low_level::enable_interrupt(default_gpio_interrupt_handler);
 }
 
 /// The default GPIO interrupt handler, when the user has not set one.
@@ -145,8 +123,9 @@ pub(super) fn set_interrupt_priority(interrupt: Interrupt, priority: Priority) {
 /// status bits unchanged. This enables functions like `is_interrupt_set` to
 /// work correctly.
 #[ram]
+#[handler]
 #[cfg(feature = "rt")]
-extern "C" fn default_gpio_interrupt_handler() {
+fn default_gpio_interrupt_handler() {
     GPIO_LOCK.lock(|| {
         let banks = interrupt_status();
 
@@ -188,57 +167,67 @@ pub(super) extern "C" fn user_gpio_interrupt_handler() {
 
         // Call the user handler before clearing interrupts. The user can use the enable
         // bits to determine which interrupts they are interested in. Clearing the
-        // interupt status or enable bits have no effect on the rest of the
+        // interrupt status or enable bits have no effect on the rest of the
         // interrupt handler.
         USER_INTERRUPT_HANDLER.call();
 
-        // Handle the async interrupts
-        for (bank, intrs) in banks {
-            // Get the mask of active async pins and clear the relevant bits to signal
-            // completion. This way the user may clear the interrupt status
-            // without worrying about the async bit being cleared.
-            let async_pins = bank.async_operations().load(Ordering::Relaxed);
-
-            // Wake up the tasks
-            handle_async_pins(bank, async_pins, intrs);
-        }
+        process_async_banks(banks);
     });
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum InterruptStatusRegisterAccess {
-    Bank0,
-    #[cfg(gpio_has_bank_1)]
-    Bank1,
+/// Internal entry point for [`crate::gpio::handle_gpio_interrupt`].
+///
+/// Kept here (rather than at the public callsite) because this module owns
+/// the GPIO ISR critical section and the per-bank dispatch routine, both of
+/// which are private to this module.
+///
+/// # Safety
+///
+/// Must be called from a GPIO interrupt context.
+#[ram]
+pub(super) unsafe fn handle_gpio_interrupt_impl() {
+    GPIO_LOCK.lock(|| {
+        let banks = interrupt_status();
+        process_async_banks(banks);
+    });
 }
 
-impl InterruptStatusRegisterAccess {
-    pub(crate) fn interrupt_status_read(self) -> u32 {
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
-                match self {
-                    Self::Bank0 => GPIO::regs().status().read().bits(),
-                    Self::Bank1 => GPIO::regs().status1().read().bits(),
-                }
-            } else if #[cfg(any(esp32c2, esp32c3, esp32c6, esp32h2))] {
-                GPIO::regs().pcpu_int().read().bits()
-            } else if #[cfg(any(esp32s2, esp32s3))] {
-                // Whilst the S3 is a dual core chip, it shares the enable registers between
-                // cores so treat it as a single core device
-                match self {
-                    Self::Bank0 => GPIO::regs().pcpu_int().read().bits(),
-                    Self::Bank1 => GPIO::regs().pcpu_int1().read().bits(),
-                }
-            }
-        }
+#[inline]
+pub(super) fn process_async_banks(banks: [(GpioBank, u32); GpioBank::COUNT]) {
+    for (bank, intrs) in banks {
+        let async_pins = bank.async_operations().load(Ordering::Relaxed);
+
+        handle_async_pins(bank, async_pins, intrs);
     }
 }
 
+/// Internal entry point for [`crate::gpio::wake_pin`].
+///
+/// # Safety
+///
+/// Must be called from a GPIO interrupt context.
+#[ram]
+pub(super) unsafe fn wake_pin_impl(pin: u8) {
+    GPIO_LOCK.lock(|| {
+        let any = unsafe { AnyPin::steal(pin) };
+        let bank = any.bank();
+        let mask = any.mask();
+
+        // Only act if this pin is registered as an async waiter.
+        let async_pins = bank.async_operations().load(Ordering::Relaxed);
+        if async_pins & mask == 0 {
+            return;
+        }
+
+        handle_async_pins(bank, mask, mask);
+    });
+}
+
 fn interrupt_status() -> [(GpioBank, u32); GpioBank::COUNT] {
-    let intrs_bank0 = InterruptStatusRegisterAccess::Bank0.interrupt_status_read();
+    let intrs_bank0 = GpioBank::_0.read_interrupt_status_of_current_cpu();
 
     #[cfg(gpio_has_bank_1)]
-    let intrs_bank1 = InterruptStatusRegisterAccess::Bank1.interrupt_status_read();
+    let intrs_bank1 = GpioBank::_1.read_interrupt_status_of_current_cpu();
 
     [
         (GpioBank::_0, intrs_bank0),

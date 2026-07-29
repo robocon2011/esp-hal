@@ -149,6 +149,7 @@ impl<T: Sync + Send> Inner<T> {
     fn dequeue_and_post(&mut self, notify_on_empty: bool) -> bool {
         let Some(mut ptr) = self.dequeue() else {
             if notify_on_empty {
+                debug!("Stop driver - no more work items");
                 // There are no more work items. Notify the driver that it can stop.
                 (self.vtable.stop)(self.data);
             }
@@ -157,6 +158,7 @@ impl<T: Sync + Send> Inner<T> {
 
         // Start processing a new work item.
 
+        debug!("Post new work item to driver");
         if let Some(poll_status) = (self.vtable.post)(self.data, &mut unsafe { ptr.as_mut() }.data)
         {
             match poll_status {
@@ -526,6 +528,7 @@ pub(crate) struct Handle<'t, T: Sync + Send> {
 }
 
 impl<'t, T: Sync + Send> Handle<'t, T> {
+    #[cfg(sha_driver_supported)]
     pub(crate) fn from_completed_work_item(
         queue: &'t WorkQueue<T>,
         work_item: &'t mut WorkItem<T>,
@@ -705,6 +708,7 @@ pub(crate) struct WorkQueueFrontend<T: Sync + Send> {
 }
 
 impl<T: Sync + Send> WorkQueueFrontend<T> {
+    /// Creates a new work queue frontend with the given initial value.
     pub fn new(initial: T) -> Self {
         Self {
             work_item: WorkItem {
@@ -716,15 +720,26 @@ impl<T: Sync + Send> WorkQueueFrontend<T> {
         }
     }
 
+    /// Returns a reference to the work item's data.
+    #[cfg(ecc_driver_supported)]
+    pub fn data(&self) -> &T {
+        &self.work_item.data
+    }
+
+    /// Returns a mutable reference to the work item's data.
     pub fn data_mut(&mut self) -> &mut T {
         &mut self.work_item.data
     }
 
+    /// Posts the work item to the queue.
+    ///
+    /// Returns a [`Handle`] that can be used to wait for the work item to complete.
     pub fn post<'t>(&'t mut self, queue: &'t WorkQueue<T>) -> Handle<'t, T> {
         queue.post_work(&mut self.work_item)
     }
 
     /// Creates a Handle for a work item that does not need to be put into the queue.
+    #[cfg(sha_driver_supported)]
     pub fn post_completed<'t>(&'t mut self, queue: &'t WorkQueue<T>) -> Handle<'t, T> {
         Handle::from_completed_work_item(queue, &mut self.work_item)
     }

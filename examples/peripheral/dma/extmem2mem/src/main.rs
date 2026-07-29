@@ -1,7 +1,6 @@
 //! Uses DMA to copy psram to internal memory.
-//!
-//! If your module is octal PSRAM then you need to set
-//! `ESP_HAL_CONFIG_PSRAM_MODE` to `octal`.
+
+//% CHIP_FILTER: dma_can_access_psram && dma_supports_mem2mem
 
 #![no_std]
 #![no_main]
@@ -46,24 +45,12 @@ macro_rules! dma_alloc_buffer {
     }};
 }
 
-fn init_heap(psram: &esp_hal::peripherals::PSRAM<'_>) {
-    let (start, size) = esp_hal::psram::psram_raw_parts(psram);
-    info!("init_heap: start: {:p}", start);
-    unsafe {
-        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-            start,
-            size,
-            esp_alloc::MemoryCapability::External.into(),
-        ));
-    }
-}
-
 #[main]
 fn main() -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
-    init_heap(&peripherals.PSRAM);
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let delay = Delay::new();
 
@@ -71,14 +58,23 @@ fn main() -> ! {
     let intram_buffer = dma_buffer_aligned!(DATA_SIZE, A64);
     let (rx_descriptors, tx_descriptors) = dma_descriptors_chunk_size!(DATA_SIZE, CHUNK_SIZE);
 
-    let dma_peripheral = peripherals.SPI2;
+    let mem2mem = cfg_select! {
+        feature = "esp32s2" => Mem2Mem::new(peripherals.DMA_CRYPTO),
+        feature = "esp32s3" => Mem2Mem::new(peripherals.DMA_CH0, peripherals.SPI2),
+        feature = "esp32p4" => Mem2Mem::new(peripherals.DMA_AXI_CH0),
+        _ => Mem2Mem::new(peripherals.DMA_CH0),
+    };
 
-    let mut mem2mem = Mem2Mem::new(peripherals.DMA_CH0, dma_peripheral)
+    let mut mem2mem = mem2mem
         .with_descriptors(
             rx_descriptors,
             tx_descriptors,
             BurstConfig {
-                external_memory: ExternalBurstConfig::Size64,
+                external_memory: cfg_select! {
+                    // ExternalBurstConfig::Size64 is not available on ESP32-S2.
+                    feature = "esp32s2" => ExternalBurstConfig::Size32,
+                    _ => ExternalBurstConfig::Size64,
+                },
                 internal_memory: Default::default(),
             },
         )

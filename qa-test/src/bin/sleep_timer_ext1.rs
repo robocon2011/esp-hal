@@ -3,26 +3,24 @@
 //! The following wiring is assumed:
 //! - ext1 wakeup pins => GPIO2, GPIO4
 
-//% CHIPS: esp32 esp32s2 esp32s3
+//% CHIP_FILTER: xtensa && sleep_driver_supported
 
 #![no_std]
 #![no_main]
 
-use core::time::Duration;
-
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
-    gpio::{Input, InputConfig, Pull, RtcPin},
+    gpio::{Input, InputConfig, Level, Pull, RtcPin},
     main,
     rtc_cntl::{
-        Rtc,
         SocResetReason,
         reset_reason,
-        sleep::{Ext1WakeupSource, TimerWakeupSource, WakeupLevel},
+        sleep::{Ext1WakeupSource, LowPower, TimerWakeupSource},
         wakeup_cause,
     },
     system::Cpu,
+    time::Duration,
 };
 use esp_println::println;
 
@@ -32,7 +30,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    let mut rtc = Rtc::new(peripherals.LPWR);
+    let mut lpwr = LowPower::new(peripherals.LPWR);
 
     let mut pin_2 = peripherals.GPIO2;
     let mut pin_4 = peripherals.GPIO4;
@@ -41,7 +39,7 @@ fn main() -> ! {
         InputConfig::default().with_pull(Pull::None),
     );
 
-    println!("up and runnning!");
+    println!("up and running!");
     let reason = reset_reason(Cpu::ProCpu).unwrap_or(SocResetReason::ChipPowerOn);
     println!("reset reason: {:?}", reason);
     let wake_reason = wakeup_cause();
@@ -52,8 +50,8 @@ fn main() -> ! {
     let timer = TimerWakeupSource::new(Duration::from_secs(30));
     core::mem::drop(input);
     let mut wakeup_pins: [&mut dyn RtcPin; 2] = [&mut pin_4, &mut pin_2];
-    let ext1 = Ext1WakeupSource::new(&mut wakeup_pins, WakeupLevel::High);
+    let ext1 = Ext1WakeupSource::new(&mut wakeup_pins, Level::High);
     println!("sleeping!");
     delay.delay_millis(100);
-    rtc.sleep_deep(&[&timer, &ext1]);
+    lpwr.sleep_deep(&[&timer, &ext1]);
 }

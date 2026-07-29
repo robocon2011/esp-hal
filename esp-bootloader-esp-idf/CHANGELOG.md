@@ -9,18 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `OtaUpdater::ota_data()` (#4413)
+- Add ESP32-S31 support (#5922)
 
 ### Changed
 
-- `Ota::new()` now takes `FlashRegion` by value (#4413)
-- The section of `ESP_APP_DESC` has been changed to `.flash.appdesc` to align with the behavior of esptool (#4745)
+- ESP32-P4: Use ROM CRC32 / MD5 functions instead of the software fallback (#5400)
 
 ### Fixed
 
 
 ### Removed
 
+
+## [v0.5.0] - 2026-04-16
+
+### Added
+
+- `OtaUpdater::ota_data()` (#4413)
+- Initial ESP32-C5 support (#4859)
+- Initial ESP32-C61 support (#5187)
+
+### Changed
+
+- `Ota::new()` now takes `FlashRegion` by value (#4413)
+- The section of `ESP_APP_DESC` has been changed to `.flash.appdesc` to align with the behavior of esptool (#4745)
+- `esp_app_desc!` macro now accepts a `secure_version` argument (#5326)
 
 ## [v0.4.0] - 2025-10-30
 
@@ -86,4 +99,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v0.2.0]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.1.0...esp-bootloader-esp-idf-v0.2.0
 [v0.3.0]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.2.0...esp-bootloader-esp-idf-v0.3.0
 [v0.4.0]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.3.0...esp-bootloader-esp-idf-v0.4.0
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.4.0...HEAD
+[v0.5.0]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.4.0...esp-bootloader-esp-idf-v0.5.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-bootloader-esp-idf-v0.5.0...HEAD

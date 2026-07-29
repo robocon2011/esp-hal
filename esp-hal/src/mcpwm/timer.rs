@@ -104,7 +104,7 @@ impl<const TIM: u8, PWM: PwmPeripheral> Timer<TIM, PWM> {
 
     fn cfg1(&mut self) -> &pac::mcpwm0::timer::CFG1 {
         // SAFETY:
-        // We only grant access to our CFG0 register with the lifetime of &mut self
+        // We only grant access to our CFG1 register with the lifetime of &mut self
         unsafe { Self::tmr() }.cfg1()
     }
 
@@ -168,7 +168,9 @@ impl TimerClockConfig {
         if target_timer_frequency == 0 || target_freq > clock.frequency {
             return Err(FrequencyError);
         }
-        let prescaler = clock.frequency.as_hz() / target_timer_frequency - 1;
+        let prescaler = (clock.frequency.as_hz() / target_timer_frequency)
+            .checked_sub(1)
+            .ok_or(FrequencyError)?;
         if prescaler > u8::MAX as u32 {
             return Err(FrequencyError);
         }

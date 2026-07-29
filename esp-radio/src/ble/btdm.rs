@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use core::ptr::{NonNull, addr_of, addr_of_mut};
 
-use esp_phy::{PhyController, PhyInitGuard};
+use esp_phy::PhyInitGuard;
 use esp_sync::RawMutex;
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -189,11 +189,6 @@ unsafe extern "C" fn task_delete(task: *mut ()) {
     }
 }
 
-#[ram]
-unsafe extern "C" fn is_in_isr() -> i32 {
-    crate::is_interrupts_disabled() as i32
-}
-
 #[cfg(esp32)]
 #[ram]
 unsafe extern "C" fn cause_sw_intr_to_core(_core: i32, _intr_no: i32) -> i32 {
@@ -227,7 +222,7 @@ unsafe extern "C" fn btdm_hus_2_lpcycles(us: u32) -> u32 {
     let g_btdm_lpcycle_us = 2 << (g_btdm_lpcycle_us_frac);
 
     // Converts a duration in half us into a number of low power clock cycles.
-    let cycles: u64 = (us as u64) << (g_btdm_lpcycle_us_frac as u64 / g_btdm_lpcycle_us as u64);
+    let cycles: u64 = ((us as u64) << g_btdm_lpcycle_us_frac) / (g_btdm_lpcycle_us as u64);
     trace!("btdm_hus_2_lpcycles {} {}", us, cycles);
 
     cycles as u32
@@ -259,7 +254,7 @@ unsafe extern "C" fn btdm_sleep_exit_phase3() {
 
 unsafe extern "C" fn coex_schm_status_bit_set(_typ: i32, status: i32) {
     trace!("coex_schm_status_bit_set {} {}", _typ, status);
-    #[cfg(coex)]
+    #[cfg(feature = "coex")]
     unsafe {
         crate::sys::include::coex_schm_status_bit_set(_typ as u32, status as u32)
     };
@@ -267,7 +262,7 @@ unsafe extern "C" fn coex_schm_status_bit_set(_typ: i32, status: i32) {
 
 unsafe extern "C" fn coex_schm_status_bit_clear(_typ: i32, status: i32) {
     trace!("coex_schm_status_bit_clear {} {}", _typ, status);
-    #[cfg(coex)]
+    #[cfg(feature = "coex")]
     unsafe {
         crate::sys::include::coex_schm_status_bit_clear(_typ as u32, status as u32)
     };
@@ -325,7 +320,7 @@ pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
         let res = btdm_osi_funcs_register(addr_of!(G_OSI_FUNCS));
         assert!(res == 0, "btdm_osi_funcs_register returned {}", res);
 
-        #[cfg(coex)]
+        #[cfg(feature = "coex")]
         {
             let res = crate::wifi::coex_init();
             assert!(res == 0, "coex_init failed");
@@ -352,25 +347,26 @@ pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
 
         debug!("The btdm_controller_init was initialized");
 
-        #[cfg(coex)]
+        #[cfg(feature = "coex")]
         crate::sys::include::coex_enable();
 
-        phy_init_guard = esp_hal::peripherals::BT::steal().enable_phy();
+        phy_init_guard = esp_phy::enable_phy();
 
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
+        cfg_select! {
+            esp32 => {
                 unsafe extern "C" {
                     fn btdm_rf_bb_init_phase2();
                 }
 
                 btdm_rf_bb_init_phase2();
                 coex_bt_high_prio();
-            } else {
+            }
+            _ => {
                 coex_pti_v2();
             }
         }
 
-        #[cfg(coex)]
+        #[cfg(feature = "coex")]
         coex_enable();
 
         btdm_controller_enable(esp_bt_mode_t_ESP_BT_MODE_BLE);
@@ -417,14 +413,14 @@ pub fn send_hci(data: &[u8]) {
 
                 PACKET_SENT.store(false, Ordering::Relaxed);
 
-                #[cfg(all(esp32, coex))]
+                #[cfg(all(esp32, feature = "coex"))]
                 ble_os_adapter_chip_specific::async_wakeup_request(
                     ble_os_adapter_chip_specific::BTDM_ASYNC_WAKEUP_REQ_HCI,
                 );
 
                 API_vhci_host_send_packet(packet.as_ptr(), packet.len() as u16);
 
-                #[cfg(all(esp32, coex))]
+                #[cfg(all(esp32, feature = "coex"))]
                 ble_os_adapter_chip_specific::async_wakeup_request_end(
                     ble_os_adapter_chip_specific::BTDM_ASYNC_WAKEUP_REQ_HCI,
                 );

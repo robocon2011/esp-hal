@@ -6,7 +6,8 @@ use super::*;
 use crate::{
     ble::InvalidConfigError,
     common_adapter::*,
-    hal::{interrupt, peripherals::Interrupt},
+    hal::{interrupt::Priority, peripherals::BT},
+    interrupt_dispatch::Handler,
     sys::include::{
         esp_bt_controller_config_t,
         esp_bt_mode_t,
@@ -17,14 +18,9 @@ use crate::{
     },
 };
 
-pub(crate) static mut ISR_INTERRUPT_5: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
-
-pub(crate) static mut ISR_INTERRUPT_8: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
-
-pub(crate) static mut ISR_INTERRUPT_7: (*mut c_void, *mut c_void) =
-    (core::ptr::null_mut(), core::ptr::null_mut());
+static ISR_INTERRUPT_5: Handler = Handler::new();
+static ISR_INTERRUPT_7: Handler = Handler::new();
+static ISR_INTERRUPT_8: Handler = Handler::new();
 
 #[repr(C)]
 pub(super) struct osi_funcs_s {
@@ -91,7 +87,7 @@ pub(super) struct osi_funcs_s {
     coex_schm_status_bit_set: Option<unsafe extern "C" fn(i32, i32)>,
     coex_schm_interval_get: Option<unsafe extern "C" fn() -> u32>,
     coex_schm_curr_period_get: Option<unsafe extern "C" fn() -> u8>,
-    coex_schm_curr_phase_get: Option<unsafe extern "C" fn() -> *const ()>,
+    coex_schm_curr_phase_get: Option<unsafe extern "C" fn() -> *mut c_void>,
     coex_wifi_channel_get: Option<unsafe extern "C" fn(*mut u8, *mut u8) -> i32>,
     coex_register_wifi_channel_change_callback:
         Option<unsafe extern "C" fn(unsafe extern "C" fn()) -> i32>,
@@ -106,8 +102,8 @@ pub(super) struct osi_funcs_s {
 
 pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     version: 0x00010005,
-    set_isr: Some(ble_os_adapter_chip_specific::set_isr),
-    ints_on: Some(ble_os_adapter_chip_specific::ints_on),
+    set_isr: Some(set_isr),
+    ints_on: Some(ints_on),
     interrupt_disable: Some(interrupt_disable),
     interrupt_restore: Some(interrupt_enable),
     task_yield: Some(task_yield),
@@ -146,25 +142,21 @@ pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     btdm_sleep_exit_phase1: Some(btdm_sleep_exit_phase1),
     btdm_sleep_exit_phase2: Some(btdm_sleep_exit_phase2),
     btdm_sleep_exit_phase3: Some(btdm_sleep_exit_phase3),
-    coex_bt_wakeup_request: Some(ble_os_adapter_chip_specific::coex_bt_wakeup_request),
-    coex_bt_wakeup_request_end: Some(ble_os_adapter_chip_specific::coex_bt_wakeup_request_end),
-    coex_bt_request: Some(ble_os_adapter_chip_specific::coex_bt_request),
-    coex_bt_release: Some(ble_os_adapter_chip_specific::coex_bt_release),
-    coex_register_bt_cb: Some(ble_os_adapter_chip_specific::coex_register_bt_cb_wrapper),
-    coex_bb_reset_lock: Some(ble_os_adapter_chip_specific::coex_bb_reset_lock),
-    coex_bb_reset_unlock: Some(ble_os_adapter_chip_specific::coex_bb_reset_unlock),
-    coex_schm_register_btdm_callback: Some(
-        ble_os_adapter_chip_specific::coex_schm_register_btdm_callback_wrapper,
-    ),
+    coex_bt_wakeup_request: Some(coex_bt_wakeup_request),
+    coex_bt_wakeup_request_end: Some(coex_bt_wakeup_request_end),
+    coex_bt_request: Some(coex_bt_request),
+    coex_bt_release: Some(coex_bt_release),
+    coex_register_bt_cb: Some(coex_register_bt_cb),
+    coex_bb_reset_lock: Some(coex_bb_reset_lock),
+    coex_bb_reset_unlock: Some(coex_bb_reset_unlock),
+    coex_schm_register_btdm_callback: Some(coex_schm_register_btdm_callback_wrapper),
     coex_schm_status_bit_clear: Some(coex_schm_status_bit_clear),
     coex_schm_status_bit_set: Some(coex_schm_status_bit_set),
-    coex_schm_interval_get: Some(ble_os_adapter_chip_specific::coex_schm_interval_get),
-    coex_schm_curr_period_get: Some(ble_os_adapter_chip_specific::coex_schm_curr_period_get),
-    coex_schm_curr_phase_get: Some(ble_os_adapter_chip_specific::coex_schm_curr_phase_get),
-    coex_wifi_channel_get: Some(ble_os_adapter_chip_specific::coex_wifi_channel_get),
-    coex_register_wifi_channel_change_callback: Some(
-        ble_os_adapter_chip_specific::coex_register_wifi_channel_change_callback,
-    ),
+    coex_schm_interval_get: Some(coex_schm_interval_get),
+    coex_schm_curr_period_get: Some(coex_schm_curr_period_get),
+    coex_schm_curr_phase_get: Some(coex_schm_curr_phase_get),
+    coex_wifi_channel_get: Some(coex_wifi_channel_get),
+    coex_register_wifi_channel_change_callback: Some(coex_register_wifi_channel_change_callback),
     set_isr13: Some(set_isr13),
     interrupt_l3_disable: Some(interrupt_l3_disable),
     interrupt_l3_restore: Some(interrupt_l3_restore),
@@ -329,8 +321,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // same priority as the wifi task, when using esp-rtos (I'm assuming it's MAX_PRIO - 2)
-            task_priority: 29,
+            task_priority: crate::preempt::max_task_priority()
+                .saturating_sub(2)
+                .min(255) as u8,
             task_stack_size: 4096,
             max_connections: CONFIG_BTDM_CTRL_BLE_MAX_CONN_EFF as _,
             scan_duplicate_list_count: CONFIG_BTDM_SCAN_DUPL_CACHE_SIZE as _,
@@ -348,6 +341,12 @@ impl Default for Config {
 
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), InvalidConfigError> {
+        crate::ble::validate_range!(
+            self,
+            task_priority,
+            0,
+            crate::preempt::max_task_priority().min(255) as u8
+        );
         crate::ble::validate_range!(self, max_connections, 1, 9);
         crate::ble::validate_range!(self, scan_duplicate_list_count, 10, 1000);
         crate::ble::validate_range!(self, scan_duplicate_refresh_period, 0, 1000);
@@ -470,9 +469,9 @@ pub(crate) unsafe extern "C" fn coex_bt_wakeup_request() -> bool {
 
     // This should really be
     // ```rust,norun
-    // #[cfg(coex)]
+    // #[cfg(feature = "coex")]
     // return async_wakeup_request(BTDM_ASYNC_WAKEUP_REQ_COEX);
-    // #[cfg(not(coex))]
+    // #[cfg(not(feature = "coex"))]
     // true
     // ```
     //
@@ -486,7 +485,7 @@ pub(crate) unsafe extern "C" fn coex_bt_wakeup_request_end() {
 
     // This should really be
     // ```rust,norun
-    // #[cfg(coex)]
+    // #[cfg(feature = "coex")]
     // async_wakeup_request_end(BTDM_ASYNC_WAKEUP_REQ_COEX);
     // ```
     //
@@ -494,187 +493,74 @@ pub(crate) unsafe extern "C" fn coex_bt_wakeup_request_end() {
     // In a similar scenario this function isn't called in ESP-IDF.
 }
 
-#[allow(unused_variables)]
-pub(crate) unsafe extern "C" fn coex_bt_request(event: u32, latency: u32, duration: u32) -> i32 {
-    trace!("coex_bt_request");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_bt_request(event: u32, latency: u32, duration: u32) -> i32;
-    }
-
-    #[cfg(coex)]
-    return unsafe { coex_bt_request(event, latency, duration) };
-
-    #[cfg(not(coex))]
-    0
+extern_coex_fns! {
+    fn coex_bt_request(event: u32, latency: u32, duration: u32) -> i32;
+    fn coex_bt_release(event: u32) -> i32;
+    fn coex_register_bt_cb(callback: unsafe extern "C" fn()) -> i32;
+    fn coex_bb_reset_lock() -> u32;
+    fn coex_bb_reset_unlock(event: u32);
+    fn coex_register_wifi_channel_change_callback(callback: unsafe extern "C" fn()) -> i32;
 }
 
-#[allow(unused_variables)]
-pub(crate) unsafe extern "C" fn coex_bt_release(event: u32) -> i32 {
-    trace!("coex_bt_release");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_bt_release(event: u32) -> i32;
-    }
-
-    #[cfg(coex)]
-    return unsafe { coex_bt_release(event) };
-
-    #[cfg(not(coex))]
-    0
-}
-
-pub(crate) unsafe extern "C" fn coex_register_bt_cb_wrapper(
-    callback: unsafe extern "C" fn(),
-) -> i32 {
-    trace!("coex_register_bt_cb {:?}", callback);
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_register_bt_cb(callback: unsafe extern "C" fn()) -> i32;
-    }
-
-    #[cfg(coex)]
-    return unsafe { coex_register_bt_cb(callback) };
-
-    #[cfg(not(coex))]
-    0
-}
-
-pub(crate) unsafe extern "C" fn coex_bb_reset_lock() -> u32 {
-    trace!("coex_bb_reset_lock");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_bb_reset_lock() -> u32;
-    }
-
-    #[cfg(coex)]
-    return unsafe { coex_bb_reset_lock() };
-
-    #[cfg(not(coex))]
-    0
-}
-
-#[allow(unused_variables)]
-pub(crate) unsafe extern "C" fn coex_bb_reset_unlock(event: u32) {
-    trace!("coex_bb_reset_unlock");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_bb_reset_unlock(event: u32);
-    }
-
-    #[cfg(coex)]
-    unsafe {
-        coex_bb_reset_unlock(event)
-    };
+coex_fns! {
+    fn coex_schm_interval_get() -> u32;
+    fn coex_schm_curr_period_get() -> u8;
+    fn coex_schm_curr_phase_get() -> *mut c_void;
 }
 
 pub(crate) unsafe extern "C" fn coex_schm_register_btdm_callback_wrapper(
     callback: unsafe extern "C" fn(),
 ) -> i32 {
     trace!("coex_schm_register_btdm_callback {:?}", callback);
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_schm_register_callback(kind: u32, callback: unsafe extern "C" fn()) -> i32;
+
+    cfg_select! {
+        feature = "coex" => {
+            unsafe extern "C" {
+                fn coex_schm_register_callback(kind: u32, callback: unsafe extern "C" fn()) -> i32;
+            }
+            const COEX_SCHM_CALLBACK_TYPE_BT: u32 = 1;
+            unsafe { coex_schm_register_callback(COEX_SCHM_CALLBACK_TYPE_BT, callback) }
+        }
+        _ => {
+            0
+        }
     }
-
-    #[cfg(coex)]
-    return unsafe { coex_schm_register_callback(1, callback) }; // COEX_SCHM_CALLBACK_TYPE_BT = 1
-
-    #[cfg(not(coex))]
-    0
-}
-
-pub(crate) unsafe extern "C" fn coex_schm_interval_get() -> u32 {
-    trace!("coex_schm_interval_get");
-
-    #[cfg(coex)]
-    return unsafe { crate::sys::include::coex_schm_interval_get() };
-
-    #[cfg(not(coex))]
-    0
-}
-
-pub(crate) unsafe extern "C" fn coex_schm_curr_period_get() -> u8 {
-    trace!("coex_schm_curr_period_get");
-
-    #[cfg(coex)]
-    return unsafe { crate::sys::include::coex_schm_curr_period_get() };
-
-    #[cfg(not(coex))]
-    0
-}
-
-pub(crate) unsafe extern "C" fn coex_schm_curr_phase_get() -> *const () {
-    trace!("coex_schm_curr_phase_get");
-
-    #[cfg(coex)]
-    return unsafe { crate::sys::include::coex_schm_curr_phase_get() } as *const ();
-
-    #[cfg(not(coex))]
-    return core::ptr::null::<()>();
 }
 
 #[allow(unused_variables)]
-pub(crate) unsafe extern "C" fn coex_wifi_channel_get(primary: *mut u8, secondary: *mut u8) -> i32 {
-    trace!("coex_wifi_channel_get");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_wifi_channel_get(primary: *mut u8, secondary: *mut u8) -> i32;
-    }
-
-    #[cfg(coex)]
-    return unsafe { coex_wifi_channel_get(primary, secondary) };
-
-    #[cfg(not(coex))]
-    -1
-}
-
-#[allow(unused_variables)]
-pub(crate) unsafe extern "C" fn coex_register_wifi_channel_change_callback(
-    callback: unsafe extern "C" fn(),
+pub(crate) unsafe extern "C" fn coex_wifi_channel_get(
+    _primary: *mut u8,
+    _secondary: *mut u8,
 ) -> i32 {
-    trace!("coex_register_wifi_channel_change_callback");
-    unsafe extern "C" {
-        #[cfg(coex)]
-        fn coex_register_wifi_channel_change_callback(callback: unsafe extern "C" fn()) -> i32;
+    trace!("coex_wifi_channel_get");
+
+    cfg_select! {
+        feature = "coex" => {
+            unsafe extern "C" {
+                fn coex_wifi_channel_get(_primary: *mut u8, _secondary: *mut u8) -> i32;
+            }
+            unsafe { coex_wifi_channel_get(_primary, _secondary) }
+        }
+        _ => {
+            -1
+        }
     }
-
-    #[cfg(coex)]
-    return unsafe { coex_register_wifi_channel_change_callback(callback) };
-
-    #[cfg(not(coex))]
-    0
 }
 
 pub(crate) unsafe extern "C" fn set_isr(n: i32, f: unsafe extern "C" fn(), arg: *const ()) -> i32 {
     trace!("set_isr called {} {:?} {:?}", n, f, arg);
 
     match n {
-        5 => {
-            unsafe {
-                ISR_INTERRUPT_5 = (f as *mut c_void, arg as *mut c_void);
-            }
-            unwrap!(interrupt::enable(
-                Interrupt::RWBT,
-                interrupt::Priority::Priority1
-            ));
-            unwrap!(interrupt::enable(
-                Interrupt::RWBLE,
-                interrupt::Priority::Priority1
-            ));
-        }
-        7 => unsafe {
-            ISR_INTERRUPT_7 = (f as *mut c_void, arg as *mut c_void);
+        5 => unsafe {
+            ISR_INTERRUPT_5.set(f as *const c_void, arg.cast());
+            BT::steal().enable_rwbt_interrupt(Priority::Priority1);
+            BT::steal().enable_rwble_interrupt(Priority::Priority1);
         },
-        8 => {
-            unsafe {
-                ISR_INTERRUPT_8 = (f as *mut c_void, arg as *mut c_void);
-            }
-            unwrap!(interrupt::enable(
-                Interrupt::BT_BB,
-                interrupt::Priority::Priority1,
-            ));
-        }
+        7 => ISR_INTERRUPT_7.set(f as *const c_void, arg.cast()),
+        8 => unsafe {
+            ISR_INTERRUPT_8.set(f as *const c_void, arg.cast());
+            BT::steal().enable_bb_interrupt(Priority::Priority1);
+        },
         _ => panic!("set_isr - unsupported interrupt number {}", n),
     }
 
@@ -688,10 +574,10 @@ pub(crate) unsafe extern "C" fn ints_on(mask: u32) {
     }
 }
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 pub(crate) const BTDM_ASYNC_WAKEUP_REQ_HCI: i32 = 0;
 
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 pub(crate) const BTDM_ASYNC_WAKEUP_REQ_COEX: i32 = 1;
 
 // const BTDM_ASYNC_WAKEUP_REQMAX: i32 = 2;
@@ -709,7 +595,7 @@ pub(crate) const BTDM_ASYNC_WAKEUP_REQ_COEX: i32 = 1;
 ///   true if request lock is needed, false otherwise
 ///
 /// *************************************************************************
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 pub(crate) fn async_wakeup_request(event: i32) -> bool {
     trace!("async_wakeup_request {}", event);
 
@@ -759,7 +645,7 @@ pub(crate) fn async_wakeup_request(event: i32) -> bool {
 ///   true if request lock is needed, false otherwise
 ///
 /// *************************************************************************
-#[cfg(coex)]
+#[cfg(feature = "coex")]
 pub(crate) fn async_wakeup_request_end(event: i32) {
     trace!("async_wakeup_request_end {}", event);
 
@@ -775,5 +661,38 @@ pub(crate) fn async_wakeup_request_end(event: i32) {
 
     if request_lock {
         unsafe { btdm_in_wakeup_requesting_set(false) };
+    }
+}
+
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+fn Software0() {
+    ISR_INTERRUPT_7.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn RWBT() {
+    ISR_INTERRUPT_5.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn RWBLE() {
+    ISR_INTERRUPT_5.dispatch();
+}
+
+#[unsafe(no_mangle)]
+#[crate::hal::ram]
+extern "C" fn BT_BB() {
+    ISR_INTERRUPT_8.dispatch();
+}
+
+pub(crate) fn shutdown_ble_isr() {
+    unsafe {
+        BT::steal().disable_rwbt_interrupt_on_all_cores();
+        BT::steal().disable_rwble_interrupt_on_all_cores();
+        BT::steal().disable_bb_interrupt_on_all_cores();
     }
 }

@@ -2,6 +2,8 @@
 //!
 //! Broadcasts, receives and sends messages via esp-now in an async way
 
+//% CHIP_FILTER: wifi_driver_supported
+
 #![no_std]
 #![no_main]
 
@@ -20,7 +22,7 @@ use esp_radio::esp_now::{BROADCAST_ADDRESS, PeerInfo};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_rtos::main]
+#[esp_hal::main]
 async fn main(_spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -33,13 +35,9 @@ async fn main(_spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     let wifi = peripherals.WIFI;
-    let (mut controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();
-    controller
-        .set_mode(esp_radio::wifi::WifiMode::Station)
-        .unwrap();
-    controller.start().unwrap();
+    let controller = esp_radio::wifi::WifiController::new(wifi, Default::default()).unwrap();
 
-    let mut esp_now = interfaces.esp_now;
+    let mut esp_now = controller.esp_now();
     esp_now.set_channel(11).unwrap();
 
     println!("esp-now version {}", esp_now.version().unwrap());

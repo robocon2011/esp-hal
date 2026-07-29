@@ -2,7 +2,7 @@
 //!
 //! ## Feature Flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
-#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![doc(html_logo_url = "https://docs.espressif.com/projects/rust/esp-rs-grey-bg.svg")]
 #![allow(asm_sub_register, named_asm_labels)]
 #![feature(asm_experimental_arch)]
 #![no_std]
@@ -163,7 +163,7 @@ Reset:
 );
 
 // According to 4.4.7.2 of the xtensa isa, ccount and compare are undefined on
-// reset, set all values to zero to disable. ("timer interupts are cleared by writing CCOMPARE[i]")
+// reset, set all values to zero to disable. ("timer interrupts are cleared by writing CCOMPARE[i]")
 #[cfg(any(
     XCHAL_HAVE_TIMER0,
     XCHAL_HAVE_TIMER1,

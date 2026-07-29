@@ -9,17 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `global-allocator` Cargo feature to opt in to the `#[global_allocator]`, this feature is enabled by default. (#4703)
+- Support for ESP32-P4 (#5523)
 
 ### Changed
 
 
 ### Fixed
 
-- Fixed arithmetic overflow in tracking total amount of allocated/freed memory (#4783)
+- Fixed `realloc_with_caps` over-reading issue (#5502)
 
 ### Removed
 
+
+## [v0.10.0] - 2026-04-16
+
+### Added
+
+- `global-allocator` Cargo feature to opt in to the `#[global_allocator]`, this feature is enabled by default. (#4703)
+- Support for ESP32-C5 (#4884)
+- Support for ESP32-C61 (#5240)
+- Allocation hook callbacks via the `alloc-hooks` feature (#5296)
+- The `enumset` crate has been re-exported as `esp_alloc::export::enumset` (#5296)
+
+### Changed
+
+- The `psram_allocator` macro now has branches to allow passing PSRAM configuration, or a pre-configured PSRAM driver (#5310)
+
+### Fixed
+
+- Fixed arithmetic overflow in tracking total amount of allocated/freed memory (#4783)
 
 ## [v0.9.0] - 2025-10-13
 
@@ -66,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `esp_alloc::HEAP.stats()` can now be used to get heap usage informations (#2137)
+- `esp_alloc::HEAP.stats()` can now be used to get heap usage information (#2137)
 
 ### Changed
 
@@ -91,4 +109,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.7.0]: https://github.com/esp-rs/esp-hal/releases/tag/esp-alloc-v0.7.0
 [v0.8.0]: https://github.com/esp-rs/esp-hal/compare/esp-alloc-v0.7.0...esp-alloc-v0.8.0
 [v0.9.0]: https://github.com/esp-rs/esp-hal/compare/esp-alloc-v0.8.0...esp-alloc-v0.9.0
-[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-alloc-v0.9.0...HEAD
+[v0.10.0]: https://github.com/esp-rs/esp-hal/compare/esp-alloc-v0.9.0...esp-alloc-v0.10.0
+[Unreleased]: https://github.com/esp-rs/esp-hal/compare/esp-alloc-v0.10.0...HEAD
