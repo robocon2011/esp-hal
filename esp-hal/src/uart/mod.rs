@@ -42,9 +42,11 @@
 //! [embedded-io-async]: embedded_io_async_07
 
 crate::unstable_driver! {
-    /// UHCI wrapper around UART
     #[cfg(uhci_driver_supported)]
     pub mod uhci;
+
+    #[cfg(lp_uart_driver_supported)]
+    pub mod lp_uart;
 }
 
 #[cfg_attr(uart_version = "1", path = "clocks/v1.rs")]
@@ -506,6 +508,95 @@ impl Default for AtCmdConfig {
             gap_timeout: None,
             cmd_char: b'+',
             char_num: 1,
+        }
+    }
+}
+
+/// The number of edges that the hardware counts before the threshold register starts.
+#[cfg(sleep_driver_supported)]
+const WAKEUP_EDGE_OFFSET: u16 = cfg_select! {
+    esp32 => 2,
+    esp32p4 => 6,
+    _ => 3,
+};
+
+/// The smallest number of rising edges that the hardware can wake on.
+#[cfg(sleep_driver_supported)]
+const MIN_WAKEUP_EDGES: u16 = cfg_select! {
+    // With a threshold of zero, esp32 wakes again and again.
+    esp32 => WAKEUP_EDGE_OFFSET + 1,
+    _ => WAKEUP_EDGE_OFFSET,
+};
+
+/// The largest number of rising edges that the hardware can count in its 10-bit field.
+#[cfg(sleep_driver_supported)]
+const MAX_WAKEUP_EDGES: u16 = WAKEUP_EDGE_OFFSET + 0x3FF;
+
+/// Configures how the UART wakes the chip from light sleep.
+///
+/// See [`UartRx::enable_wakeup`].
+#[cfg(sleep_driver_supported)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, procmacros::BuilderLite)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
+#[non_exhaustive]
+pub struct WakeupConfig {
+    /// The number of rising edges on the RX line that wakes the chip.
+    ///
+    /// The hardware counts edges, and not bytes, so the number of bytes that the chip needs
+    /// depends on the data of the sender. Each byte gives one rising edge at its stop bit, and
+    /// one more edge for each change from 0 to 1 in the data. The number of edges is therefore
+    /// the smallest possible number of bytes. The default is the smallest value that the
+    /// hardware accepts.
+    ///
+    /// The permitted range on this chip is
+    #[cfg_attr(esp32, doc = "`3..=1025`.")]
+    #[cfg_attr(esp32p4, doc = "`6..=1029`.")]
+    #[cfg_attr(not(any(esp32, esp32p4)), doc = "`3..=1026`.")]
+    rising_edges: u16,
+}
+
+#[cfg(sleep_driver_supported)]
+impl Default for WakeupConfig {
+    fn default() -> Self {
+        Self {
+            rising_edges: MIN_WAKEUP_EDGES,
+        }
+    }
+}
+
+/// A wakeup configuration error.
+#[cfg(sleep_driver_supported)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
+#[non_exhaustive]
+pub enum WakeConfigError {
+    /// This UART instance cannot wake the chip.
+    NotAWakeupSource,
+
+    /// The hardware cannot count the requested number of rising edges.
+    EdgeCountUnsupported,
+}
+
+#[cfg(sleep_driver_supported)]
+#[instability::unstable]
+impl core::error::Error for WakeConfigError {}
+
+#[cfg(sleep_driver_supported)]
+#[instability::unstable]
+impl core::fmt::Display for WakeConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WakeConfigError::NotAWakeupSource => {
+                write!(f, "This UART instance cannot wake the chip")
+            }
+            WakeConfigError::EdgeCountUnsupported => {
+                write!(
+                    f,
+                    "The requested number of rising edges is not supported, it must be {MIN_WAKEUP_EDGES}..={MAX_WAKEUP_EDGES}"
+                )
+            }
         }
     }
 }
@@ -1312,6 +1403,42 @@ where
         Ok(())
     }
 
+    /// Lets activity on the RX line wake the chip from light sleep.
+    ///
+    /// The chip wakes when it counts the number of rising edges that
+    /// [`WakeupConfig::with_rising_edges`] gives. Deep sleep powers the UART down, so this source
+    /// ends a light sleep only.
+    ///
+    /// The chip loses the bytes that cause the wake. It also loses the bytes that arrive during the
+    /// wake, and at a typical baud rate that wake is long enough to lose several bytes. A sender
+    /// must therefore first send data that the receiver can lose, and then send the data again.
+    /// The first data after the wake also clears the internal wakeup indication. Without that
+    /// write, the next wake occurs two edges early.
+    ///
+    /// The peripheral counts the edges itself, so a light sleep keeps the high-performance
+    /// peripherals powered instead of powering them down. This increases the sleep current.
+    ///
+    /// The configuration stays after the driver is dropped, so that the UART continues to wake the
+    /// chip while no driver owns it. Call [`Self::disable_wakeup`] to remove it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WakeConfigError::NotAWakeupSource`] if this UART instance cannot wake the chip,
+    /// and [`WakeConfigError::EdgeCountUnsupported`] if the hardware cannot count the requested
+    /// number of edges.
+    #[cfg(sleep_driver_supported)]
+    #[instability::unstable]
+    pub fn enable_wakeup(&mut self, config: &WakeupConfig) -> Result<(), WakeConfigError> {
+        self.uart.info().enable_wakeup(config)
+    }
+
+    /// Stops the UART from waking the chip.
+    #[cfg(sleep_driver_supported)]
+    #[instability::unstable]
+    pub fn disable_wakeup(&mut self) {
+        self.uart.info().disable_wakeup();
+    }
+
     /// Reads and clears RX error conditions set by received data.
     ///
     /// Only errors enabled in [`RxConfig::with_reported_errors`] are returned;
@@ -2045,6 +2172,28 @@ where
         Ok(())
     }
 
+    /// Lets activity on the RX line wake the chip from light sleep.
+    ///
+    /// See [`UartRx::enable_wakeup`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WakeConfigError::NotAWakeupSource`] if this UART instance cannot wake the chip,
+    /// and [`WakeConfigError::EdgeCountUnsupported`] if the hardware cannot count the requested
+    /// number of edges.
+    #[cfg(sleep_driver_supported)]
+    #[instability::unstable]
+    pub fn enable_wakeup(&mut self, config: &WakeupConfig) -> Result<(), WakeConfigError> {
+        self.rx.enable_wakeup(config)
+    }
+
+    /// Stops the UART from waking the chip.
+    #[cfg(sleep_driver_supported)]
+    #[instability::unstable]
+    pub fn disable_wakeup(&mut self) {
+        self.rx.disable_wakeup();
+    }
+
     #[procmacros::doc_replace]
     /// Split the UART into a transmitter and receiver
     ///
@@ -2190,6 +2339,8 @@ where
         self.regs()
             .idle_conf()
             .modify(|_, w| unsafe { w.tx_idle_num().bits(0) });
+        // `idle_conf` is a sync register.
+        sync_regs(self.regs());
 
         crate::rom::ets_delay_us(15);
 
@@ -2237,258 +2388,5 @@ impl From<RxError> for IoError {
 impl From<TxError> for IoError {
     fn from(e: TxError) -> Self {
         IoError::Tx(e)
-    }
-}
-
-/// Low-power UART
-#[cfg(lp_uart_driver_supported)]
-#[instability::unstable]
-pub mod lp_uart {
-    use crate::{
-        gpio::lp_io::{LowPowerInput, LowPowerOutput},
-        peripherals::{LP_AON, LP_CLKRST, LP_IO, LP_UART, LPWR},
-        uart::{DataBits, Parity, StopBits},
-    };
-
-    /// LP-UART Configuration
-    #[derive(Debug, Clone, Copy, procmacros::BuilderLite)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    #[non_exhaustive]
-    pub struct Config {
-        /// The baud rate (speed) of the UART communication in bits per second
-        /// (bps).
-        baudrate: u32,
-        /// Number of data bits in each frame (5, 6, 7, or 8 bits).
-        data_bits: DataBits,
-        /// Parity setting (None, Even, or Odd).
-        parity: Parity,
-        /// Number of stop bits in each frame (1, 1.5, or 2 bits).
-        stop_bits: StopBits,
-        /// Clock source used by the UART peripheral.
-        #[builder_lite(unstable)]
-        clock_source: ClockSource,
-    }
-
-    impl Default for Config {
-        fn default() -> Config {
-            Config {
-                baudrate: 115_200,
-                data_bits: Default::default(),
-                parity: Default::default(),
-                stop_bits: Default::default(),
-                clock_source: Default::default(),
-            }
-        }
-    }
-
-    /// LP-UART clock source
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    #[non_exhaustive]
-    #[instability::unstable]
-    pub enum ClockSource {
-        /// RC_FAST_CLK clock source
-        RcFast,
-
-        /// XTAL_D2 clock source
-        #[default]
-        Xtal,
-    }
-
-    /// LP-UART driver
-    pub struct LpUart {
-        uart: LP_UART<'static>,
-    }
-
-    impl LpUart {
-        /// Initialize the UART driver using the provided configuration
-        // TODO: CTS and RTS pins
-        pub fn new(
-            uart: LP_UART<'static>,
-            config: Config,
-            _tx: LowPowerOutput<'_, 5>,
-            _rx: LowPowerInput<'_, 4>,
-        ) -> Self {
-            // FIXME: use GPIO APIs to configure pins
-            LP_AON::regs()
-                .gpio_mux()
-                .modify(|r, w| unsafe { w.sel().bits(r.sel().bits() | (1 << 4) | (1 << 5)) });
-
-            LP_IO::regs()
-                .gpio(4)
-                .modify(|_, w| unsafe { w.mcu_sel().bits(1) });
-            LP_IO::regs()
-                .gpio(5)
-                .modify(|_, w| unsafe { w.mcu_sel().bits(1) });
-
-            let mut me = Self { uart };
-            let uart = me.uart.register_block();
-
-            // Set UART mode - do nothing for LP
-
-            // Disable UART parity
-            // 8-bit world
-            // 1-bit stop bit
-            uart.conf0().modify(|_, w| unsafe {
-                w.parity().clear_bit();
-                w.parity_en().clear_bit();
-                w.bit_num().bits(0x3);
-                w.stop_bit_num().bits(0x1)
-            });
-            // Set tx idle
-            uart.idle_conf()
-                .modify(|_, w| unsafe { w.tx_idle_num().bits(0) });
-            // Disable hw-flow control
-            uart.hwfc_conf().modify(|_, w| w.rx_flow_en().clear_bit());
-
-            // Get source clock frequency
-            // default == SOC_MOD_CLK_RTC_FAST == 2
-
-            // LPWR.lpperi.lp_uart_clk_sel = 0;
-            LPWR::regs()
-                .lpperi()
-                .modify(|_, w| w.lp_uart_clk_sel().clear_bit());
-
-            // Override protocol parameters from the configuration
-            // uart_hal_set_baudrate(&hal, cfg->uart_proto_cfg.baud_rate, sclk_freq);
-            me.change_baud_internal(&config);
-            // uart_hal_set_parity(&hal, cfg->uart_proto_cfg.parity);
-            me.change_parity(config.parity);
-            // uart_hal_set_data_bit_num(&hal, cfg->uart_proto_cfg.data_bits);
-            me.change_data_bits(config.data_bits);
-            // uart_hal_set_stop_bits(&hal, cfg->uart_proto_cfg.stop_bits);
-            me.change_stop_bits(config.stop_bits);
-            // uart_hal_set_tx_idle_num(&hal, LP_UART_TX_IDLE_NUM_DEFAULT);
-            me.change_tx_idle(0); // LP_UART_TX_IDLE_NUM_DEFAULT == 0
-
-            // Reset Tx/Rx FIFOs
-            me.rxfifo_reset();
-            me.txfifo_reset();
-
-            me
-        }
-
-        fn rxfifo_reset(&mut self) {
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| w.rxfifo_rst().set_bit());
-            self.update();
-
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| w.rxfifo_rst().clear_bit());
-            self.update();
-        }
-
-        fn txfifo_reset(&mut self) {
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| w.txfifo_rst().set_bit());
-            self.update();
-
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| w.txfifo_rst().clear_bit());
-            self.update();
-        }
-
-        fn update(&mut self) {
-            let register_block = self.uart.register_block();
-            register_block
-                .reg_update()
-                .modify(|_, w| w.reg_update().set_bit());
-            while register_block.reg_update().read().reg_update().bit_is_set() {
-                // wait
-            }
-        }
-
-        fn change_baud_internal(&mut self, config: &Config) {
-            let clk = match config.clock_source {
-                ClockSource::RcFast => crate::soc::clocks::rc_fast_clk_frequency(),
-                ClockSource::Xtal => crate::soc::clocks::xtal_d2_clk_frequency(),
-            };
-
-            LP_CLKRST::regs().lpperi().modify(|_, w| {
-                w.lp_uart_clk_sel().bit(match config.clock_source {
-                    ClockSource::RcFast => false,
-                    ClockSource::Xtal => true,
-                })
-            });
-            self.uart.register_block().clk_conf().modify(|_, w| {
-                w.rx_sclk_en().set_bit();
-                w.tx_sclk_en().set_bit()
-            });
-
-            let divider = clk / config.baudrate;
-            let divider = divider as u16;
-
-            self.uart
-                .register_block()
-                .clkdiv()
-                .write(|w| unsafe { w.clkdiv().bits(divider).frag().bits(0) });
-
-            self.update();
-        }
-
-        /// Modify UART baud rate and reset TX/RX fifo.
-        pub fn change_baud(&mut self, config: &Config) {
-            self.change_baud_internal(config);
-            self.txfifo_reset();
-            self.rxfifo_reset();
-        }
-
-        fn change_parity(&mut self, parity: Parity) -> &mut Self {
-            if parity != Parity::None {
-                self.uart
-                    .register_block()
-                    .conf0()
-                    .modify(|_, w| w.parity().bit((parity as u8 & 0x1) != 0));
-            }
-
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| match parity {
-                    Parity::None => w.parity_en().clear_bit(),
-                    Parity::Even => w.parity_en().set_bit().parity().clear_bit(),
-                    Parity::Odd => w.parity_en().set_bit().parity().set_bit(),
-                });
-
-            self
-        }
-
-        fn change_data_bits(&mut self, data_bits: DataBits) -> &mut Self {
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| unsafe { w.bit_num().bits(data_bits as u8) });
-
-            self.update();
-            self
-        }
-
-        fn change_stop_bits(&mut self, stop_bits: StopBits) -> &mut Self {
-            self.uart
-                .register_block()
-                .conf0()
-                .modify(|_, w| unsafe { w.stop_bit_num().bits(stop_bits as u8 + 1) });
-
-            self.update();
-            self
-        }
-
-        fn change_tx_idle(&mut self, idle_num: u16) -> &mut Self {
-            self.uart
-                .register_block()
-                .idle_conf()
-                .modify(|_, w| unsafe { w.tx_idle_num().bits(idle_num) });
-
-            self.update();
-            self
-        }
     }
 }

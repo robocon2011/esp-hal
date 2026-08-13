@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -45,7 +45,7 @@ peripherals = [
     { name = "ECC" },
     { name = "EFUSE", hidden = true },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HMAC" },
     { name = "HP_APM" },
     { name = "HP_SYS" },
@@ -180,10 +180,6 @@ separate_jacobian_point_memory = true
 has_memory_clock_gate = true
 supports_enhanced_security = true # only after revision 1.2
 
-[device.lp_io]
-support_status = "partial"
-version = "esp32h2"
-
 [device.gpio]
 support_status = "supported"
 # {include gpio.toml}
@@ -195,7 +191,7 @@ channels = [["CPU_GPIO_0", "CPU_GPIO_1", "CPU_GPIO_2", "CPU_GPIO_3", "CPU_GPIO_4
 
 [device.i2c_master]
 support_status = "supported"
-version = 3
+version = 4
 instances = [
     { name = "i2c0", sys_instance = "I2cExt0", scl = "I2CEXT0_SCL", sda = "I2CEXT0_SDA" },
     { name = "i2c1", sys_instance = "I2cExt1", scl = "I2CEXT1_SCL", sda = "I2CEXT1_SDA" },
@@ -247,7 +243,8 @@ support_status = "partial"
 algo = { sha1 = 0, sha224 = 1, sha256 = 2 }
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 4
 
 [device.ecdsa]
 support_status = { status = "not_supported", issue = 5444 }
@@ -317,6 +314,9 @@ version = 2
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+# esp32h2 has no separate per-pin path: `pin_wakeup_version` stays unset because the per-pin
+# registers *are* the ext1 registers.
+ext1_version = 2
 wakeup_sources = {
     Ext1 = 1,
     Gpio = 2,
@@ -328,7 +328,6 @@ wakeup_sources = {
     Sdio = 8,
     Bt = 10,
     LpCore = 11,
-    Usb = 14,
 }
 
 # Other drivers which are partially supported but have no other configuration:
@@ -383,3 +382,6 @@ controller = "npl"
 [device.ieee802154]
 
 [device.phy]
+
+[device.avc]
+support_status = "not_supported"

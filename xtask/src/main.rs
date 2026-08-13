@@ -7,7 +7,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser};
 use esp_devtool as xtask;
-use esp_metadata::{Chip, Config};
 use object::{Object, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
 use rustc_demangle::try_demangle;
 use strum::IntoEnumIterator;
@@ -15,7 +14,7 @@ use xtask::{
     Package,
     cargo::{CargoAction, CargoArgsBuilder, CargoCommandBatcher},
     commands::*,
-    update_metadata,
+    metadata::{Chip, Config},
 };
 
 // ----------------------------------------------------------------------------
@@ -52,8 +51,6 @@ enum Cli {
     ///
     /// Reads the body from stdin by default. Pass `--pr` to fetch from GitHub.
     CheckPrChangelog(CheckPrChangelogArgs),
-    /// Re-generate metadata and tables in the esp-hal README.
-    UpdateMetadata(UpdateMetadataArgs),
     /// Run host-tests in the workspace with `cargo test`
     HostTests(HostTestsArgs),
     /// Check global symbols in the compiled `.rlib` of the specified packages for the specified
@@ -170,7 +167,6 @@ fn main() -> Result<()> {
         Cli::SemverCheck(args) => semver_checks(&workspace, args),
         Cli::CheckChangelog(args) => check_changelog(&workspace, &args.packages, args.normalize),
         Cli::CheckPrChangelog(args) => check_pr_changelog(&workspace, args.pr),
-        Cli::UpdateMetadata(args) => update_metadata(&workspace, args.check),
         Cli::HostTests(args) => host_tests(&workspace, args),
         Cli::CheckGlobalSymbols(args) => check_global_symbols(&args.chips),
         #[cfg(feature = "report")]
@@ -263,7 +259,7 @@ fn check_packages(workspace: &Path, args: CheckPackagesArgs) -> Result<()> {
 
             for mut check_config in package.check_config_rules(device) {
                 if package.has_chip_features() {
-                    check_config.features.push(device.name());
+                    check_config.features.push(device.name.clone());
                 }
 
                 commands.push(build_check_package_command(
@@ -364,7 +360,7 @@ fn lint_packages(workspace: &Path, args: LintPackagesArgs) -> Result<()> {
 
             for mut check_config in package.lint_config_rules(device) {
                 if package.has_chip_features() {
-                    check_config.features.push(device.name());
+                    check_config.features.push(device.name.clone());
                 }
 
                 lint_package(
@@ -736,11 +732,11 @@ fn run_ci_checks(workspace: &Path, args: CiArgs) -> Result<()> {
     }
 
     runner.run("examples", "Build examples", || {
-        // The `ota_example` expects a file named `examples/target/ota_image` - it
-        // doesn't care about the contents however
-        std::fs::create_dir_all("./examples/target")
-            .with_context(|| format!("Failed to create `./examples/target`"))?;
-        std::fs::write("./examples/target/ota_image", "DUMMY")
+        // The `ota_example` expects a file named `target/ota_image` - it doesn't
+        // care about the contents however
+        std::fs::create_dir_all("./target")
+            .with_context(|| format!("Failed to create `./target`"))?;
+        std::fs::write("./target/ota_image", "DUMMY")
             .with_context(|| format!("Failed to create a dummy file required by ota example!"))?;
 
         examples(

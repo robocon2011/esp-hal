@@ -117,7 +117,10 @@ pub(super) fn change_flow_control(
             cfg_select! {
                 esp32 => {
                     info.regs().swfc_conf().modify(|_, w| unsafe {
-                        w.xon_threshold().bits(xon_threshold).xoff_threshold().bits(xoff_threshold)
+                        w.xon_threshold()
+                            .bits(xon_threshold)
+                            .xoff_threshold()
+                            .bits(xoff_threshold)
                     });
                     info.regs().swfc_conf().modify(|_, w| unsafe {
                         w.xon_char().bits(xon_char).xoff_char().bits(xoff_char)
@@ -162,6 +165,13 @@ pub(super) fn change_flow_control(
 #[cfg(sleep_driver_supported)]
 pub(super) fn suspend(_info: &Info, _en: bool) {
     // We drain the entire FIFO, so we have nothing to disable.
+}
+
+#[cfg(sleep_driver_supported)]
+pub(super) fn set_wakeup_edge_threshold(info: &Info, threshold: u16) {
+    info.regs()
+        .sleep_conf()
+        .modify(|_, w| unsafe { w.active_threshold().bits(threshold) });
 }
 
 #[cfg(sleep_driver_supported)]
@@ -223,12 +233,8 @@ pub(super) fn read_next_from_fifo(info: &Info) -> u8 {
     fn access_fifo_register<R>(f: impl Fn() -> R) -> R {
         // https://docs.espressif.com/projects/esp-chip-errata/en/latest/esp32/03-errata-description/esp32/cpu-subsequent-access-halted-when-get-interrupted.html
         cfg_select! {
-            esp32 => {
-                crate::interrupt::free(f)
-            }
-            _ => {
-                f()
-            }
+            esp32 => crate::interrupt::free(f),
+            _ => f(),
         }
     }
 
@@ -237,7 +243,11 @@ pub(super) fn read_next_from_fifo(info: &Info) -> u8 {
         esp32s2 => {
             // On the ESP32-S2 we need to use PeriBus2 to read the FIFO:
             let fifo_reg = unsafe {
-                &*fifo_reg.as_ptr().cast::<u8>().add(0x20C00000).cast::<crate::pac::uart0::FIFO>()
+                &*fifo_reg
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(0x20C00000)
+                    .cast::<crate::pac::uart0::FIFO>()
             };
         }
         _ => {}
@@ -268,8 +278,6 @@ pub(super) fn rx_fifo_count(info: &Info) -> u16 {
                 0
             }
         }
-        _ => {
-            info.regs().status().read().rxfifo_cnt().bits() as u16
-        }
+        _ => info.regs().status().read().rxfifo_cnt().bits() as u16,
     }
 }

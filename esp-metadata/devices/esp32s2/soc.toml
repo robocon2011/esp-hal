@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -33,7 +33,6 @@ has_swd_watchdog = true
 peripherals = [
     { name = "AES", interrupts = { peri = "AES" } },
     { name = "APB_SARADC" },
-    { name = "DEDICATED_GPIO" },
     { name = "DS" },
     { name = "EFUSE", hidden = true },
     { name = "EXTMEM" },
@@ -41,7 +40,7 @@ peripherals = [
     { name = "FE" },
     { name = "FE2" },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HMAC" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
@@ -58,7 +57,7 @@ peripherals = [
     { name = "RSA", interrupts = { peri = "RSA" } },
     { name = "LPWR", pac = "RTC_CNTL" },
     { name = "RTC_TIMER", pac = "RTC_CNTL" },
-    { name = "RTC_I2C" },
+    { name = "LP_I2C0", pac = "RTC_I2C" },
     { name = "RTC_IO" },
     { name = "SENS" },
     { name = "SHA", interrupts = { peri = "SHA" } },
@@ -170,10 +169,6 @@ engines = [
     },
 ]
 
-[device.lp_io]
-support_status = "partial"
-version = "v2"
-
 [device.gpio]
 support_status = "supported"
 # {include gpio.toml}
@@ -204,6 +199,10 @@ i2c0_data_register_ahb_address = 0x6001301c
 [device.i2c_slave]
 support_status = { status = "not_supported", issue = 1909 }
 
+[device.lp_i2c_master]
+support_status = "not_supported"
+version = "rtc_i2c"
+
 [device.interrupts]
 support_status = "partial"
 status_registers = 3
@@ -233,7 +232,8 @@ support_status = "partial"
 algo = { sha1 = 0, sha224 = 1, sha256 = 2, sha384 = 3, sha512 = 4, sha512_224 = 5, sha512_256 = 6, sha512_t = 7 }
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 8
 
 [device.spi_master]
 version = 2
@@ -298,8 +298,11 @@ version = 1
 [device.uhci]
 support_status = "not_supported"
 
-[device.rgb_display] # via SPI and I2S
+[device.rgb_display] # via I2S
 support_status = "not_supported"
+
+[device.spi_lcd] # the LCD mode of GP-SPI2
+support_status = { status = "not_supported", issue = 5374 }
 
 [device.camera] # via I2S
 support_status = "not_supported"
@@ -319,7 +322,21 @@ apb_cycle_wait_num = 16 # TODO
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 1
+pin_wakeup_version = 1
+deep_sleep_needs_gpio_isolation = true
 wakeup_sources = {
+    # A UART wake cannot reject a sleep.
+    rejectable = [
+        "Ext0",
+        "Ext1",
+        "Gpio",
+        "Timer",
+        "Wifi",
+        "Touch",
+        "UlpRiscv",
+        "UlpRiscvTrap",
+    ],
     Ext0 = 0,
     Ext1 = 1,
     Gpio = 2,
@@ -331,7 +348,6 @@ wakeup_sources = {
     #UlpFsm = 9,
     UlpRiscv = 11,
     UlpRiscvTrap = 13,
-    Usb = 15,
 }
 
 # Other drivers which are partially supported but have no other configuration:
@@ -376,7 +392,7 @@ extmem_origin = 0x3f500000
 [device.systimer]
 [device.temp_sensor]
 [device.ulp_fsm]
-support_status = "not_supported"
+support_status = { status = "not_supported", issue = 376 }
 [device.ulp_riscv]
 [device.lp_timer]
 

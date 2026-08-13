@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -49,7 +49,7 @@ peripherals = [
     { name = "FE" },
     { name = "FE2" },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HMAC" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
@@ -140,10 +140,6 @@ engines = [
     },
 ]
 
-[device.lp_io]
-support_status = "partial"
-version = "v3"
-
 [device.gpio]
 support_status = "supported"
 # {include gpio.toml}
@@ -206,7 +202,8 @@ support_status = "partial"
 algo = { sha1 = 0, sha224 = 1, sha256 = 2 }
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 4
 
 [device.spi_master]
 version = 3
@@ -269,7 +266,11 @@ apb_cycle_wait_num = 16 # TODO
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+pin_wakeup_version = 2
+deep_sleep_needs_gpio_isolation = true
 wakeup_sources = {
+    # A UART wake cannot reject a sleep.
+    rejectable = ["Gpio", "Timer", "Sdio", "Wifi", "Touch", "Ulp", "Bt"],
     Gpio = 2,
     Timer = 3,
     Sdio = 4,

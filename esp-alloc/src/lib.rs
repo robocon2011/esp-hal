@@ -475,23 +475,19 @@ impl EspHeapInner {
         }
 
         cfg_select! {
-            feature = "internal-heap-stats" => {
-                HeapStats {
-                    region_stats,
-                    size: free + used,
-                    current_usage: used,
-                    max_usage: self.internal_heap_stats.max_usage,
-                    total_allocated: self.internal_heap_stats.total_allocated,
-                    total_freed: self.internal_heap_stats.total_freed,
-                }
-            }
-            _ => {
-                HeapStats {
-                    region_stats,
-                    size: free + used,
-                    current_usage: used,
-                }
-            }
+            feature = "internal-heap-stats" => HeapStats {
+                region_stats,
+                size: free + used,
+                current_usage: used,
+                max_usage: self.internal_heap_stats.max_usage,
+                total_allocated: self.internal_heap_stats.total_allocated,
+                total_freed: self.internal_heap_stats.total_freed,
+            },
+            _ => HeapStats {
+                region_stats,
+                size: free + used,
+                current_usage: used,
+            },
         }
     }
 
@@ -678,9 +674,9 @@ impl EspHeap {
         self.inner.with(|this| {
             #[cfg(feature = "internal-heap-stats")]
             let before = this.used();
-            let mut iter = this.heap.iter_mut();
-
-            while let Some(Some(region)) = iter.next() {
+            // Skip empty slots instead of stopping at the first one - the region array is
+            // not necessarily densely populated.
+            for region in this.heap.iter_mut().filter_map(|region| region.as_mut()) {
                 if unsafe { region.try_deallocate(ptr, layout) } {
                     break;
                 }

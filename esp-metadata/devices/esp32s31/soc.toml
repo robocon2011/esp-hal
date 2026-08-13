@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -63,6 +63,8 @@ peripherals = [
     { name = "IO_MUX" },
     { name = "LP_AON_CLK_RST", pac = "LP_AON_CLKRST" },
     { name = "LP_APM" },
+    { name = "LP_GPIO" },
+    { name = "LP_IO_MUX" },
     { name = "LP_PERI", pac = "LP_PERICLKRST" },
     { name = "LP_SYS" },
     { name = "LP_TEE" },
@@ -95,6 +97,7 @@ peripherals = [
     { name = "USB_HS", pac = "USB_OTG_HS", interrupts = { peri = "USB_OTG_HS" } },
 
     { name = "FLASH", virtual = true },
+    { name = "GPIO_DEDICATED", virtual = true },
     { name = "SW_INTERRUPT", virtual = true },
     { name = "CPU_CTRL", virtual = true },
 ]
@@ -119,6 +122,14 @@ rc_fast_calibration = { divider = 50, min_rev = 0 }
 support_status = "supported"
 # {include gpio.toml}
 
+[device.dedicated_gpio]
+version = "riscv_v2"
+support_status = "partial"
+channels = [
+    ["CPU_GPIO_0", "CPU_GPIO_1",  "CPU_GPIO_2",  "CPU_GPIO_3",  "CPU_GPIO_4",  "CPU_GPIO_5",  "CPU_GPIO_6",  "CPU_GPIO_7" ],
+    ["CPU_GPIO_8", "CPU_GPIO_9",  "CPU_GPIO_10", "CPU_GPIO_11", "CPU_GPIO_12", "CPU_GPIO_13", "CPU_GPIO_14", "CPU_GPIO_15"],
+]
+
 [device.io_mux]
 
 [device.uart]
@@ -136,7 +147,7 @@ has_sclk_enable = true
 
 [device.i2c_master]
 support_status = "supported"
-version = 3
+version = 4
 instances = [
     { name = "i2c0", sys_instance = "I2c0", scl = "I2CEXT0_SCL", sda = "I2CEXT0_SDA" },
     { name = "i2c1", sys_instance = "I2c1", scl = "I2CEXT1_SCL", sda = "I2CEXT1_SDA" },
@@ -154,6 +165,11 @@ has_arbitration_en = true
 has_tx_fifo_watermark = true
 bus_timeout_is_exponential = true
 has_pd_en = true
+
+[device.lp_i2c_master]
+support_status = "not_supported"
+version = "lp_i2c"
+fifo_size = 16
 
 [device.systimer]
 
@@ -174,6 +190,8 @@ is_lp_sys = false
 support_status = "not_supported"
 light_sleep = true
 deep_sleep = true
+ext1_version = 3
+pin_wakeup_version = 3
 wakeup_sources = {
     LpCore = 0,
     Gpio = 2,
@@ -301,4 +319,109 @@ support_status = "not_supported"
 [device.ds]
 support_status = "not_supported"
 [device.ecdsa]
+support_status = "not_supported"
+
+# Peripherals the chip has, that no driver reaches yet.
+[device.adc]
+support_status = "not_supported"
+[device.avc]
+support_status = "not_supported"
+[device.bit_scrambler]
+support_status = "not_supported"
+[device.camera]
+support_status = "not_supported"
+[device.dac]
+support_status = "not_supported"
+[device.ethernet]
+support_status = "not_supported"
+[device.etm]
+support_status = "not_supported"
+[device.i2c_slave]
+support_status = "not_supported"
+[device.i2s]
+support_status = "not_supported"
+[device.ieee802154]
+support_status = "not_supported"
+[device.key_manager]
+support_status = "not_supported"
+[device.mcpwm]
+support_status = "not_supported"
+[device.pcnt]
+support_status = "not_supported"
+[device.rgb_display]
+support_status = "not_supported"
+
+[device.sdm]
+support_status = "not_supported"
+channel_count = 8
+
+[device.temp_sensor]
+support_status = "not_supported"
+[device.touch]
+support_status = "not_supported"
+[device.canfd]
+support_status = "not_supported"
+[device.uhci]
+support_status = "not_supported"
+[device.ulp_riscv]
+support_status = "not_supported"
+[device.usb_serial_jtag]
+support_status = "not_supported"
+
+[device.rmt]
+support_status = "not_supported"
+ram_start = 0x20355800
+channel_ram_size = 48
+channels = ["Tx", "Tx", "Tx", "Tx", "Rx", "Rx", "Rx", "Rx"]
+# TODO capabilities
+
+[device.parl_io]
+support_status = "not_supported"
+version = 1 # FIXME placeholder
+
+[device.sdmmc]
+support_status = "not_supported"
+delay_phase_num = 8 # FIXME: placeholder
+has_iomux = true # FIXME: placeholder
+has_gpio_matrix = true # FIXME: placeholder
+psram_dma = true # FIXME: placeholder
+uhs = false # FIXME: placeholder
+slot_config = []
+
+## Radio
+[device.wifi]
+support_status = "not_supported"
+mac_version = 1 # FIXME: placeholder
+csi_supported = true # FIXME: placeholder
+
+[device.bt]
+support_status = "not_supported"
+controller = "npl" # FIXME: placeholder
+
+[device.phy]
+support_status = "not_supported"
+
+[device.ledc]
+support_status = "not_supported"
+version = 2 # FIXME: placeholder
+channel_count = 8
+
+[device.lp_uart]
+support_status = "not_supported"
+ram_size = 20 # FIXME: placeholder
+
+[device.psram]
+support_status = "not_supported"
+extmem_origin = 0x5000_0000
+
+[device.pixel_accelerator]
+support_status = "not_supported"
+
+[device.asrc]
+support_status = "not_supported"
+
+[device.cordic]
+support_status = "not_supported"
+
+[device.jpeg]
 support_status = "not_supported"

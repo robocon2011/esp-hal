@@ -7,14 +7,14 @@ constant_0_input = 0xc0
 constant_1_input = 0x80
 # GPIO29 and GPIO41 are not bonded.
 pins = [
-    { pin =  0                                                                          }, # lp = { 0 = "LP_GPIO0" }, analog = { 0 = "XTAL_32K_N" } },
-    { pin =  1                                                                          }, # lp = { 0 = "LP_GPIO1" }, analog = { 0 = "XTAL_32K_P" } },
-    { pin =  2, functions = {                                        3 = "LCD_DATA19" } }, # lp = { 0 = "LP_GPIO2" } },
-    { pin =  3, functions = {                                        3 = "LCD_DATA20" } }, # lp = { 0 = "LP_GPIO3" } },
-    { pin =  4, functions = {                                        3 = "LCD_DATA21" } }, # lp = { 0 = "LP_GPIO4" } },
-    { pin =  5, functions = {                                        3 = "LCD_DATA22" } }, # lp = { 0 = "LP_GPIO5" } },
-    { pin =  6,                                                                         }, # lp = { 0 = "LP_GPIO6" } },
-    { pin =  7, functions = {                                        3 = "LCD_DATA23" } }, # lp = { 0 = "LP_GPIO7" } },
+    { pin =  0,                                                      lp = { 0 = "LP_GPIO0" },        analog = { 0 = "XTAL_32K_N" } },
+    { pin =  1,                                                      lp = { 0 = "LP_GPIO1" },        analog = { 0 = "XTAL_32K_P" } },
+    { pin =  2, functions = {                    3 = "LCD_DATA19" }, lp = { 0 = "LP_GPIO2" } },
+    { pin =  3, functions = {                    3 = "LCD_DATA20" }, lp = { 0 = "LP_GPIO3" } },
+    { pin =  4, functions = {                    3 = "LCD_DATA21" }, lp = { 0 = "LP_GPIO4" } },
+    { pin =  5, functions = {                    3 = "LCD_DATA22" }, lp = { 0 = "LP_GPIO5" } },
+    { pin =  6,                                                      lp = { 0 = "LP_GPIO6" } },
+    { pin =  7, functions = {                    3 = "LCD_DATA23" }, lp = { 0 = "LP_GPIO7" } },
     { pin =  8, functions = {                   2 = "GMAC_PHY_TXD0", 3 = "LCD_DATA0"  } },
     { pin =  9, functions = { 0 = "FSPIHD",     2 = "GMAC_PHY_TXD1", 3 = "LCD_DATA1",  4 = "DBG_PSRAM_CK" } },
     { pin = 10, functions = { 0 = "FSPICS0",    2 = "GMAC_PHY_TXD2", 3 = "LCD_DATA2",  4 = "DBG_PSRAM_CS" } },
@@ -39,8 +39,8 @@ pins = [
     { pin = 30, functions = { 0 = "SPIHD" },  limitations = ["spi_flash"] },
     { pin = 31, functions = { 0 = "SPICLK" }, limitations = ["spi_flash"] },
     { pin = 32, functions = { 0 = "SPID" },   limitations = ["spi_flash"] },
-    { pin = 33, functions = {                                  3 = "LCD_DATA12" }, analog = { 0 = "USJ_DM" } },
-    { pin = 34, functions = {                                  3 = "LCD_DATA13" }, analog = { 0 = "USJ_DP" } },
+    { pin = 33, functions = {                                  3 = "LCD_DATA12" },                   analog = { 0 = "USJ_DM" } },
+    { pin = 34, functions = {                                  3 = "LCD_DATA13" },                   analog = { 0 = "USJ_DP" } },
     { pin = 35, functions = {             2 = "REF_GMAC_CLK",  3 = "LCD_DATA14", 4 = "SD2_CDATA0" } },
     { pin = 36, functions = {             2 = "GMAC_PHY_RXDV", 3 = "LCD_DATA15", 4 = "SD2_CDATA1" }, limitations = ["strapping"] },
     { pin = 37, functions = {             2 = "GMAC_PHY_TXEN", 3 = "LCD_DATA16", 4 = "SD2_CDATA2" }, limitations = ["strapping"] },
@@ -130,6 +130,14 @@ input_signals = [
     { name = "CPU_GPIO_5",          id = 219 },
     { name = "CPU_GPIO_6",          id = 220 },
     { name = "CPU_GPIO_7",          id = 221 },
+    { name = "CPU_GPIO_8",          id = 222 },
+    { name = "CPU_GPIO_9",          id = 223 },
+    { name = "CPU_GPIO_10",         id = 224 },
+    { name = "CPU_GPIO_11",         id = 225 },
+    { name = "CPU_GPIO_12",         id = 226 },
+    { name = "CPU_GPIO_13",         id = 227 },
+    { name = "CPU_GPIO_14",         id = 228 },
+    { name = "CPU_GPIO_15",         id = 229 },
     # Spare functions
     { name = "SIG_IN_FUNC251",      id = 251 },
     { name = "SIG_IN_FUNC252",      id = 252 },
@@ -292,6 +300,14 @@ output_signals = [
     { name = "CPU_GPIO_5",          id = 219 },
     { name = "CPU_GPIO_6",          id = 220 },
     { name = "CPU_GPIO_7",          id = 221 },
+    { name = "CPU_GPIO_8",          id = 222 },
+    { name = "CPU_GPIO_9",          id = 223 },
+    { name = "CPU_GPIO_10",         id = 224 },
+    { name = "CPU_GPIO_11",         id = 225 },
+    { name = "CPU_GPIO_12",         id = 226 },
+    { name = "CPU_GPIO_13",         id = 227 },
+    { name = "CPU_GPIO_14",         id = 228 },
+    { name = "CPU_GPIO_15",         id = 229 },
     # GPIO passthrough
     { name = "GPIO",                id = 256 },
 
@@ -388,4 +404,30 @@ output_signals = [
     { name = "DBG_FLASH_Q" },
     { name = "DBG_FLASH_WP" },
     { name = "DBG_FLASH_HOLD" },
+]
+
+[device.lp_io]
+support_status = "not_supported"
+version = "esp32s31"
+lp_input_signals = [
+    { name = "LP_I2C_SCL",   id = 0 },
+    { name = "LP_I2C_SDA",   id = 1 },
+    { name = "LP_UART_RXD",  id = 2 },
+    { name = "LP_UART_CTSN", id = 3 },
+    { name = "LP_UART_DSRN", id = 4 },
+    { name = "LP_SPI_CK",    id = 5 },
+    { name = "LP_SPI_CS",    id = 6 },
+    { name = "LP_SPI_D",     id = 7 },
+    { name = "LP_SPI_Q",     id = 8 },
+]
+lp_output_signals = [
+    { name = "LP_I2C_SCL",   id = 0 },
+    { name = "LP_I2C_SDA",   id = 1 },
+    { name = "LP_UART_TXD",  id = 2 },
+    { name = "LP_UART_RTSN", id = 3 },
+    { name = "LP_UART_DTRN", id = 4 },
+    { name = "LP_SPI_CK",    id = 5 },
+    { name = "LP_SPI_CS",    id = 6 },
+    { name = "LP_SPI_D",     id = 7 },
+    { name = "LP_SPI_Q",     id = 8 },
 ]

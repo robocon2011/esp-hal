@@ -112,8 +112,6 @@ loop {
 "#
 )]
 pub use self::rtc::SocResetReason;
-#[cfg(sleep_driver_supported)]
-use crate::rtc_cntl::sleep::{RtcSleepConfig, WakeSource, WakeTriggers};
 #[cfg_attr(not(lp_timer_driver_supported), expect(unused))]
 use crate::{
     interrupt::{self, InterruptHandler},
@@ -139,17 +137,13 @@ pub(crate) mod rtc;
 
 cfg_select! {
     esp32s31 => {
-        use crate::peripherals::LP_SYS as LP_AON;
-        use crate::peripherals::LP_WDT;
+        use crate::peripherals::{LP_SYS as LP_AON, LP_WDT};
     }
     soc_has_lp_wdt => {
-        use crate::peripherals::LP_WDT;
-        use crate::peripherals::LP_AON;
+        use crate::peripherals::{LP_AON, LP_WDT};
     }
     _ => {
-        use crate::peripherals::LPWR;
-        use crate::peripherals::LPWR as LP_WDT;
-        use crate::peripherals::LPWR as LP_AON;
+        use crate::peripherals::{LPWR, LPWR as LP_WDT, LPWR as LP_AON};
     }
 }
 
@@ -231,7 +225,9 @@ impl WakeupReason {
 
 /// RTC clock.
 pub struct Rtc<'d> {
-    rtc_timer: RTC_TIMER<'d>,
+    // This field holds the peripheral, which prevents a second `Rtc`. The code uses
+    // `RTC_TIMER::regs()` for the registers, because the sleep alarm needs them without an `Rtc`.
+    _rtc_timer: RTC_TIMER<'d>,
     /// Reset Watchdog Timer.
     pub rwdt: Rwdt,
     /// Super Watchdog
@@ -245,7 +241,7 @@ impl<'d> Rtc<'d> {
     /// Optionally an interrupt handler can be bound.
     pub fn new(rtc_timer: RTC_TIMER<'d>) -> Self {
         Self {
-            rtc_timer,
+            _rtc_timer: rtc_timer,
             rwdt: Rwdt,
             #[cfg(soc_has_swd_watchdog)]
             swd: Swd,
@@ -255,50 +251,7 @@ impl<'d> Rtc<'d> {
     /// Get the time since boot in the raw register units.
     #[cfg(lp_timer_driver_supported)]
     fn time_since_boot_raw(&self) -> u64 {
-        let rtc = self.rtc_timer.register_block();
-
-        // Load counter value
-        cfg_select! {
-            any(esp32, esp32s2, esp32s3, esp32c2, esp32c3) => {
-                // Keep update high for at least one RTC slowclk period, assumes 150k RTC_SLOWCLK
-                // Without this, this function may return a stale value
-                const UPDATE_COUNT: usize = if cfg!(esp32) {
-                    20
-                } else {
-                    10
-                };
-                for _ in 0..UPDATE_COUNT {
-                    rtc.time_update().write(|w| w.time_update().set_bit());
-                    crate::rom::ets_delay_us(1);
-                }
-            }
-            _ => {
-                rtc.update().write(|w| w.main_timer_update().set_bit());
-            }
-        }
-
-        // Read counter value
-        cfg_select! {
-            esp32 => {
-                while rtc.time_update().read().time_valid().bit_is_clear() {
-                    // Might take 1 RTC slowclk period, don't flood RTC bus
-                    crate::rom::ets_delay_us(1);
-                }
-
-                let h = rtc.time1().read().time_hi().bits();
-                let l = rtc.time0().read().time_lo().bits();
-            }
-            any(esp32s2, esp32s3, esp32c2, esp32c3) => {
-                let h = rtc.time_high0().read().timer_value0_high().bits();
-                let l = rtc.time_low0().read().timer_value0_low().bits();
-            }
-            _ => {
-                let h = rtc.main_buf0_high().read().main_timer_buf0_high().bits();
-                let l = rtc.main_buf0_low().read().main_timer_buf0_low().bits();
-            }
-        }
-
-        ((h as u64) << 32) | (l as u64)
+        time_since_boot_raw()
     }
 
     /// Get the time elapsed since the last power-on reset.
@@ -314,11 +267,12 @@ impl<'d> Rtc<'d> {
     #[cfg(lp_timer_driver_supported)]
     fn boot_time_us(&self) -> u64 {
         // For more info on about how RTC setting works and what it has to do with boot time, see https://github.com/esp-rs/esp-hal/pull/1883
-        let (low_reg, high_reg) = cfg_select! {
-            esp32s31 => (LP_AON::regs().lp_store(2), LP_AON::regs().lp_store(3)),
-            esp32p4 => (LP_AON::regs().lp_store2(), LP_AON::regs().lp_store3()),
-            _ => (LP_AON::regs().store2(), LP_AON::regs().store3()),
-        };
+        let (low_reg, high_reg) =
+            cfg_select! {
+                esp32s31 => (LP_AON::regs().lp_store(2), LP_AON::regs().lp_store(3)),
+                esp32p4 => (LP_AON::regs().lp_store2(), LP_AON::regs().lp_store3()),
+                _ => (LP_AON::regs().store2(), LP_AON::regs().store3()),
+            };
 
         let l = low_reg.read().bits() as u64;
         let h = high_reg.read().bits() as u64;
@@ -333,11 +287,12 @@ impl<'d> Rtc<'d> {
         // Please see `boot_time_us` for documentation on registers and peripherals
         // used for certain SOCs.
 
-        let (low_reg, high_reg) = cfg_select! {
-            esp32s31 => (LP_AON::regs().lp_store(2), LP_AON::regs().lp_store(3)),
-            esp32p4 => (LP_AON::regs().lp_store2(), LP_AON::regs().lp_store3()),
-            _ => (LP_AON::regs().store2(), LP_AON::regs().store3()),
-        };
+        let (low_reg, high_reg) =
+            cfg_select! {
+                esp32s31 => (LP_AON::regs().lp_store(2), LP_AON::regs().lp_store(3)),
+                esp32p4 => (LP_AON::regs().lp_store2(), LP_AON::regs().lp_store3()),
+                _ => (LP_AON::regs().store2(), LP_AON::regs().store3()),
+            };
 
         // https://github.com/espressif/esp-idf/blob/23e4823/components/newlib/port/esp_time_impl.c#L102-L103
 
@@ -426,7 +381,9 @@ impl<'d> Rtc<'d> {
             _ => LP_AON::regs().store4(),
         };
         let disable_mask = cfg_select! {
-            any(esp32p4, esp32s31) => Self::RTC_DISABLE_ROM_LOG | (Self::RTC_DISABLE_ROM_LOG << 16),
+            any(esp32p4, esp32s31) => {
+                Self::RTC_DISABLE_ROM_LOG | (Self::RTC_DISABLE_ROM_LOG << 16)
+            }
             _ => Self::RTC_DISABLE_ROM_LOG,
         };
         reg.modify(|r, w| unsafe { w.bits(r.bits() | disable_mask) });
@@ -709,6 +666,62 @@ impl Swd {
     }
 }
 
+/// Reads the LP timer counter, in its own tick units.
+///
+/// `Rtc` owns `RTC_TIMER`, but the sleep alarm needs the same counter without the peripheral. This
+/// read is therefore a free function. A read first writes a register to make a snapshot, and then
+/// reads the snapshot from other registers. Two callers that do this at the same time can read the
+/// snapshot of the other caller, and the lock prevents that. The lock keeps interrupts disabled for
+/// the time of the snapshot, which is up to approximately 20 µs on esp32. That chip needs the
+/// update request set for one slow-clock period.
+#[cfg(lp_timer_driver_supported)]
+pub(crate) fn time_since_boot_raw() -> u64 {
+    static SNAPSHOT: esp_sync::NonReentrantMutex<()> = esp_sync::NonReentrantMutex::new(());
+
+    SNAPSHOT.with(|()| {
+        let rtc = RTC_TIMER::regs();
+
+        // Load counter value
+        cfg_select! {
+            any(esp32, esp32s2, esp32s3, esp32c2, esp32c3) => {
+                // Keep update high for at least one RTC slowclk period, assumes 150k RTC_SLOWCLK
+                // Without this, this function may return a stale value
+                const UPDATE_COUNT: usize = if cfg!(esp32) { 20 } else { 10 };
+                for _ in 0..UPDATE_COUNT {
+                    rtc.time_update().write(|w| w.time_update().set_bit());
+                    crate::rom::ets_delay_us(1);
+                }
+            }
+            _ => {
+                rtc.update().write(|w| w.main_timer_update().set_bit());
+            }
+        }
+
+        // Read counter value
+        cfg_select! {
+            esp32 => {
+                while rtc.time_update().read().time_valid().bit_is_clear() {
+                    // Might take 1 RTC slowclk period, don't flood RTC bus
+                    crate::rom::ets_delay_us(1);
+                }
+
+                let h = rtc.time1().read().time_hi().bits();
+                let l = rtc.time0().read().time_lo().bits();
+            }
+            any(esp32s2, esp32s3, esp32c2, esp32c3) => {
+                let h = rtc.time_high0().read().timer_value0_high().bits();
+                let l = rtc.time_low0().read().timer_value0_low().bits();
+            }
+            _ => {
+                let h = rtc.main_buf0_high().read().main_timer_buf0_high().bits();
+                let l = rtc.main_buf0_low().read().main_timer_buf0_low().bits();
+            }
+        }
+
+        ((h as u64) << 32) | (l as u64)
+    })
+}
+
 /// Return reset reason.
 pub fn reset_reason(cpu: Cpu) -> Option<SocResetReason> {
     let reason = crate::rom::rtc_get_reset_reason(cpu as u32);
@@ -812,10 +825,7 @@ impl WakeLock {
     #[instability::unstable]
     pub fn is_active() -> bool {
         cfg_select! {
-            sleep_light_sleep => {
-                wake_lock_count().load(portable_atomic::Ordering::Acquire)
-                    != 0
-            }
+            sleep_light_sleep => wake_lock_count().load(portable_atomic::Ordering::Acquire) != 0,
             _ => true,
         }
     }

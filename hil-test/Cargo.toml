@@ -67,6 +67,11 @@ harness           = false
 required-features = ["embassy", "esp-alloc"]
 
 [[bin]]
+name              = "sdm"
+harness           = false
+required-features = ["unstable"]
+
+[[bin]]
 name              = "spi"
 harness           = false
 
@@ -123,6 +128,8 @@ p256                = { version = "0.13.2", default-features = false, features =
 p384                = { version = "0.13.1", default-features = false, features = ["arithmetic"] }
 sha1                = { version = "0.11.0", default-features = false }
 sha2                = { version = "0.11.0", default-features = false }
+
+paste               = "1.0.15"
 
 [build-dependencies]
 esp-metadata-generated = { path = "../esp-metadata-generated", features = ["build-script"] }

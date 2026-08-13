@@ -42,6 +42,7 @@ strum = { version = "0.27", default-features = false, features = ["derive"] }
 
 crc = { version = "3.3.0", optional = true }
 md-5 = { version = "0.10.6", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false }
 
 [build-dependencies]
 jiff       = { version = "0.2.13", default-features = false, features = ["std"] }
@@ -65,10 +66,10 @@ log-04 = ["dep:log-04"]
 defmt = ["dep:defmt"]
 
 # Replace ROM functions with pure Rust implementations, needed for tests.
-std = ["dep:crc", "dep:md-5", "esp-storage/emulation"]
+std = ["dep:crc", "dep:md-5"]
 
-## Implement traits from `embedded-storage` for [`FlashRegion`].
-embedded-storage = ["dep:embedded-storage", "esp-storage/embedded-storage"]
+## Implement traits from `embedded-storage` for [`crate::partitions::FlashRegion`].
+embedded-storage = ["dep:embedded-storage"]
 
 #! ### Chip selection
 #! One of the following features must be enabled to select the target chip:

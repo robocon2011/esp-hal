@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -46,7 +46,7 @@ peripherals = [
     { name = "FLASH_ENCRYPTION" },
     { name = "FRC_TIMER" },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HINF" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
     { name = "I2C1", interrupts = { peri = "I2C_EXT1" }, stable = true, clock_group = "I2C" },
@@ -64,7 +64,7 @@ peripherals = [
     { name = "RSA", interrupts = { peri = "RSA" } },
     { name = "LPWR", pac = "RTC_CNTL" },
     { name = "RTC_TIMER", pac = "RTC_CNTL" },
-    { name = "RTC_I2C" },
+    { name = "LP_I2C0", pac = "RTC_I2C" },
     { name = "RTC_IO" },
     { name = "SDHOST" },
     { name = "SENS" },
@@ -155,10 +155,6 @@ engines = [
     }
 ]
 
-[device.lp_io]
-support_status = "partial"
-version = "esp32"
-
 [device.gpio]
 support_status = "supported"
 # {include gpio.toml}
@@ -178,6 +174,10 @@ i2c0_data_register_ahb_address = 0x6001301c
 
 [device.i2c_slave]
 support_status = { status = "not_supported", issue = 1909 }
+
+[device.lp_i2c_master]
+support_status = "not_supported"
+version = "esp32"
 
 [device.interrupts]
 support_status = "partial"
@@ -203,7 +203,8 @@ support_status = "partial"
 algo = { sha1 = 0, sha256 = 0, sha384 = 0, sha512 = 0 } # fake mode bits, ESP32 has separate register sets
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 8
 
 [device.spi_master]
 version = 1
@@ -284,7 +285,11 @@ apb_cycle_wait_num = 16 # TODO
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 1
+pin_wakeup_version = 1
+deep_sleep_needs_gpio_isolation = true
 wakeup_sources = {
+    rejectable = ["Gpio", "Sdio"],
     Ext0 = 0,
     Ext1 = 1,
     Gpio = 2,
@@ -330,6 +335,7 @@ instances = [
         ws_rx = "I2S1I_WS",
         dout = ["I2S1O_DATA_23"],
         din = ["I2S1I_DATA_15"],
+        pdm_tx = true,
     },
 ]
 
@@ -376,7 +382,7 @@ extmem_origin = 0x3F800000
 [device.lp_timer]
 
 [device.ulp_fsm]
-support_status = "not_supported"
+support_status = { status = "not_supported", issue = 376 }
 
 ## Radio
 [device.wifi]

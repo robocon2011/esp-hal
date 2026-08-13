@@ -413,12 +413,8 @@ impl ContextExt for CpuContext {
 
     fn sp(&self) -> u32 {
         cfg_select! {
-            xtensa => {
-                self.A1
-            }
-            _ => {
-                self.sp as u32
-            }
+            xtensa => self.A1,
+            _ => self.sp as u32,
         }
     }
 
@@ -541,6 +537,21 @@ impl Task {
         }
     }
 
+    /// Returns the address range of the task's stack, as `(bottom, top)`.
+    ///
+    /// The stack grows down from `top`, so `bottom` itself is not a valid stack pointer.
+    fn stack_range(&self) -> (usize, usize) {
+        let bottom = self.stack.cast::<MaybeUninit<u32>>();
+        let top = bottom.wrapping_add(self.stack.len());
+        (bottom as usize, top as usize)
+    }
+
+    /// Returns whether `sp` points into this task's stack.
+    pub(crate) fn owns_stack_pointer(&self, sp: usize) -> bool {
+        let (bottom, top) = self.stack_range();
+        sp > bottom && sp <= top
+    }
+
     pub(crate) fn ensure_no_stack_overflow(&self, _sp: usize) {
         #[cfg(sw_task_overflow_detection)]
         assert_eq!(
@@ -553,20 +564,14 @@ impl Task {
         );
 
         #[cfg(stack_pointer_range_check)]
-        {
-            let len = self.stack.len();
-            let data_ptr = self.stack.cast::<MaybeUninit<u32>>();
-            let stack_bottom = data_ptr as usize;
-            let stack_top = data_ptr.wrapping_add(len) as usize;
-            assert!(
-                _sp > stack_bottom && _sp <= stack_top,
-                "Stack overflow detected in {:?}. Stack pointer: {:x}, Task stack range: {:x} ..= {:x}",
-                self as *const Task,
-                _sp,
-                stack_bottom,
-                stack_top
-            );
-        }
+        assert!(
+            self.owns_stack_pointer(_sp),
+            "Stack overflow detected in {:?}. Stack pointer: {:x}, Task stack range: {:x} ..= {:x}",
+            self as *const Task,
+            _sp,
+            self.stack_range().0,
+            self.stack_range().1
+        );
     }
 
     pub(crate) fn set_up_stack_watchpoint(&self) {
@@ -600,13 +605,6 @@ pub(super) fn allocate_main_task(
 ) {
     let cpu = Cpu::current();
     let current_cpu = cpu as usize;
-
-    debug_assert!(
-        !scheduler.per_cpu[current_cpu].initialized,
-        "Tried to allocate main task multiple times"
-    );
-
-    scheduler.per_cpu[current_cpu].initialized = true;
 
     // Reset main task properties. The rest should be cleared when the task is deleted.
     scheduler.per_cpu[current_cpu].main_task.priority = Priority::ZERO;
@@ -652,7 +650,7 @@ pub(super) fn allocate_main_task(
     scheduler.set_current_task(cpu, Some(main_task_ptr));
     scheduler
         .run_queue
-        .mark_task_ready(&scheduler.per_cpu, main_task_ptr);
+        .mark_task_ready(&scheduler.per_cpu, scheduler.active_cores, main_task_ptr);
 }
 
 /// A handle to the current thread.
@@ -718,9 +716,7 @@ pub(crate) fn trigger_scheduler(run_scheduler: RunSchedulerOn) {
                         schedule_other_core()
                     }
                 }
-                _ => {
-                    yield_task()
-                }
+                _ => yield_task(),
             }
         }
     }

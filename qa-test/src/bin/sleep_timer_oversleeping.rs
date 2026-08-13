@@ -49,7 +49,7 @@ async fn main(_spawner: Spawner) {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
+    let rtc = Rtc::new(peripherals.RTC_TIMER);
     let mut lpwr = LowPower::new(peripherals.LPWR);
 
     let boot_count = unsafe { BOOT_COUNT };
@@ -116,11 +116,13 @@ async fn main(_spawner: Spawner) {
 
     let delay = esp_hal::delay::Delay::new();
 
-    let timer = esp_hal::rtc_cntl::sleep::TimerWakeupSource::new(
-        esp_hal::time::Duration::from_millis(SLEEP_MS),
-    );
-
+    // Send the console output before the code arms the deadline. The deadline is absolute, so a
+    // delay after the arming makes the sleep 30 ms shorter.
     delay.delay_millis(100);
 
-    lpwr.sleep(&config, &[&timer]);
+    lpwr.set_wakeup_deadline(
+        esp_hal::time::Instant::now() + esp_hal::time::Duration::from_millis(SLEEP_MS),
+    );
+
+    lpwr.sleep_deep(config);
 }

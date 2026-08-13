@@ -1,7 +1,6 @@
 //! UART Test
 
-// FIXME: ESP32-P4's UART driver still needs some work.
-//% CHIP_FILTER: uart_driver_supported && !esp32p4
+//% CHIP_FILTER: uart_driver_supported
 //% FEATURES: unstable embassy
 
 #![no_std]
@@ -30,10 +29,11 @@ mod tests {
 
     #[init]
     fn init() -> Context {
-        let config = cfg_select! {
-            esp32s31 => esp_hal::Config::default(),
-            _ => esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
-        };
+        let config =
+            cfg_select! {
+                esp32s31 => esp_hal::Config::default(),
+                _ => esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+            };
         let peripherals = esp_hal::init(config);
 
         let (rx, tx) = hil_test::common_test_pins!(peripherals);
@@ -52,16 +52,6 @@ mod tests {
             rts: rts.degrade(),
             delay: delay,
         }
-    }
-
-    #[test]
-    fn test_send_receive(ctx: Context) {
-        let mut uart = ctx.uart1.with_tx(ctx.tx).with_rx(ctx.rx);
-
-        uart.write(&[0x42]).unwrap();
-        let mut byte = [0u8; 1];
-        uart.read(&mut byte).unwrap();
-        assert_eq!(byte[0], 0x42);
     }
 
     #[test]
@@ -171,12 +161,13 @@ mod tests {
         // working as expected. We will also using different clock sources
         // while we're at it.
 
-        let fastest_clock_source = cfg_select! {
-            esp32c2 => ClockSource::PllF40m,
-            any(esp32c5, esp32c6, esp32c61, esp32p4, esp32s31) => ClockSource::PllF80m,
-            esp32h2 => ClockSource::PllF48m,
-            _ => ClockSource::Apb,
-        };
+        let fastest_clock_source =
+            cfg_select! {
+                esp32c2 => ClockSource::PllF40m,
+                any(esp32c5, esp32c6, esp32c61, esp32p4, esp32s31) => ClockSource::PllF80m,
+                esp32h2 => ClockSource::PllF48m,
+                _ => ClockSource::Apb,
+            };
 
         let configs = [
             #[cfg(not(soc_has_clock_node_ref_tick))]
@@ -596,18 +587,6 @@ mod async_tx_rx {
             .into_async();
 
         Context { rx, tx }
-    }
-
-    #[test]
-    async fn test_write_read(mut ctx: Context) {
-        let byte = [0x42];
-        let mut read = [0u8; 1];
-
-        ctx.tx.flush_async().await.unwrap();
-        ctx.tx.write_async(&byte).await.unwrap();
-        let _ = ctx.rx.read_async(&mut read).await;
-
-        assert_eq!(read, byte);
     }
 
     #[test]
@@ -1329,4 +1308,112 @@ mod uhci {
     // async fn test_baudrate_change_tx(ctx: Context) {
     // return;
     // }
+}
+
+#[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
+mod new_tests {
+    use defmt::info;
+    use esp_hal::{
+        Async,
+        Blocking,
+        gpio::{AnyPin, Pin},
+        interrupt::software::SoftwareInterruptControl,
+        timer::timg::TimerGroup,
+        uart::{self, AnyUart, Uart},
+    };
+    use esp_metadata_generated::for_each_uart;
+
+    for_each_uart! {
+        (all $($any:tt),*) => {
+            const UART_COUNT: usize = 0 $(+ { stringify!($any); 1 })*;
+        };
+    }
+
+    struct Context {
+        uart: [AnyUart<'static>; UART_COUNT],
+        rx: AnyPin<'static>,
+        tx: AnyPin<'static>,
+    }
+
+    #[init]
+    fn init() -> Context {
+        let p = esp_hal::init(
+            esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+        );
+
+        let sw_int = SoftwareInterruptControl::new(p.SW_INTERRUPT);
+        let timg0 = TimerGroup::new(p.TIMG0);
+        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+        let (rx, tx) = hil_test::common_test_pins!(p);
+
+        for_each_uart! {
+            (all $( ($id:literal, $peri:ident, $variant:ident, $rxd:ident, $txd:ident, $cts:ident, $rts:ident, wakeup_source = $_:literal) ),*) => {
+                let uart = [
+                    $(
+                        p.$peri.into(),
+                    )*
+                ];
+
+                return Context {
+                    uart,
+                    rx: rx.degrade(),
+                    tx: tx.degrade(),
+                };
+            };
+        }
+    }
+
+    #[test]
+    fn send_receive(mut ctx: Context) {
+        fn inner(instance: usize, mut driver: Uart<'_, Blocking>) {
+            info!("Testing UART{}", instance);
+
+            const TEST_BYTE: u8 = 0x42;
+            let mut read = [0u8; 1];
+
+            driver.write(&[TEST_BYTE]).unwrap();
+            driver.read(&mut read).unwrap();
+            hil_test::assert_eq!(read[0], TEST_BYTE, "UART{} read unexpected byte", instance);
+
+            info!("UART{} test passed", instance);
+        }
+
+        // Run the test for each UART instance
+        for (i, uart) in ctx.uart.into_iter().enumerate() {
+            let uart = Uart::new(uart, uart::Config::default())
+                .unwrap()
+                .with_tx(ctx.tx.reborrow())
+                .with_rx(ctx.rx.reborrow());
+            inner(i, uart);
+        }
+    }
+
+    #[test]
+    async fn async_send_receive(mut ctx: Context) {
+        async fn inner(instance: usize, mut driver: Uart<'_, Async>) {
+            info!("Testing UART{}", instance);
+
+            const TEST_BYTE: u8 = 0x42;
+            let mut read = [0u8; 1];
+
+            driver.flush_async().await.unwrap();
+            driver.write_async(&[TEST_BYTE]).await.unwrap();
+            let _ = driver.read_async(&mut read).await;
+
+            hil_test::assert_eq!(read[0], TEST_BYTE, "UART{} read unexpected byte", instance);
+
+            info!("UART{} test passed", instance);
+        }
+
+        // Run the test for each UART instance
+        for (i, uart) in ctx.uart.into_iter().enumerate() {
+            let uart = Uart::new(uart, uart::Config::default())
+                .unwrap()
+                .with_tx(ctx.tx.reborrow())
+                .with_rx(ctx.rx.reborrow())
+                .into_async();
+            inner(i, uart).await;
+        }
+    }
 }

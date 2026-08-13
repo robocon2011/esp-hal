@@ -14,8 +14,11 @@ use hil_test as _;
 cfg_select! {
     feature = "unstable" => {
         use core::cell::RefCell;
+
         use critical_section::Mutex;
         use embassy_time::{Duration, Timer};
+        #[cfg(multi_core)]
+        use esp_hal::system::Stack;
         use esp_hal::{
             // OutputOpenDrain is here because will be unused otherwise
             delay::Delay,
@@ -23,8 +26,6 @@ cfg_select! {
             handler,
             timer::timg::TimerGroup,
         };
-        #[cfg(multi_core)]
-        use esp_hal::system::Stack;
         #[cfg(multi_core)]
         use hil_test::mk_static;
         use portable_atomic::{AtomicUsize, Ordering};
@@ -540,6 +541,44 @@ mod tests {
         assert_eq!(test_gpio2.is_set_low(), true);
     }
 
+    #[test]
+    #[cfg(all(feature = "unstable", lp_io_driver_supported))]
+    fn creating_a_driver_releases_the_hold_of_a_pad(mut ctx: Context) {
+        let probe = Input::new(
+            ctx.test_gpio2.reborrow(),
+            InputConfig::default().with_pull(Pull::None),
+        );
+
+        // A program that held the pad while it drove a high level.
+        {
+            let mut pin = Flex::new(ctx.test_gpio1.reborrow());
+            pin.apply_output_config(&OutputConfig::default());
+            pin.set_output_enable(true);
+            pin.set_high();
+
+            pin.set_pad_hold(true);
+            assert!(pin.is_pad_held(), "the pad does not report its hold");
+
+            pin.set_low();
+            ctx.delay.delay_millis(1);
+            assert_eq!(
+                probe.level(),
+                Level::High,
+                "the hold does not keep the level of the pad"
+            );
+        }
+
+        let mut pin = Flex::new(ctx.test_gpio1.reborrow());
+        pin.apply_output_config(&OutputConfig::default());
+        pin.set_output_enable(true);
+        pin.set_low();
+
+        assert!(!pin.is_pad_held(), "the pad still reports a hold");
+
+        ctx.delay.delay_millis(1);
+        assert_eq!(probe.level(), Level::Low, "the pad is still held");
+    }
+
     // Tests touch pin (GPIO2) as AnyPin and Output
     // https://github.com/esp-rs/esp-hal/issues/1943
     #[test]
@@ -570,7 +609,7 @@ mod tests {
 
     #[cfg(esp32)]
     #[test]
-    fn can_configure_rtcio_pins_as_input() {
+    fn can_configure_lp_io_pins_as_input() {
         let pin = unsafe { esp_hal::peripherals::GPIO37::steal() };
 
         _ = Input::new(pin, InputConfig::default().with_pull(Pull::Down));
@@ -847,30 +886,31 @@ mod tests {
         output_bundle.set_low(0b10); // should panic, only channel0 is configured
     }
 
-    #[cfg(all(lp_io_driver_supported, feature = "unstable"))]
+    #[cfg(all(ulp_riscv_driver_supported, feature = "unstable"))]
     fn no_init() {}
 
     #[test(init = no_init)]
-    #[cfg(all(lp_io_driver_supported, feature = "unstable"))]
+    #[cfg(all(ulp_riscv_driver_supported, feature = "unstable"))]
     fn creating_lpio_does_not_panic() {
         let peripherals = esp_hal::init(esp_hal::Config::default());
 
-        let jtag_pins = cfg_select!(
+        // Do not use JTAG or USB Serial/JTAG pins because they break the tests.
+        let debug_pins = cfg_select!(
             esp32 => [13, 14, 15, 16],
             any(esp32c2, esp32c3) => [4, 5],
-            // S2 JTAG pins are not RTC_IO pins, rest use USB Serial/JTAG
+            esp32s3 => [19, 20],
             _ => [],
         );
 
         esp_metadata_generated::for_each_lp_function! {
-            (($_rtc:ident, RTC_GPIOn, $pin:literal), $gpio:ident) => {
-                if !jtag_pins.contains(&$pin) {
-                    esp_hal::gpio::lp_io::LowPowerInput::new(peripherals.$gpio);
-                }
-            };
-            (($_rtc:ident, LP_GPIOn, $pin:literal), $gpio:ident) => {
-                if !jtag_pins.contains(&$pin) {
-                    esp_hal::gpio::lp_io::LowPowerInput::new(peripherals.$gpio);
+            (($_lp:ident, LP_GPIOn, $pin:literal), $gpio:ident, $_af:ident, $_lp_in:tt $_lp_out:tt) => {
+                if !debug_pins.contains(&$pin) {
+                    esp_hal::gpio::Input::new(
+                        peripherals.$gpio,
+                        esp_hal::gpio::InputConfig::default(),
+                    )
+                    .into_lp::<$pin>()
+                    .unwrap();
                 }
             };
         }

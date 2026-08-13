@@ -20,6 +20,9 @@ use crate::efuse::ChipRevision;
 #[cfg_attr(esp32s31, path = "esp32s31/mod.rs")]
 mod implementation;
 
+#[cfg(soc_has_xtal32k_pads)]
+pub(crate) mod xtal32k;
+
 cfg_select! {
     all(feature = "unstable", ulp_riscv_driver_supported) => {
         pub use self::implementation::*;
@@ -273,12 +276,12 @@ pub(crate) fn ensure_stack_pointer_in_range() {
     }
     let current_sp: usize;
     cfg_select! {
-        xtensa => {
-            unsafe { core::arch::asm!("mov {0}, sp", out(reg) current_sp); }
-        }
-        _ => {
-            unsafe { core::arch::asm!("mv {0}, sp", out(reg) current_sp); }
-        }
+        xtensa => unsafe {
+            core::arch::asm!("mov {0}, sp", out(reg) current_sp);
+        },
+        _ => unsafe {
+            core::arch::asm!("mv {0}, sp", out(reg) current_sp);
+        },
     }
     let stack_bottom = (&raw const _stack_end_cpu0) as usize;
     let stack_top = (&raw const _stack_start_cpu0) as usize;

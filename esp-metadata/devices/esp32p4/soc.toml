@@ -2,7 +2,7 @@
 #
 # Empty [`device.driver`] tables imply `partial` support status.
 #
-# If you modify a driver support status, run `cargo xtask update-metadata` to
+# If you modify a driver support status, run `cargo update-metadata` to
 # update the table in the esp-hal README.
 
 [device]
@@ -61,6 +61,7 @@ peripherals = [
     # Minimal set for esp-hal compilation
     { name = "EFUSE", hidden = true },
     { name = "GPIO" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "SYSTEM", pac = "HP_SYS" },
     { name = "HP_SYS" },
     { name = "HP_SYS_CLKRST" },
@@ -129,6 +130,7 @@ peripherals = [
     { name = "USB_WRAP", hidden = true },
 
     { name = "FLASH", virtual = true },
+    { name = "GPIO_DEDICATED", virtual = true },
     { name = "SW_INTERRUPT", virtual = true },
     { name = "CPU_CTRL", virtual = true },
 ]
@@ -185,7 +187,7 @@ instances = [
 
 [device.i2c_master]
 support_status = "supported"
-version = 3
+version = 4
 instances = [
     { name = "i2c0", sys_instance = "I2c0", scl = "I2C0_SCL", sda = "I2C0_SDA" },
     { name = "i2c1", sys_instance = "I2c1", scl = "I2C1_SCL", sda = "I2C1_SDA" },
@@ -196,6 +198,8 @@ ll_intr_mask = 0x3ffff
 fifo_size = 32
 has_bus_timeout_enable = true
 max_bus_timeout = 0x1F
+can_estimate_nack_reason = true # txfifo_raddr is present
+has_conf_update = true
 has_arbitration_en = true
 has_pd_en = true
 
@@ -264,14 +268,13 @@ support_status = "not_supported"
 [device.assist_debug]
 support_status = "not_supported"
 [device.avc]
-support_status = "not_supported"  # P4 ANA_CMPR (CH0/CH1)
+support_status = "not_supported"
+[device.bit_scrambler]
+support_status = "not_supported"
 [device.camera]
-support_status = "not_supported"  # LCD_CAM block, camera path
-# [device.dedicated_gpio] requires a `channels` table -- skip for now
-# until we map the P4 CPU GPIO instance list. README will show this row
-# blank for P4, accurate to the current driver state.
+support_status = "not_supported"
 [device.ds]
-support_status = "not_supported"  # Digital Signature
+support_status = "not_supported"
 [device.ecdsa]
 support_status = "not_supported"
 
@@ -279,11 +282,14 @@ support_status = "not_supported"
 support_status = "partial"
 mii_via_gpio_matrix = true
 
+[device.mipi_csi]
+support_status = "not_supported"
+
 [device.mipi_dsi]
 support_status = "partial"
 
 [device.etm]
-support_status = "not_supported"  # Event Task Matrix
+support_status = "not_supported"
 [device.hmac]
 support_status = "not_supported"
 [device.i2c_slave]
@@ -323,6 +329,8 @@ instances = [
         ws_rx = "I2S1_I_WS",
         dout = ["I2S1_O_SD"],
         din = ["I2S1_I_SD"],
+        pdm_tx = true,
+        pdm_rx = true,
     },
     {
         name = "i2s2",
@@ -334,16 +342,24 @@ instances = [
         ws_rx = "I2S2_I_WS",
         dout = ["I2S2_O_SD"],
         din = ["I2S2_I_SD"],
+        pdm_tx = true,
+        pdm_rx = true,
     },
 ]
+
+[device.lp_i2s]
+support_status = "not_supported"
 
 [device.ledc]
 version = 2
 channel_count = 8
 support_status = "not_supported"
+
 [device.lp_i2c_master]
 support_status = "not_supported"
-fifo_size = 32  # placeholder until LP I2C driver lands; from c6 reference
+version = "lp_i2c"
+fifo_size = 16
+
 [device.lp_uart]
 support_status = "not_supported"
 ram_size = 32  # placeholder; LP UART RAM size on P4 needs verification
@@ -353,8 +369,17 @@ support_status = "not_supported"  # 2 instances (MCPWM0/1)
 support_status = "not_supported"
 [device.rgb_display]
 support_status = "not_supported"  # LCD path of LCD_CAM block
-# [device.rmt] requires ram_start / channel_ram_size / channels config -
-# left out until those are mapped from P4 TRM. README row stays blank.
+
+[device.rmt]
+support_status = "not_supported"
+ram_start = 0x500A2800
+channel_ram_size = 48
+channels = ["Tx", "Tx", "Tx", "Tx", "Rx", "Rx", "Rx", "Rx"]
+# TODO capabilities
+
+[device.parl_io]
+support_status = "not_supported"
+version = 1 # FIXME placeholder
 
 [device.rng]
 support_status = { status = "partial", issue = 5982 }
@@ -400,12 +425,15 @@ slot_config = [
 ]
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 8
 
 [device.sleep]
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 3
+pin_wakeup_version = 3
 wakeup_sources = {
     # TODO: other sources
     Sdio = 0,
@@ -422,6 +450,14 @@ wakeup_sources = {
 }
 
 [device.spi_slave]
+support_status = "not_supported"
+[device.lp_spi_master]
+support_status = "not_supported"
+[device.lp_spi_slave]
+support_status = "not_supported"
+[device.i3c_master]
+support_status = "not_supported"
+[device.i3c_slave]
 support_status = "not_supported"
 [device.temp_sensor]
 support_status = "not_supported"
@@ -496,10 +532,34 @@ separate_jacobian_point_memory = true
 has_memory_clock_gate = true
 supports_enhanced_security = true
 
-[device.lp_io]
-support_status = "partial"
-version = "esp32p4"
-
 [device.gpio]
 support_status = "supported"
 # {include gpio.toml}
+
+[device.dedicated_gpio]
+version = "riscv_v2"
+support_status = "partial"
+channels = [
+    ["CPU_GPIO_0", "CPU_GPIO_1",  "CPU_GPIO_2",  "CPU_GPIO_3",  "CPU_GPIO_4",  "CPU_GPIO_5",  "CPU_GPIO_6",  "CPU_GPIO_7" ],
+    ["CPU_GPIO_8", "CPU_GPIO_9",  "CPU_GPIO_10", "CPU_GPIO_11", "CPU_GPIO_12", "CPU_GPIO_13", "CPU_GPIO_14", "CPU_GPIO_15"],
+]
+
+[device.key_manager]
+support_status = "not_supported"
+
+[device.isp]
+support_status = "not_supported"
+
+[device.pixel_accelerator]
+support_status = "not_supported"
+
+[device.jpeg]
+support_status = "not_supported"
+
+[device.h264_encoder]
+support_status = "not_supported"
+
+[device.vad]
+support_status = "not_supported"
+
+[device.io_mux]

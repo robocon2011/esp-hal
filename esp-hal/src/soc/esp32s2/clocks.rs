@@ -19,7 +19,7 @@ use esp_rom_sys::rom::{ets_delay_us, ets_update_cpu_frequency_rom};
 
 use crate::{
     peripherals::{I2C_ANA_MST, LPWR, RMT, SYSCON, SYSTEM, TIMG0, TIMG1},
-    soc::regi2c,
+    soc::{regi2c, xtal32k},
     time::Rate,
 };
 
@@ -54,7 +54,7 @@ impl CpuClock {
         cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_6)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
-        rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
+        rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -65,7 +65,7 @@ impl CpuClock {
         cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_3)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
-        rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
+        rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -76,7 +76,7 @@ impl CpuClock {
         cpu_pll_div: Some(CpuPllDivConfig::new(CpuPllDivDivisor::_2)),
         system_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
-        rtc_slow_clk: Some(RtcSlowClkConfig::RcSlow),
+        rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -681,6 +681,24 @@ impl TimgInstance {
     }
 }
 
+impl SdmInstance {
+    // SDM_FUNCTION_CLOCK
+
+    fn enable_function_clock_impl(self, _clocks: &mut ClockTree, en: bool) {
+        crate::peripherals::GPIO_SD::regs()
+            .sigmadelta_misc()
+            .modify(|_, w| w.function_clk_en().bit(en));
+    }
+
+    fn configure_function_clock_impl(
+        self,
+        _clocks: &mut ClockTree,
+        _old_config: Option<SdmFunctionClockConfig>,
+        _new_config: SdmFunctionClockConfig,
+    ) {
+        // Nothing to do.
+    }
+}
 impl RmtInstance {
     // RMT_SCLK
 

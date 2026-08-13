@@ -106,18 +106,7 @@ use enumset::{EnumSet, EnumSetType};
 #[cfg(feature = "unstable")]
 use crate::gpio::{Input, Output};
 use crate::{
-    gpio::{
-        self,
-        AlternateFunction,
-        AnyPin,
-        Flex,
-        InputPin,
-        Level,
-        NoPin,
-        OutputPin,
-        Pin,
-        PinGuard,
-    },
+    gpio::{self, AlternateFunction, AnyPin, Flex, Level, NoPin, OutputPin, Pin, PinGuard},
     peripherals::GPIO,
     private::{self, Sealed},
 };
@@ -167,32 +156,6 @@ pub trait PeripheralOutput<'d>: Into<OutputSignal<'d>> + PeripheralSignal<'d> {
     /// peripheral remain intact.
     #[doc(hidden)] // Considered unstable
     fn disconnect_from_peripheral_output(&self);
-}
-
-// Pins
-impl<'d, P> PeripheralSignal<'d> for P
-where
-    P: Pin + 'd,
-{
-    fn connect_input_to_peripheral(&self, signal: gpio::InputSignal) {
-        let pin = unsafe { AnyPin::steal(self.number()) };
-        InputSignal::new(pin).connect_input_to_peripheral(signal);
-    }
-}
-impl<'d, P> PeripheralInput<'d> for P where P: InputPin + 'd {}
-
-impl<'d, P> PeripheralOutput<'d> for P
-where
-    P: OutputPin + 'd,
-{
-    fn connect_peripheral_to_output(&self, signal: gpio::OutputSignal) {
-        let pin = unsafe { AnyPin::steal(self.number()) };
-        OutputSignal::new(pin).connect_peripheral_to_output(signal);
-    }
-    fn disconnect_from_peripheral_output(&self) {
-        let pin = unsafe { AnyPin::steal(self.number()) };
-        OutputSignal::new(pin).disconnect_from_peripheral_output();
-    }
 }
 
 // Pin drivers
@@ -555,7 +518,8 @@ where
     P: Pin + 'd,
 {
     fn from(input: P) -> Self {
-        InputSignal::new(input.degrade())
+        // Safety: the pin singleton proves that no other signal drives this pad.
+        unsafe { input.degrade().into_input_signal() }
     }
 }
 
@@ -742,7 +706,7 @@ where
     P: OutputPin + 'd,
 {
     fn from(output: P) -> Self {
-        OutputSignal::new(output.degrade())
+        output.degrade().into_output_signal()
     }
 }
 

@@ -15,6 +15,7 @@ use esp_rom_sys::rom::ets_update_cpu_frequency_rom;
 use crate::{
     pac::HP_ALIVE_SYS,
     peripherals::{HP_SYS_CLKRST, LP_AON_CLK_RST, PMU},
+    soc::xtal32k,
 };
 
 define_clock_tree_types!();
@@ -51,7 +52,7 @@ impl CpuClock {
         ahb_clk: Some(AhbClkConfig::new(1)),
         apb_clk: Some(ApbClkConfig::new(1)),
         lp_fast_clk: Some(LpFastClkConfig::RcFast),
-        lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+        lp_slow_clk: Some(xtal32k::default_lp_slow_clk()),
         timg_calibration_clock: None,
     };
     const PRESET_240: ClockConfig = ClockConfig {
@@ -62,7 +63,7 @@ impl CpuClock {
         ahb_clk: Some(AhbClkConfig::new(2)),
         apb_clk: Some(ApbClkConfig::new(1)),
         lp_fast_clk: Some(LpFastClkConfig::RcFast),
-        lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+        lp_slow_clk: Some(xtal32k::default_lp_slow_clk()),
         timg_calibration_clock: None,
     };
     const PRESET_320: ClockConfig = ClockConfig {
@@ -73,7 +74,7 @@ impl CpuClock {
         ahb_clk: Some(AhbClkConfig::new(2)),
         apb_clk: Some(ApbClkConfig::new(1)),
         lp_fast_clk: Some(LpFastClkConfig::RcFast),
-        lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+        lp_slow_clk: Some(xtal32k::default_lp_slow_clk()),
         timg_calibration_clock: None,
     };
 }
@@ -164,19 +165,19 @@ fn configure_bbpll_clk_impl(
     // The S31 BBPLL is fixed at 480 MHz. Program its documented divider taps.
     HP_SYS_CLKRST::regs()
         .ref_20m_ctrl0()
-        .modify(|_, w| unsafe { w.ref_20m_clk_div_num().bits(23) });
+        .modify(|_, w| unsafe { w.clk_div_num().bits(23) });
     HP_SYS_CLKRST::regs()
         .ref_80m_ctrl0()
-        .modify(|_, w| unsafe { w.ref_80m_clk_div_num().bits(5) });
+        .modify(|_, w| unsafe { w.clk_div_num().bits(5) });
     HP_SYS_CLKRST::regs()
         .ref_120m_ctrl0()
-        .modify(|_, w| unsafe { w.ref_120m_clk_div_num().bits(3) });
+        .modify(|_, w| unsafe { w.clk_div_num().bits(3) });
     HP_SYS_CLKRST::regs()
         .ref_160m_ctrl0()
-        .modify(|_, w| unsafe { w.ref_160m_clk_div_num().bits(2) });
+        .modify(|_, w| unsafe { w.clk_div_num().bits(2) });
     HP_SYS_CLKRST::regs()
         .ref_240m_ctrl0()
-        .modify(|_, w| unsafe { w.ref_240m_clk_div_num().bits(1) });
+        .modify(|_, w| unsafe { w.clk_div_num().bits(1) });
 }
 
 fn enable_cpll_clk_impl(_clocks: &mut ClockTree, en: bool) {
@@ -262,20 +263,20 @@ fn enable_rc_slow_clk_impl(_clocks: &mut ClockTree, en: bool) {
 }
 
 macro_rules! pll_gate {
-    ($name:ident, $register:ident, $field:ident) => {
+    ($name:ident, $register:ident) => {
         fn $name(_clocks: &mut ClockTree, en: bool) {
             HP_SYS_CLKRST::regs()
                 .$register()
-                .modify(|_, w| w.$field().bit(en));
+                .modify(|_, w| w.clk_en().bit(en));
         }
     };
 }
 
-pll_gate!(enable_pll_f20m_impl, ref_20m_ctrl0, ref_20m_clk_en);
-pll_gate!(enable_pll_f80m_impl, ref_80m_ctrl0, ref_80m_clk_en);
-pll_gate!(enable_pll_f120m_impl, ref_120m_ctrl0, ref_120m_clk_en);
-pll_gate!(enable_pll_f160m_impl, ref_160m_ctrl0, ref_160m_clk_en);
-pll_gate!(enable_pll_f240m_impl, ref_240m_ctrl0, ref_240m_clk_en);
+pll_gate!(enable_pll_f20m_impl, ref_20m_ctrl0);
+pll_gate!(enable_pll_f80m_impl, ref_80m_ctrl0);
+pll_gate!(enable_pll_f120m_impl, ref_120m_ctrl0);
+pll_gate!(enable_pll_f160m_impl, ref_160m_ctrl0);
+pll_gate!(enable_pll_f240m_impl, ref_240m_ctrl0);
 
 fn enable_xtal_d2_clk_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do here
@@ -398,7 +399,7 @@ fn configure_lp_slow_clk_impl(
 fn enable_timg_calibration_clock_impl(_clocks: &mut ClockTree, en: bool) {
     HP_SYS_CLKRST::regs()
         .timergrp0_tgrt_ctrl0()
-        .modify(|_, w| w.timergrp0_tgrt_clk_en().bit(en));
+        .modify(|_, w| w.clk_en().bit(en));
 }
 
 fn configure_timg_calibration_clock_impl(
@@ -414,8 +415,8 @@ fn configure_timg_calibration_clock_impl(
     HP_SYS_CLKRST::regs()
         .timergrp0_tgrt_ctrl0()
         .modify(|_, w| unsafe {
-            w.timergrp0_tgrt_clk_src_sel().bits(source);
-            w.timergrp0_tgrt_clk_div_num().bits(divider - 1)
+            w.clk_src_sel().bits(source);
+            w.clk_div_num().bits(divider - 1)
         });
 }
 

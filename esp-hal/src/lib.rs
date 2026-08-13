@@ -393,6 +393,8 @@ unstable_driver! {
     pub mod sdmmc;
     #[cfg(sha_driver_supported)]
     pub mod sha;
+    #[cfg(sdm_driver_supported)]
+    pub mod sdm;
     #[cfg(touch_driver_supported)]
     pub mod touch;
     #[cfg(soc_has_trace0)]
@@ -765,7 +767,7 @@ pub fn init(config: Config) -> Peripherals {
     let mut rtc = crate::rtc_cntl::Rtc::new(peripherals.RTC_TIMER.reborrow());
 
     #[cfg(sleep_driver_supported)]
-    crate::rtc_cntl::sleep::RtcSleepConfig::base_settings(&rtc);
+    crate::rtc_cntl::sleep::init(&rtc);
 
     // Disable watchdog timers
     #[cfg(soc_has_swd_watchdog)]

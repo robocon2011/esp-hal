@@ -34,6 +34,7 @@ esp-radio = { path = "../esp-radio", features = [
     "unstable",
 ], optional = true }
 esp-storage = { path = "../esp-storage", optional = true }
+ieee802154 = "0.6.1"
 lis3dh-async = "0.9.3"
 ssd1306 = "0.10.0"
 static_cell = "2.1.1"
@@ -59,6 +60,7 @@ esp-radio = [
 ]
 
 esp32 = [
+    "esp-alloc/esp32",
     "esp-backtrace/esp32",
     "esp-bootloader-esp-idf/esp32",
     "esp-hal/esp32",
@@ -68,54 +70,67 @@ esp32 = [
     "esp-storage?/esp32",
 ]
 esp32c2 = [
+    "esp-alloc/esp32c2",
     "esp-backtrace/esp32c2",
     "esp-bootloader-esp-idf/esp32c2",
     "esp-hal/esp32c2",
     "esp-rtos/esp32c2",
     "esp-println/esp32c2",
     "esp-radio?/esp32c2",
+    "esp-storage?/esp32c2",
 ]
 esp32c3 = [
+    "esp-alloc/esp32c3",
     "esp-backtrace/esp32c3",
     "esp-bootloader-esp-idf/esp32c3",
     "esp-hal/esp32c3",
     "esp-rtos/esp32c3",
     "esp-println/esp32c3",
     "esp-radio?/esp32c3",
+    "esp-storage?/esp32c3",
 ]
 esp32c5 = [
+    "esp-alloc/esp32c5",
     "esp-backtrace/esp32c5",
     "esp-bootloader-esp-idf/esp32c5",
     "esp-hal/esp32c5",
     "esp-rtos/esp32c5",
     "esp-println/esp32c5",
     "esp-radio?/esp32c5",
+    "esp-storage?/esp32c5",
 ]
 esp32c6 = [
+    "esp-alloc/esp32c6",
     "esp-backtrace/esp32c6",
     "esp-bootloader-esp-idf/esp32c6",
     "esp-hal/esp32c6",
     "esp-rtos/esp32c6",
     "esp-println/esp32c6",
     "esp-radio?/esp32c6",
+    "esp-storage?/esp32c6",
 ]
 esp32c61 = [
+    "esp-alloc/esp32c61",
     "esp-backtrace/esp32c61",
     "esp-bootloader-esp-idf/esp32c61",
     "esp-hal/esp32c61",
     "esp-rtos/esp32c61",
     "esp-println/esp32c61",
     "esp-radio?/esp32c61",
+    "esp-storage?/esp32c61",
 ]
 esp32h2 = [
+    "esp-alloc/esp32h2",
     "esp-backtrace/esp32h2",
     "esp-bootloader-esp-idf/esp32h2",
     "esp-hal/esp32h2",
     "esp-rtos/esp32h2",
     "esp-println/esp32h2",
     "esp-radio?/esp32h2",
+    "esp-storage?/esp32h2",
 ]
 esp32p4 = [
+    "esp-alloc/esp32p4",
     "esp-backtrace/esp32p4",
     "esp-bootloader-esp-idf/esp32p4",
     "esp-hal/esp32p4",
@@ -124,14 +139,17 @@ esp32p4 = [
     "esp-storage?/esp32p4",
 ]
 esp32s2 = [
+    "esp-alloc/esp32s2",
     "esp-backtrace/esp32s2",
     "esp-bootloader-esp-idf/esp32s2",
     "esp-hal/esp32s2",
     "esp-rtos/esp32s2",
     "esp-println/esp32s2",
     "esp-radio?/esp32s2",
+    "esp-storage?/esp32s2",
 ]
 esp32s3 = [
+    "esp-alloc/esp32s3",
     "esp-backtrace/esp32s3",
     "esp-bootloader-esp-idf/esp32s3",
     "esp-hal/esp32s3",
@@ -141,6 +159,7 @@ esp32s3 = [
     "esp-storage?/esp32s3",
 ]
 esp32s31 = [
+    "esp-alloc/esp32s31",
     "esp-backtrace/esp32s31",
     "esp-bootloader-esp-idf/esp32s31",
     "esp-hal/esp32s31",
