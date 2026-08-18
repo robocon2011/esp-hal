@@ -7,7 +7,7 @@
 use core::fmt::{Debug, Display, Formatter, Result as FmtResult};
 
 type InnerRate = fugit::Rate<u32, 1, 1>;
-type InnerInstant = fugit::Instant<u64, 1, 1_000_000>;
+type InnerInstant = fugit::Instant<u64, 1, 1_000_000, fugit::kind::Monotonic>;
 type InnerDuration = fugit::Duration<u64, 1, 1_000_000>;
 
 /// Represents a rate or frequency of events.
@@ -328,8 +328,7 @@ impl core::ops::Sub for Instant {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        // Avoid "Sub failed! Other > self" panics
-        Duration::from_micros(self.0.as_ticks().wrapping_sub(rhs.0.as_ticks()))
+        Duration(self.0 - rhs.0)
     }
 }
 
@@ -491,7 +490,6 @@ impl Duration {
             /// let micros = duration.as_micros();
             /// # {after_snippet}
             /// ```
-            #[call(as_micros)]
             pub const fn as_micros(&self) -> u64;
 
             #[procmacros::doc_replace]
@@ -506,7 +504,6 @@ impl Duration {
             /// let millis = duration.as_millis();
             /// # {after_snippet}
             /// ```
-            #[call(as_millis)]
             pub const fn as_millis(&self) -> u64;
 
             #[procmacros::doc_replace]
@@ -521,7 +518,6 @@ impl Duration {
             /// let secs = duration.as_secs();
             /// # {after_snippet}
             /// ```
-            #[call(as_secs)]
             pub const fn as_secs(&self) -> u64;
 
             #[procmacros::doc_replace]
@@ -536,7 +532,6 @@ impl Duration {
             /// let minutes = duration.as_minutes();
             /// # {after_snippet}
             /// ```
-            #[call(as_minutes)]
             pub const fn as_minutes(&self) -> u64;
 
             #[procmacros::doc_replace]
@@ -551,7 +546,6 @@ impl Duration {
             /// let hours = duration.as_hours();
             /// # {after_snippet}
             /// ```
-            #[call(as_hours)]
             pub const fn as_hours(&self) -> u64;
         }
     }

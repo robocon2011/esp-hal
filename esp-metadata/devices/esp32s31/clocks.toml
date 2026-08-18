@@ -42,6 +42,16 @@ system_clocks = { clock_tree = [
         { name = "XTAL32K",  outputs = "XTAL32K_CLK" },
     ] },
 
+    {
+        name = "IOMUX_FUNCTION_CLOCK", type = "generic", output = "source / (div_num + 1)", always_on = true,
+        params = {
+            source = [
+                { name = "XTAL_CLK", outputs = "XTAL_CLK" },
+                { name = "PLL_F80M", outputs = "PLL_F80M", default = true },
+            ],
+            div_num = "0 .. 0x100",
+        },
+    },
     { name = "TIMG_CALIBRATION_CLOCK", type = "mux", wake_locking = true, variants = [
         { name = "RC_SLOW_CLK",     outputs = "RC_SLOW_CLK" },
         { name = "RC_FAST_DIV_CLK", outputs = "RC_FAST_CLK" },
@@ -120,6 +130,8 @@ peripheral_clocks = { templates = [
     { name = "I2c1", template_params = { clk_en = "{{apb_clk}} {{peri_clk}}", ctrl_reg = "i2c_ctrl0(1)" } },
     # DMA engines
     { name = "AxiGdma", template_params = { peripheral = "axi_pdma", clk_en = "{{sys_clk}}" } },
+    { name = "AhbGdma", template_params = { peripheral = "ahb_pdma", clk_en = "{{sys_clk}}" } },
+    { name = "Uhci0", template_params = { peripheral = "uhci" } },
     # USB
     { name = "UsbHs", template_params = { peripheral = "usb_otghs", rst_template = "{{no_rst}}" } },
     # Crypto - there is a crypto_clk_en bit as well, luckily it starts as 1

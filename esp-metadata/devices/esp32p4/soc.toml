@@ -26,16 +26,7 @@ has_md5_bsd = true
 support_status = "partial"
 status_registers = 5
 software_interrupt_count = 4
-# ESP32-P4 uses CLIC with 48 interrupt lines (TRM v0.5, Ch 14)
 controller = { Riscv = { flavour = "clic", interrupts = 48, priority_levels = 8 } }
-
-# TODO: align with newer TRM revisions after v0.5. The v0.5 TRM still has
-# the following sections incomplete:
-# - Bus Architecture
-# - Processor Instruction Extensions
-# - AXI Performance Monitor
-# - MIPI DSI (CAM)
-# - I3C
 
 [device.soc]
 cpu_has_branch_predictor = true
@@ -71,11 +62,13 @@ peripherals = [
     { name = "LP_I2C_ANA_MST" },
     { name = "CLIC" },
     { name = "IO_MUX" },
+    { name = "LP_I2C0" },
     { name = "LP_AON", pac = "LP_SYS" },
     { name = "LP_AON_CLKRST" },
     { name = "LP_SYS" },
     { name = "LP_GPIO" },
     { name = "LP_IO_MUX" },
+    { name = "LP_PERI" },
     { name = "RTC_TIMER", pac = "LP_TIMER" },
     { name = "LP_WDT" },
     { name = "LPWR", pac = "LP_SYS" },
@@ -88,6 +81,7 @@ peripherals = [
     { name = "UART2", interrupts = { peri = "UART2" }, stable = true, clock_group = "UART" },
     { name = "UART3", interrupts = { peri = "UART3" }, stable = true, clock_group = "UART" },
     { name = "UART4", interrupts = { peri = "UART4" }, stable = true, clock_group = "UART" },
+    { name = "UHCI0" },
     { name = "SPI0" },
     { name = "SPI1" },
     { name = "SPI2", interrupts = { peri = "SPI2" }, stable = true, clock_group = "SPI" },
@@ -212,8 +206,9 @@ engines = [
         name = "AHB_GDMA",
         max_priority = 5,
         burst_sizes = [0, 4, 16, 32], # unclear if 64 byte (INCR16) is supported
-        drivers = ["i2s"],
+        drivers = ["i2s", "uhci"],
         peripheral_instances = [
+            { name = "UHCI0", dma_id = 2 },
             { name = "I2S0", dma_id = 3 },
             { name = "I2S1", dma_id = 4 },
             { name = "I2S2", dma_id = 5 },
@@ -356,7 +351,7 @@ channel_count = 8
 support_status = "not_supported"
 
 [device.lp_i2c_master]
-support_status = "not_supported"
+support_status = "partial"
 version = "lp_i2c"
 fifo_size = 16
 
@@ -464,7 +459,8 @@ support_status = "not_supported"
 [device.touch]
 support_status = "not_supported"
 [device.uhci]
-support_status = "not_supported"
+support_status = "partial"
+combined_uart_selector_field = true
 [device.ulp_riscv]
 support_status = "not_supported"
 
