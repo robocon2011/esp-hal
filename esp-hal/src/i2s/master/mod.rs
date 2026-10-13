@@ -166,6 +166,15 @@ pub use super::pdm::{
     PdmSlotMode,
     PdmTxConfig,
 };
+/// Clock source for the I2S TX/RX module clocks (after the source mux and MCLK divider).
+#[cfg(not(i2s_version = "1"))]
+pub use crate::clock::ll::I2sClkSclk as I2sClockSource;
+/// Selects whether the MCLK pad outputs the TX or RX module clock.
+#[cfg(not(i2s_version = "1"))]
+pub use crate::clock::ll::I2sMclkOutConfig as MclkOut;
+/// Clock source for the I2S module clock (after the source mux and MCLK divider).
+#[cfg(i2s_version = "1")]
+pub use crate::clock::ll::I2sMclkSclk as I2sClockSource;
 use crate::{
     Async,
     Blocking,
@@ -197,6 +206,31 @@ use crate::{
     system::PeripheralGuard,
     time::Rate,
 };
+
+/// Returns the frequency of a module clock source, in Hz.
+///
+/// The transmitter and the receiver select their source from the same set of clocks, so one
+/// lookup describes both directions.
+pub(crate) fn source_frequency(source: I2sClockSource) -> u32 {
+    cfg_select! {
+        i2s_version = "1" => crate::clock::ll::I2sInstance::mclk_source_frequency(source),
+        _ => crate::clock::ll::I2sInstance::tx_clk_source_frequency(source),
+    }
+}
+
+/// Returns the largest A coefficient the module-clock divider can hold.
+pub(crate) fn mclk_max_denominator() -> u32 {
+    cfg_select! {
+        i2s_version = "1" => {
+            let (_, max) = property!("clock_tree.i2s.mclk.div_a");
+            max
+        }
+        _ => {
+            let (_, max) = property!("clock_tree.i2s.tx_clk.div_a");
+            max
+        }
+    }
+}
 
 #[derive(Debug, EnumSetType)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -245,7 +279,7 @@ with_i2s_dma_engine! {
 }
 
 impl<'d> I2s<'d, crate::Blocking> {
-    /// Construct a new I2S instance in TDM mode.
+    /// Creates a new I2S instance in TDM mode.
     pub fn new<I: Instance + 'd>(
         i2s: I,
         channel: impl I2sMasterDmaChannel<'d, I>,
@@ -254,7 +288,7 @@ impl<'d> I2s<'d, crate::Blocking> {
         Self::new_internal(i2s, channel.into(), Config::Tdm(config))
     }
 
-    /// Construct a new I2S instance in PDM mode.
+    /// Creates a new I2S instance in PDM mode.
     #[cfg(any(i2s_supports_pdm_tx, i2s_supports_pdm_rx))]
     pub fn new_pdm<I: Instance + PdmInstance + 'd>(
         i2s: I,
@@ -265,14 +299,9 @@ impl<'d> I2s<'d, crate::Blocking> {
     }
 }
 
-pub(crate) const I2S_LL_MCLK_DIVIDER_BIT_WIDTH: usize = property!("i2s.mclk_divider_bit_width");
-
-pub(crate) const I2S_LL_MCLK_DIVIDER_MAX: usize = (1 << I2S_LL_MCLK_DIVIDER_BIT_WIDTH) - 1;
-
 /// A structure representing a DMA transfer.
 ///
-/// This structure holds references to the driver instance, DMA buffers, and
-/// transfer status.
+/// Holds references to the driver instance, DMA buffers, and transfer status.
 #[instability::unstable]
 pub struct I2sTxDmaTransfer<'d, Dm, Buf>
 where
@@ -289,7 +318,7 @@ where
     Dm: DriverMode,
     Buf: DmaTxBuffer,
 {
-    /// Returns true when [Self::wait] will not block.
+    /// Returns whether [`Self::wait`] will not block.
     pub fn is_done(&self) -> bool {
         self.completed || self.i2s_tx.i2s.info().is_tx_done()
     }
@@ -306,7 +335,7 @@ where
         }
     }
 
-    /// Immediately stop the transfer and return the peripheral and buffer.
+    /// Immediately stops the transfer and returns the peripheral and buffer.
     pub fn stop(mut self) -> (I2sTx<'d, Dm>, Buf::Final) {
         self.i2s_tx.tx_channel.stop_transfer();
         self.i2s_tx.i2s.info().tx_stop();
@@ -406,8 +435,7 @@ impl<Dm: DriverMode, BUF: DmaTxBuffer> Drop for I2sTxDmaTransfer<'_, Dm, BUF> {
 
 /// A structure representing a DMA transfer.
 ///
-/// This structure holds references to the driver instance, DMA buffers, and
-/// transfer status.
+/// Holds references to the driver instance, DMA buffers, and transfer status.
 #[instability::unstable]
 pub struct I2sRxDmaTransfer<'d, Dm, Buf>
 where
@@ -424,7 +452,7 @@ where
     Dm: DriverMode,
     Buf: DmaRxBuffer,
 {
-    /// Returns true when [Self::wait] will not block.
+    /// Returns whether [`Self::wait`] will not block.
     pub fn is_done(&self) -> bool {
         self.completed || self.i2s_rx.i2s.info().is_rx_done()
     }
@@ -442,7 +470,7 @@ where
         }
     }
 
-    /// Immediately stop the transfer and return the peripheral and buffer.
+    /// Immediately stops the transfer and returns the peripheral and buffer.
     pub fn stop(mut self) -> (I2sRx<'d, Dm>, Buf::Final) {
         self.i2s_rx.i2s.info().rx_stop();
         self.i2s_rx.rx_channel.stop_transfer();
@@ -574,56 +602,165 @@ impl From<DmaError> for Error {
     }
 }
 
-/// Supported data formats
+/// Supported I2S data formats.
+///
+/// Each format defines two dimensions:
+///
+/// - **`Data{X}` (on-wire slot width)**: The number of bit-clock (BCLK) cycles allocated to each
+///   channel slot on the physical line ([`Self::data_bits`]). This determines the BCLK frequency
+///   (`BCLK = sample_rate * channels * data_bits`) and the time duration of each channel slot.
+/// - **`Channel{Y}` (in-memory sample width)**: The number of active audio data bits per sample
+///   transferred to or from memory via DMA ([`Self::channel_bits`]).
+///
+/// ### In-Memory Representation
+///
+/// In the DMA memory buffer, samples are stored with a size corresponding to `Channel{Y}`:
+/// - 32-bit (`Channel32`): 4 bytes per sample (e.g. `i32` / `u32`).
+/// - 24-bit (`Channel24`): 3 bytes per sample (packed 24-bit PCM).
+/// - 16-bit (`Channel16`): 2 bytes per sample (e.g. `i16` / `u16`).
+/// - 8-bit (`Channel8`): 1 byte per sample (e.g. `i8` / `u8`).
+///
+/// ### On-Wire Representation and Padding
+///
+/// On the physical I2S lines, each channel occupies `Data{X}` clock cycles:
+/// - When `X == Y` (e.g. [`Data16Channel16`], [`Data32Channel32`]), the entire slot carries sample
+///   data with no padding.
+/// - When `X > Y` (e.g. [`Data32Channel16`]), the `Y`-bit sample occupies `Y` bits of the `X`-bit
+///   slot on the wire, and the remaining `X - Y` bits are padded or discarded according to
+///   [`Alignment`]:
+///   - [`Alignment::Left`] (default):
+///     - **TX**: The `Y` sample bits are transmitted first (MSB-aligned within the slot), followed
+///       by `X - Y` zero bits.
+///     - **RX**: The first `Y` bits from the wire are captured into memory; trailing bits in the
+///       slot are discarded.
+///   - [`Alignment::Right`]:
+///     - **TX**: `X - Y` zero bits are transmitted first, followed by the `Y` sample bits
+///       (LSB-aligned within the slot).
+///     - **RX**: The leading `X - Y` bits are discarded; the last `Y` bits of the slot are captured
+///       into memory.
+///
+/// Note: In this driver's naming scheme, `Data{X}` refers to the on-wire slot width, and
+/// `Channel{Y}` refers to the in-memory sample data width. (This differs from some datasheets where
+/// the on-wire slot is called "slot width" or "channel width", and the sample size is called "data
+/// width".)
+///
+/// [`Data16Channel16`]: DataFormat::Data16Channel16
+/// [`Data32Channel16`]: DataFormat::Data32Channel16
+/// [`Data32Channel32`]: DataFormat::Data32Channel32
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(not(i2s_version = "1"))]
 pub enum DataFormat {
-    /// 32-bit data width and 32-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 32-bit in-memory sample width (4 bytes per
+    /// sample).
     Data32Channel32,
-    /// 32-bit data width and 24-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 24-bit in-memory sample width (3 bytes packed
+    /// per sample).
+    ///
+    /// In TX, 24-bit samples from memory are padded to 32 bits on the wire according to
+    /// [`Alignment`]. In RX, 24 bits are extracted from each 32-bit slot on the wire into
+    /// memory.
     Data32Channel24,
-    /// 32-bit data width and 16-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 16-bit in-memory sample width (2 bytes per
+    /// sample).
+    ///
+    /// In TX, 16-bit samples from memory are padded to 32 bits on the wire according to
+    /// [`Alignment`]. In RX, 16 bits are extracted from each 32-bit slot on the wire into
+    /// memory.
     Data32Channel16,
-    /// 32-bit data width and 8-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 8-bit in-memory sample width (1 byte per
+    /// sample).
+    ///
+    /// In TX, 8-bit samples from memory are padded to 32 bits on the wire according to
+    /// [`Alignment`]. In RX, 8 bits are extracted from each 32-bit slot on the wire into
+    /// memory.
     Data32Channel8,
-    /// 16-bit data width and 16-bit channel width.
+    /// 16-bit on-wire slot width (16 BCLK cycles) and 16-bit in-memory sample width (2 bytes per
+    /// sample).
     Data16Channel16,
-    /// 16-bit data width and 8-bit channel width.
+    /// 16-bit on-wire slot width (16 BCLK cycles) and 8-bit in-memory sample width (1 byte per
+    /// sample).
+    ///
+    /// In TX, 8-bit samples from memory are padded to 16 bits on the wire according to
+    /// [`Alignment`]. In RX, 8 bits are extracted from each 16-bit slot on the wire into
+    /// memory.
     Data16Channel8,
-    /// 8-bit data width and 8-bit channel width.
+    /// 8-bit on-wire slot width (8 BCLK cycles) and 8-bit in-memory sample width (1 byte per
+    /// sample).
     Data8Channel8,
 }
 
-/// Supported data formats
+/// Supported I2S data formats.
+///
+/// Each format defines the on-wire slot width (`Data{X}`) and the in-memory sample width
+/// (`Channel{Y}`). On the ESP32-S2, each slot on the wire matches the sample data width in memory
+/// (`X == Y`).
+///
+/// - **`Data{X}` (on-wire slot width)**: The number of bit-clock (BCLK) cycles allocated to each
+///   channel slot on the physical line ([`Self::data_bits`]).
+/// - **`Channel{Y}` (in-memory sample width)**: The number of audio data bits per sample
+///   transferred to or from memory via DMA ([`Self::channel_bits`]).
+///
+/// In the DMA memory buffer, samples occupy:
+/// - 32-bit ([`Data32Channel32`]): 4 bytes per sample.
+/// - 24-bit ([`Data24Channel24`]): 3 bytes per sample.
+/// - 16-bit ([`Data16Channel16`]): 2 bytes per sample.
+/// - 8-bit ([`Data8Channel8`]): 1 byte per sample.
+///
+/// [`Data32Channel32`]: DataFormat::Data32Channel32
+/// [`Data24Channel24`]: DataFormat::Data24Channel24
+/// [`Data16Channel16`]: DataFormat::Data16Channel16
+/// [`Data8Channel8`]: DataFormat::Data8Channel8
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(esp32s2)]
 pub enum DataFormat {
-    /// 32-bit data width and 32-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 32-bit in-memory sample width (4 bytes per
+    /// sample).
     Data32Channel32,
-    /// 24-bit data width and 24-bit channel width.
+    /// 24-bit on-wire slot width (24 BCLK cycles) and 24-bit in-memory sample width (3 bytes packed
+    /// per sample).
     Data24Channel24,
-    /// 16-bit data width and 16-bit channel width.
+    /// 16-bit on-wire slot width (16 BCLK cycles) and 16-bit in-memory sample width (2 bytes per
+    /// sample).
     Data16Channel16,
-    /// 8-bit data width and 8-bit channel width.
+    /// 8-bit on-wire slot width (8 BCLK cycles) and 8-bit in-memory sample width (1 byte per
+    /// sample).
     Data8Channel8,
 }
 
-/// Supported data formats
+/// Supported I2S data formats.
+///
+/// Each format defines the on-wire slot width (`Data{X}`) and the in-memory sample width
+/// (`Channel{Y}`). On the ESP32, each slot on the wire matches the sample data width in memory (`X
+/// == Y`).
+///
+/// - **`Data{X}` (on-wire slot width)**: The number of bit-clock (BCLK) cycles allocated to each
+///   channel slot on the physical line ([`Self::data_bits`]).
+/// - **`Channel{Y}` (in-memory sample width)**: The number of audio data bits per sample
+///   transferred to or from memory via DMA ([`Self::channel_bits`]).
+///
+/// In the DMA memory buffer, samples occupy:
+/// - 32-bit ([`Data32Channel32`]): 4 bytes per sample.
+/// - 16-bit ([`Data16Channel16`]): 2 bytes per sample.
+///
+/// [`Data32Channel32`]: DataFormat::Data32Channel32
+/// [`Data16Channel16`]: DataFormat::Data16Channel16
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(esp32)]
 pub enum DataFormat {
-    /// 32-bit data width and 32-bit channel width.
+    /// 32-bit on-wire slot width (32 BCLK cycles) and 32-bit in-memory sample width (4 bytes per
+    /// sample).
     Data32Channel32,
-    /// 16-bit data width and 16-bit channel width.
+    /// 16-bit on-wire slot width (16 BCLK cycles) and 16-bit in-memory sample width (2 bytes per
+    /// sample).
     Data16Channel16,
 }
 
 #[cfg(not(i2s_version = "1"))]
 impl DataFormat {
-    /// Returns the number of data bits for the selected data format.
+    /// Returns the on-wire slot width in bits (number of BCLK cycles per channel slot).
     pub fn data_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -636,7 +773,8 @@ impl DataFormat {
         }
     }
 
-    /// Returns the number of channel bits for the selected data format.
+    /// Returns the in-memory sample width in bits (active audio data bits per sample transferred
+    /// via DMA).
     pub fn channel_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -652,7 +790,7 @@ impl DataFormat {
 
 #[cfg(esp32s2)]
 impl DataFormat {
-    /// Returns the number of data bits for the selected data format.
+    /// Returns the on-wire slot width in bits (number of BCLK cycles per channel slot).
     pub fn data_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -662,7 +800,8 @@ impl DataFormat {
         }
     }
 
-    /// Returns the number of channel bits for the selected data format.
+    /// Returns the in-memory sample width in bits (active audio data bits per sample transferred
+    /// via DMA).
     pub fn channel_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -675,7 +814,7 @@ impl DataFormat {
 
 #[cfg(esp32)]
 impl DataFormat {
-    /// Returns the number of data bits for the selected data format.
+    /// Returns the on-wire slot width in bits (number of BCLK cycles per channel slot).
     pub fn data_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -683,7 +822,8 @@ impl DataFormat {
         }
     }
 
-    /// Returns the number of channel bits for the selected data format.
+    /// Returns the in-memory sample width in bits (active audio data bits per sample transferred
+    /// via DMA).
     pub fn channel_bits(&self) -> u8 {
         match self {
             DataFormat::Data32Channel32 => 32,
@@ -718,7 +858,7 @@ pub enum Endianness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum WsWidth {
-    /// Word select signal will be kept active for half of the frame
+    /// Word select signal will be kept active for half of the frame.
     #[default]
     HalfFrame,
     /// Word select signal will be kept active for the length of the first channel (PCM long frame
@@ -732,15 +872,29 @@ pub enum WsWidth {
     Bits(u16),
 }
 
-/// Represents the polarity of a signal
+/// Represents the polarity of a signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Polarity {
-    /// The signal is high when active
+    /// The signal is high when active.
     #[default]
     ActiveHigh,
-    /// The signal is low when active
+    /// The signal is low when active.
     ActiveLow,
+}
+
+/// Alignment of sample data within the on-wire slot when the in-memory sample width is less than
+/// the on-wire slot width.
+///
+/// See [`DataFormat`] for more details on padding and on-wire slot alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Alignment {
+    #[default]
+    /// Left aligned (MSB-aligned within the on-wire slot).
+    Left,
+    /// Right aligned (LSB-aligned within the on-wire slot).
+    Right,
 }
 
 /// I2S channels configuration
@@ -753,9 +907,9 @@ pub struct Channels {
 }
 
 impl Channels {
-    /// Two channels will use different data
+    /// Two channels will use different data.
     pub const STEREO: Channels = Channels::new_impl(2, 0b11, None);
-    /// Two channels will use the same data
+    /// Two channels will use the same data.
     pub const MONO: Channels = Channels::new_impl(2, 0b01, None);
     /// Two channels. Left(first) channel will contain data. Right(second) channel will contain
     /// zeros.
@@ -776,7 +930,7 @@ impl Channels {
     ///   disabled channels repeat the data from the last active channel. This field is ignored in
     ///   the receiver unit.
     ///
-    /// ## Example
+    /// # Examples
     ///
     /// The following example prepares configuration for 6 channels. Only 1st and 4th channels
     /// are active. Channels 2-3 will use the same data as the 1st, and channels 5-6 will use the
@@ -824,20 +978,28 @@ pub(crate) enum Config {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct TdmConfig {
-    /// Receiver unit config
+    /// Receiver unit config.
     rx_config: TdmUnitConfig,
 
-    /// Transmitter unit config
+    /// Transmitter unit config.
     tx_config: TdmUnitConfig,
 
     /// Sets `I2S_SIG_LOOPBACK`: TX and RX share the same WS and BCK.
     signal_loopback: bool,
 
-    /// The target sample rate
+    /// The target sample rate.
     #[cfg(i2s_version = "1")]
     sample_rate: Rate,
 
-    /// Format of the data
+    /// Source clock for the shared module clock.
+    #[cfg(i2s_version = "1")]
+    clock_source: I2sClockSource,
+
+    /// Selects which module clock is routed to the MCLK pad.
+    #[cfg(not(i2s_version = "1"))]
+    mclk_out: MclkOut,
+
+    /// Data format configuring on-wire slot width and in-memory sample width.
     #[cfg(i2s_version = "1")]
     data_format: DataFormat,
 }
@@ -848,15 +1010,6 @@ impl Config {
             Self::Tdm(c) => c.validate(),
             #[cfg(any(i2s_supports_pdm_tx, i2s_supports_pdm_rx))]
             Self::Pdm(c) => c.validate(_info).map_err(ConfigError::Pdm),
-        }
-    }
-
-    #[cfg(i2s_version = "1")]
-    fn calculate_clock(&self) -> I2sClockDividers {
-        match self {
-            Self::Tdm(c) => c.calculate_clock(),
-            #[cfg(any(i2s_supports_pdm_tx, i2s_supports_pdm_rx))]
-            Self::Pdm(_) => unreachable!(),
         }
     }
 }
@@ -907,10 +1060,15 @@ impl TdmConfig {
 
     #[cfg(i2s_version = "1")]
     fn calculate_clock(&self) -> I2sClockDividers {
-        I2sClockDividers::new(self.sample_rate, 2, self.data_format.data_bits())
+        I2sClockDividers::new(
+            self.sample_rate,
+            2,
+            self.data_format.data_bits(),
+            self.clock_source,
+        )
     }
 
-    /// Assign the given value to the `sample_rate` field in both units.
+    /// Assigns the given value to the `sample_rate` field in both units.
     #[must_use]
     #[cfg(not(i2s_version = "1"))]
     pub fn with_sample_rate(self, sample_rate: Rate) -> Self {
@@ -921,7 +1079,7 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `channels` field in both units.
+    /// Assigns the given value to the `channels` field in both units.
     #[must_use]
     pub fn with_channels(self, channels: Channels) -> Self {
         Self {
@@ -931,7 +1089,9 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `data_format` field in both units.
+    /// Assigns the given data format to both units.
+    ///
+    /// See [`DataFormat`] for details on on-wire slot width and in-memory sample width.
     #[must_use]
     #[cfg(not(i2s_version = "1"))]
     pub fn with_data_format(self, data_format: DataFormat) -> Self {
@@ -942,7 +1102,7 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `ws_width` field in both units.
+    /// Assigns the given value to the `ws_width` field in both units.
     #[must_use]
     pub fn with_ws_width(self, ws_width: WsWidth) -> Self {
         Self {
@@ -952,7 +1112,7 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `ws_polarity` field in both units.
+    /// Assigns the given value to the `ws_polarity` field in both units.
     #[must_use]
     pub fn with_ws_polarity(self, ws_polarity: Polarity) -> Self {
         Self {
@@ -962,7 +1122,7 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `msb_shift` field in both units.
+    /// Assigns the given value to the `msb_shift` field in both units.
     #[must_use]
     pub fn with_msb_shift(self, msb_shift: bool) -> Self {
         Self {
@@ -972,7 +1132,7 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `endianness` field in both units.
+    /// Assigns the given value to the `endianness` field in both units.
     #[cfg(not(esp32))]
     #[must_use]
     pub fn with_endianness(self, endianness: Endianness) -> Self {
@@ -983,13 +1143,24 @@ impl TdmConfig {
         }
     }
 
-    /// Assign the given value to the `bit_order` field in both units.
+    /// Assigns the given value to the `bit_order` field in both units.
     #[cfg(not(i2s_version = "1"))]
     #[must_use]
     pub fn with_bit_order(self, bit_order: BitOrder) -> Self {
         Self {
             rx_config: self.rx_config.with_bit_order(bit_order),
             tx_config: self.tx_config.with_bit_order(bit_order),
+            ..self
+        }
+    }
+
+    /// Assigns the given value to the `alignment` field in both units.
+    #[cfg(not(i2s_version = "1"))]
+    #[must_use]
+    pub fn with_alignment(self, alignment: Alignment) -> Self {
+        Self {
+            rx_config: self.rx_config.with_alignment(alignment),
+            tx_config: self.tx_config.with_alignment(alignment),
             ..self
         }
     }
@@ -1005,6 +1176,10 @@ impl Default for TdmConfig {
             #[cfg(i2s_version = "1")]
             sample_rate: Rate::from_hz(44100),
             #[cfg(i2s_version = "1")]
+            clock_source: I2sClockSource::default(),
+            #[cfg(not(i2s_version = "1"))]
+            mclk_out: MclkOut::default(),
+            #[cfg(i2s_version = "1")]
             data_format: DataFormat::Data16Channel16,
         }
     }
@@ -1015,44 +1190,55 @@ impl Default for TdmConfig {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct TdmUnitConfig {
-    /// The target sample rate
+    /// The target sample rate.
     #[cfg(not(i2s_version = "1"))]
     sample_rate: Rate,
 
-    /// I2S channels configuration
+    /// Source clock for this unit's module clock.
+    #[cfg(not(i2s_version = "1"))]
+    clock_source: I2sClockSource,
+
+    /// I2S channels configuration.
     channels: Channels,
 
-    /// Format of the data
+    /// Data format configuring on-wire slot width and in-memory sample width.
     #[cfg(not(i2s_version = "1"))]
     data_format: DataFormat,
 
-    /// Duration for which WS signal is kept active
+    /// Duration for which WS signal is kept active.
     ws_width: WsWidth,
 
-    /// Polarity of WS signal
+    /// Polarity of WS signal.
     ws_polarity: Polarity,
 
-    /// Data signal will lag by one bit relative to the WS signal
+    /// Data signal will lag by one bit relative to the WS signal.
     msb_shift: bool,
 
-    /// Byte order of the data
+    /// Byte order of the data.
     #[cfg(not(esp32))]
     endianness: Endianness,
 
-    /// Bit order of the data
+    /// Bit order of the data.
     #[cfg(not(i2s_version = "1"))]
     bit_order: BitOrder,
+
+    /// Alignment of sample data within the on-wire slot. Only relevant when sample width is less
+    /// than slot width.
+    #[cfg(not(i2s_version = "1"))]
+    alignment: Alignment,
 }
 
 /// Alias for [`TdmUnitConfig`] (TDM mode unit configuration).
 pub type UnitConfig = TdmUnitConfig;
 
 impl TdmUnitConfig {
-    /// TDM Philips standard configuration with two 16-bit active channels
+    /// TDM Philips standard configuration with two 16-bit active channels.
     pub fn new_tdm_philips() -> Self {
         Self {
             #[cfg(not(i2s_version = "1"))]
             sample_rate: Rate::from_hz(44100),
+            #[cfg(not(i2s_version = "1"))]
+            clock_source: I2sClockSource::default(),
             channels: Channels::STEREO,
             #[cfg(not(i2s_version = "1"))]
             data_format: DataFormat::Data16Channel16,
@@ -1063,22 +1249,24 @@ impl TdmUnitConfig {
             endianness: Endianness::LittleEndian,
             #[cfg(not(i2s_version = "1"))]
             bit_order: BitOrder::MsbFirst,
+            #[cfg(not(i2s_version = "1"))]
+            alignment: Alignment::Left,
         }
     }
 
-    /// TDM MSB standard configuration with two 16-bit active channels
+    /// TDM MSB standard configuration with two 16-bit active channels.
     pub fn new_tdm_msb() -> Self {
         Self::new_tdm_philips().with_msb_shift(false)
     }
 
-    /// TDM PCM short frame standard configuration with two 16-bit active channels
+    /// TDM PCM short frame standard configuration with two 16-bit active channels.
     pub fn new_tdm_pcm_short() -> Self {
         Self::new_tdm_philips()
             .with_ws_width(WsWidth::Bit)
             .with_ws_polarity(Polarity::ActiveHigh)
     }
 
-    /// TDM PCM long frame standard configuration with two 16-bit active channels
+    /// TDM PCM long frame standard configuration with two 16-bit active channels.
     #[cfg(not(i2s_version = "1"))]
     pub fn new_tdm_pcm_long() -> Self {
         Self::new_tdm_philips()
@@ -1123,6 +1311,7 @@ impl TdmUnitConfig {
             self.sample_rate,
             self.channels.count,
             self.data_format.data_bits(),
+            self.clock_source,
         )
     }
 }
@@ -1138,13 +1327,13 @@ impl Default for TdmUnitConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ConfigError {
-    /// Provided [Channels] configuration has no active channels or has over 16 total channels
+    /// Provided [Channels] configuration has no active channels or has over 16 total channels.
     #[cfg(not(i2s_version = "1"))]
     ChannelsOutOfRange,
-    /// Requested WS signal width is out of range
+    /// Requested WS signal width is out of range.
     #[cfg(not(i2s_version = "1"))]
     WsWidthOutOfRange,
-    /// PDM configuration error
+    /// PDM configuration error.
     #[cfg(any(i2s_supports_pdm_tx, i2s_supports_pdm_rx))]
     Pdm(PdmError),
 }
@@ -1182,7 +1371,7 @@ impl core::fmt::Display for ConfigError {
     }
 }
 
-/// Instance of the I2S peripheral driver
+/// Instance of the I2S peripheral driver.
 #[non_exhaustive]
 pub struct I2s<'d, Dm>
 where
@@ -1207,10 +1396,9 @@ where
         doc = "Registers an interrupt handler for the peripheral on the current core."
     )]
     #[doc = ""]
-    /// Note that this will replace any previously registered interrupt
-    /// handlers.
+    /// Replaces any previously registered interrupt handlers.
     ///
-    /// You can restore the default/unhandled interrupt handler by using
+    /// The default/unhandled interrupt handler can be restored with
     /// [crate::interrupt::DEFAULT_INTERRUPT_HANDLER]
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
@@ -1218,7 +1406,7 @@ where
         self.i2s_tx.i2s.set_interrupt_handler(handler);
     }
 
-    /// Listen for the given interrupts
+    /// Listens for the given interrupts.
     #[instability::unstable]
     pub fn listen(&mut self, interrupts: impl Into<EnumSet<I2sInterrupt>>) {
         // tx.i2s and rx.i2s is the same, we could use either one
@@ -1228,7 +1416,7 @@ where
             .enable_listen(interrupts.into(), true);
     }
 
-    /// Unlisten the given interrupts
+    /// Unlistens from the given interrupts.
     #[instability::unstable]
     pub fn unlisten(&mut self, interrupts: impl Into<EnumSet<I2sInterrupt>>) {
         // tx.i2s and rx.i2s is the same, we could use either one
@@ -1238,14 +1426,14 @@ where
             .enable_listen(interrupts.into(), false);
     }
 
-    /// Gets asserted interrupts
+    /// Returns the asserted interrupts.
     #[instability::unstable]
     pub fn interrupts(&mut self) -> EnumSet<I2sInterrupt> {
         // tx.i2s and rx.i2s is the same, we could use either one
         self.i2s_tx.i2s.info().interrupts()
     }
 
-    /// Resets asserted interrupts
+    /// Resets asserted interrupts.
     #[instability::unstable]
     pub fn clear_interrupts(&mut self, interrupts: impl Into<EnumSet<I2sInterrupt>>) {
         // tx.i2s and rx.i2s is the same, we could use either one
@@ -1286,20 +1474,25 @@ impl<'d> I2s<'d, Blocking> {
 
         i2s.info().set_master();
         i2s.info().configure(&config)?;
-        match &config {
-            Config::Tdm(_) => {
-                i2s.info().update_tx();
-                i2s.info().update_rx();
-            }
+
+        let clock = i2s.info().clock_instance;
+        let (req_tx, req_rx) = match &config {
+            Config::Tdm(_) => (true, true),
             #[cfg(any(i2s_supports_pdm_tx, i2s_supports_pdm_rx))]
-            Config::Pdm(c) => {
-                if c.tx.is_some() {
-                    i2s.info().update_tx();
-                }
-                if c.rx.is_some() {
-                    i2s.info().update_rx();
-                }
-            }
+            Config::Pdm(c) => (c.tx.is_some(), c.rx.is_some()),
+        };
+
+        // `tx_update` / `rx_update` copy APB registers into the I2S clock domain. The
+        // module clock of that direction must run, or the self-clearing bit never
+        // clears.
+        let rx_clk_guard = req_rx.then(|| I2sDirClkGuard::request_rx(clock));
+        let tx_clk_guard = req_tx.then(|| I2sDirClkGuard::request_tx(clock));
+
+        if req_tx {
+            i2s.info().update_tx();
+        }
+        if req_rx {
+            i2s.info().update_rx();
         }
 
         Ok(Self {
@@ -1307,6 +1500,9 @@ impl<'d> I2s<'d, Blocking> {
                 i2s: unsafe { i2s.clone_unchecked() },
                 rx_channel: channel.rx,
                 guard: rx_guard,
+                clk_guard: rx_clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                mclk_out_guard: None,
                 #[cfg(i2s_version = "1")]
                 data_format: match config {
                     Config::Tdm(c) => c.data_format,
@@ -1318,6 +1514,9 @@ impl<'d> I2s<'d, Blocking> {
                 i2s,
                 tx_channel: channel.tx,
                 guard: tx_guard,
+                clk_guard: tx_clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                mclk_out_guard: None,
                 #[cfg(i2s_version = "1")]
                 data_format: match config {
                     Config::Tdm(c) => c.data_format,
@@ -1335,6 +1534,9 @@ impl<'d> I2s<'d, Blocking> {
                 i2s: self.i2s_rx.i2s,
                 rx_channel: self.i2s_rx.rx_channel.into_async(),
                 guard: self.i2s_rx.guard,
+                clk_guard: self.i2s_rx.clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                mclk_out_guard: self.i2s_rx.mclk_out_guard,
                 #[cfg(i2s_version = "1")]
                 data_format: self.i2s_rx.data_format,
             },
@@ -1342,6 +1544,9 @@ impl<'d> I2s<'d, Blocking> {
                 i2s: self.i2s_tx.i2s,
                 tx_channel: self.i2s_tx.tx_channel.into_async(),
                 guard: self.i2s_tx.guard,
+                clk_guard: self.i2s_tx.clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                mclk_out_guard: self.i2s_tx.mclk_out_guard,
                 #[cfg(i2s_version = "1")]
                 data_format: self.i2s_tx.data_format,
             },
@@ -1397,6 +1602,21 @@ where
 
         self.i2s_tx.i2s.info().mclk.connect_to(&mclk);
 
+        self.request_mclk_out()
+    }
+
+    /// Requests the MCLK pad output, on the chips that gate it as a separate clock.
+    #[cfg(all(not(esp32), i2s_version = "1"))]
+    fn request_mclk_out(self) -> Self {
+        self
+    }
+
+    /// Requests the MCLK pad output, on the chips that gate it as a separate clock.
+    #[cfg(all(not(esp32), not(i2s_version = "1")))]
+    fn request_mclk_out(mut self) -> Self {
+        let guard = I2sMclkOutGuard::request(self.i2s_tx.i2s.info().clock_instance);
+        self.i2s_tx.mclk_out_guard = Some(guard.clone());
+        self.i2s_rx.mclk_out_guard = Some(guard);
         self
     }
 
@@ -1442,7 +1662,7 @@ where
     }
 }
 
-/// I2S TX channel
+/// I2S TX channel.
 pub struct I2sTx<'d, Dm>
 where
     Dm: DriverMode,
@@ -1450,6 +1670,9 @@ where
     i2s: AnyI2s<'d>,
     tx_channel: ChannelTx<Dm, <I2sMasterErased<'d> as DmaChannel>::Tx>,
     _guard: PeripheralGuard,
+    _clk_guard: Option<I2sDirClkGuard>,
+    #[cfg(not(i2s_version = "1"))]
+    _mclk_out_guard: Option<I2sMclkOutGuard>,
     #[cfg(i2s_version = "1")]
     data_format: DataFormat,
 }
@@ -1467,7 +1690,7 @@ impl<'d, Dm> I2sTx<'d, Dm>
 where
     Dm: DriverMode,
 {
-    /// Perform a DMA write.
+    /// Performs a DMA write.
     #[allow(clippy::type_complexity)]
     #[instability::unstable]
     pub fn write<TX: DmaTxBuffer>(
@@ -1493,7 +1716,7 @@ where
         })
     }
 
-    /// Change the I2S Tx unit configuration.
+    /// Changes the I2S Tx unit configuration.
     pub fn apply_config(&mut self, tx_config: &UnitConfig) -> Result<(), ConfigError> {
         tx_config.validate()?;
         self.i2s.info().configure_tx(
@@ -1504,7 +1727,7 @@ where
     }
 }
 
-/// I2S RX channel
+/// I2S RX channel.
 pub struct I2sRx<'d, Dm>
 where
     Dm: DriverMode,
@@ -1512,6 +1735,9 @@ where
     i2s: AnyI2s<'d>,
     rx_channel: ChannelRx<Dm, <I2sMasterErased<'d> as DmaChannel>::Rx>,
     _guard: PeripheralGuard,
+    _clk_guard: Option<I2sDirClkGuard>,
+    #[cfg(not(i2s_version = "1"))]
+    _mclk_out_guard: Option<I2sMclkOutGuard>,
     #[cfg(i2s_version = "1")]
     data_format: DataFormat,
 }
@@ -1529,12 +1755,12 @@ impl<'d, Dm> I2sRx<'d, Dm>
 where
     Dm: DriverMode,
 {
-    /// Perform a DMA read.
+    /// Performs a DMA read.
     ///
     /// The number of read bytes might be less than the capacity of the provided buffer since the
     /// peripheral might not completely fill each descriptor's buffer.
     ///
-    /// This will return a [I2sRxDmaTransfer]
+    /// Returns an [`I2sRxDmaTransfer`].
     pub fn read<BUF>(
         mut self,
         mut buffer: BUF,
@@ -1564,7 +1790,7 @@ where
         })
     }
 
-    /// Change the I2S Rx unit configuration.
+    /// Changes the I2S Rx unit configuration.
     pub fn apply_config(&mut self, rx_config: &UnitConfig) -> Result<(), ConfigError> {
         rx_config.validate()?;
         self.i2s.info().configure_rx(
@@ -1607,6 +1833,7 @@ for_each_i2s! {
                     pdm_rx: $pdm_rx,
                     pcm2pdm: $pcm2pdm,
                     pdm2pcm: $pdm2pcm,
+                    clock_instance: crate::clock::ll::I2sInstance::$sys,
                 };
                 &INFO
             }
@@ -1648,6 +1875,95 @@ impl AnyI2s<'_> {
     }
 }
 
+/// Keeps the module clock of one direction enabled.
+///
+/// Both directions share a single module clock on `i2s_version = "1"`, and the clock tree counts
+/// the requests, so a guard per direction is correct on every chip.
+pub(crate) struct I2sDirClkGuard {
+    clock: crate::clock::ll::I2sInstance,
+    #[cfg(not(i2s_version = "1"))]
+    tx: bool,
+}
+
+impl I2sDirClkGuard {
+    pub(crate) fn request_tx(clock: crate::clock::ll::I2sInstance) -> Self {
+        Self::request(clock, true)
+    }
+
+    fn request_rx(clock: crate::clock::ll::I2sInstance) -> Self {
+        Self::request(clock, false)
+    }
+
+    fn request(clock: crate::clock::ll::I2sInstance, tx: bool) -> Self {
+        crate::clock::ll::ClockTree::with(|clocks| {
+            cfg_select! {
+                i2s_version = "1" => {
+                    let _ = tx;
+                    clock.request_mclk(clocks);
+                }
+                _ => {
+                    if tx {
+                        clock.request_tx_clk(clocks);
+                    } else {
+                        clock.request_rx_clk(clocks);
+                    }
+                }
+            }
+        });
+
+        Self {
+            clock,
+            #[cfg(not(i2s_version = "1"))]
+            tx,
+        }
+    }
+}
+
+impl Drop for I2sDirClkGuard {
+    fn drop(&mut self) {
+        crate::clock::ll::ClockTree::with(|clocks| {
+            cfg_select! {
+                i2s_version = "1" => self.clock.release_mclk(clocks),
+                _ => {
+                    if self.tx {
+                        self.clock.release_tx_clk(clocks);
+                    } else {
+                        self.clock.release_rx_clk(clocks);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Keeps the MCLK pad output enabled.
+#[cfg(not(i2s_version = "1"))]
+pub(crate) struct I2sMclkOutGuard {
+    clock: crate::clock::ll::I2sInstance,
+}
+
+#[cfg(not(i2s_version = "1"))]
+impl I2sMclkOutGuard {
+    fn request(clock: crate::clock::ll::I2sInstance) -> Self {
+        crate::clock::ll::ClockTree::with(|clocks| clock.request_mclk_out(clocks));
+        Self { clock }
+    }
+}
+
+#[cfg(not(i2s_version = "1"))]
+impl Clone for I2sMclkOutGuard {
+    fn clone(&self) -> Self {
+        Self::request(self.clock)
+    }
+}
+
+#[cfg(not(i2s_version = "1"))]
+impl Drop for I2sMclkOutGuard {
+    fn drop(&mut self) {
+        crate::clock::ll::ClockTree::with(|clocks| self.clock.release_mclk_out(clocks));
+    }
+}
+
 pub(crate) mod private {
     use super::*;
 
@@ -1658,6 +1974,9 @@ pub(crate) mod private {
         pub i2s: AnyI2s<'d>,
         pub tx_channel: ChannelTx<Dm, <I2sMasterErased<'d> as DmaChannel>::Tx>,
         pub(crate) guard: PeripheralGuard,
+        pub(crate) clk_guard: Option<I2sDirClkGuard>,
+        #[cfg(not(i2s_version = "1"))]
+        pub(crate) mclk_out_guard: Option<I2sMclkOutGuard>,
         #[cfg(i2s_version = "1")]
         pub(crate) data_format: DataFormat,
     }
@@ -1672,6 +1991,9 @@ pub(crate) mod private {
                 i2s: self.i2s,
                 tx_channel: self.tx_channel,
                 _guard: PeripheralGuard::new(peripheral),
+                _clk_guard: self.clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                _mclk_out_guard: self.mclk_out_guard,
                 #[cfg(i2s_version = "1")]
                 data_format: self.data_format,
             }
@@ -1710,12 +2032,12 @@ pub(crate) mod private {
             self
         }
 
-        /// Connect the PDM clock pin (maps to the WS output signal).
+        /// Connects the PDM clock pin (maps to the WS output signal).
         pub fn with_clk(self, clk: impl PeripheralOutput<'d>) -> Self {
             self.with_ws(clk)
         }
 
-        /// Connect a second PDM TX data line (line 1, two-line DAC mode, HW v2+).
+        /// Connects a second PDM TX data line (line 1, two-line DAC mode, HW v2+).
         #[cfg(all(i2s_supports_pdm_tx, not(i2s_version = "1")))]
         pub fn with_dout2(self, dout: impl PeripheralOutput<'d>) -> Result<Self, ConfigError> {
             let dout = dout.into();
@@ -1737,6 +2059,9 @@ pub(crate) mod private {
         pub i2s: AnyI2s<'d>,
         pub rx_channel: ChannelRx<Dm, <I2sMasterErased<'d> as DmaChannel>::Rx>,
         pub(crate) guard: PeripheralGuard,
+        pub(crate) clk_guard: Option<I2sDirClkGuard>,
+        #[cfg(not(i2s_version = "1"))]
+        pub(crate) mclk_out_guard: Option<I2sMclkOutGuard>,
         #[cfg(i2s_version = "1")]
         pub(crate) data_format: DataFormat,
     }
@@ -1751,6 +2076,9 @@ pub(crate) mod private {
                 i2s: self.i2s,
                 rx_channel: self.rx_channel,
                 _guard: PeripheralGuard::new(peripheral),
+                _clk_guard: self.clk_guard,
+                #[cfg(not(i2s_version = "1"))]
+                _mclk_out_guard: self.mclk_out_guard,
                 #[cfg(i2s_version = "1")]
                 data_format: self.data_format,
             }
@@ -1789,12 +2117,12 @@ pub(crate) mod private {
             self
         }
 
-        /// Connect the PDM clock pin (maps to the WS output signal).
+        /// Connects the PDM clock pin (maps to the WS output signal).
         pub fn with_clk(self, clk: impl PeripheralOutput<'d>) -> Self {
             self.with_ws(clk)
         }
 
-        /// Connect a PDM RX data line (`line` 0..=`pdm_max_rx_lines`-1).
+        /// Connects a PDM RX data line (`line` 0..=`pdm_max_rx_lines`-1).
         #[cfg(i2s_supports_pdm_rx)]
         pub fn with_din_line(
             self,
@@ -1813,6 +2141,10 @@ pub(crate) mod private {
         }
     }
 
+    /// The divider from the module clock source to MCLK and BCLK.
+    ///
+    /// MCLK is `sclk / (mclk_divider + numerator / denominator)`, and BCLK is
+    /// `MCLK / bclk_divider`.
     pub struct I2sClockDividers {
         pub(crate) mclk_divider: u32,
         pub(crate) bclk_divider: u32,
@@ -1821,30 +2153,35 @@ pub(crate) mod private {
     }
 
     impl I2sClockDividers {
-        pub fn new(sample_rate: Rate, channels: u8, data_bits: u8) -> I2sClockDividers {
+        pub fn new(
+            sample_rate: Rate,
+            channels: u8,
+            data_bits: u8,
+            source: I2sClockSource,
+        ) -> I2sClockDividers {
             // this loosely corresponds to `i2s_std_calculate_clock` and
             // `i2s_ll_tx_set_mclk` in esp-idf
 
             // If data_bits is a power of two, use 256 as the mclk_multiple
             // If data_bits is 24, use 192 (24 * 8) as the mclk_multiple
             let mclk_multiple = if data_bits == 24 { 192 } else { 256 };
-            let sclk = crate::soc::i2s_sclk_frequency();
 
             let rate = sample_rate.as_hz();
 
             let bclk = rate * channels as u32 * data_bits as u32;
             let mclk = rate * mclk_multiple;
 
-            I2sClockDividers::from_frequencies(sclk, mclk, mclk / bclk)
+            I2sClockDividers::from_frequencies(source_frequency(source), mclk, mclk / bclk)
         }
 
         pub(crate) fn from_frequencies(sclk: u32, mclk: u32, bclk_divider: u32) -> Self {
-            let divider = FractionalDivider::new(sclk, mclk, I2S_LL_MCLK_DIVIDER_MAX as u32);
+            let divider = FractionalDivider::new(sclk, mclk, super::mclk_max_denominator());
 
             I2sClockDividers {
                 mclk_divider: divider.integer,
                 bclk_divider,
-                denominator: divider.denominator,
+                // An integer divider is described as `0 / 1`, not as `0 / 0`.
+                denominator: divider.denominator.max(1),
                 numerator: divider.numerator,
             }
         }

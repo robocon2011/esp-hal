@@ -21,15 +21,15 @@ pub struct SemverCheckArgs {
     pub command: SemverCheckCmd,
 
     /// Package(s) to target.
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = vec![Package::EspHal, Package::EspRomSys, Package::EspRadio])]
+    #[arg(long, alias = "package", value_enum, value_delimiter = ',', default_values_t = vec![Package::EspHal, Package::EspRomSys, Package::EspRadio])]
     pub packages: Vec<Package>,
 
     /// Default packages that are not supposed to run, used in CI.
     #[arg(long, value_enum, value_delimiter = ' ')]
     pub exclude_packages: Vec<Package>,
 
-    /// Chip(s) to target.
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = Chip::iter())]
+    /// Chip(s) to target. Omitted means every chip.
+    #[arg(long, alias = "chip", value_enum, value_delimiter = ',', default_values_t = Chip::iter())]
     pub chips: Vec<Chip>,
 }
 
@@ -76,7 +76,7 @@ pub mod checker {
     use crate::{
         Package,
         metadata::Chip,
-        semver_check::{build_doc_json, minimum_update},
+        semver_check::{baseline_stem, build_prepared_doc_json, minimum_update},
     };
 
     /// Generate the API baselines for the specified packages and chips.
@@ -97,21 +97,13 @@ pub mod checker {
                 let package_name = package.to_string();
                 let package_path = crate::windows_safe_path(&workspace.join(&package_name));
 
-                package.prepare_semver_check(&package_path, chip)?;
+                let current_path =
+                    build_prepared_doc_json(workspace, package, chip, &package_path)?;
 
-                let current_path = build_doc_json(package, chip, &package_path)?;
-
-                let dest_path = workspace.join("esp-rom-sys/src/generated_rom_symbols.rs");
-                package.clean_semver_check(&dest_path)?;
-
-                let file_name = if package.chip_features_matter() {
-                    chip.to_string()
-                } else {
-                    "api".to_string()
-                };
-
-                let to_path = PathBuf::from(&package_path)
-                    .join(format!("api-baseline/{}.json.gz", file_name));
+                let to_path = PathBuf::from(&package_path).join(format!(
+                    "api-baseline/{}.json.gz",
+                    baseline_stem(package, *chip)
+                ));
                 fs::create_dir_all(to_path.parent().unwrap())?;
 
                 log::debug!("Compress into {current_path:?}");

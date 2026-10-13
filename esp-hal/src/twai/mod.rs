@@ -235,12 +235,12 @@ impl embedded_can::Error for ErrorKind {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TwaiMode {
-    /// Normal operating mode
+    /// Normal operating mode.
     Normal,
     /// Self-test mode (no acknowledgement required for a successful message
-    /// transmission)
+    /// transmission).
     SelfTest,
-    /// Listen only operating mode
+    /// Listens only operating mode.
     ListenOnly,
 }
 
@@ -258,7 +258,7 @@ impl StandardId {
 
     /// Tries to create a `StandardId` from a raw 16-bit integer.
     ///
-    /// This will return `None` if `raw` is out of range of an 11-bit integer
+    /// Returns `None` if `raw` is out of range of an 11-bit integer.
     /// (`> 0x7FF`).
     #[inline]
     pub fn new(raw: u16) -> Option<Self> {
@@ -314,7 +314,7 @@ impl ExtendedId {
 
     /// Tries to create a `ExtendedId` from a raw 32-bit integer.
     ///
-    /// This will return `None` if `raw` is out of range of an 29-bit integer
+    /// Returns `None` if `raw` is out of range of an 29-bit integer.
     /// (`> 0x1FFF_FFFF`).
     #[inline]
     pub fn new(raw: u32) -> Option<Self> {
@@ -459,7 +459,7 @@ impl EspTwaiFrame {
     /// Frame Format (FF): specifies whether content is Extended Frame Format (EFF) or Standard
     /// Frame Format (SFF).
     ///
-    /// This method is private: interested clients should deduce the frame format from
+    /// Private: interested clients should deduce the frame format from
     /// [`Self::id()`].
     #[inline(always)]
     fn is_extended_format(&self) -> bool {
@@ -469,7 +469,7 @@ impl EspTwaiFrame {
     /// Remote Transmission Request (RTR): specifies whether content is a data frame or a remote
     /// request frame (on-demand polling).
     ///
-    /// Note: Remote request frames do not have a data payload, no matter their DLC.
+    /// Remote request frames do not have a data payload, no matter their DLC.
     pub fn is_remote_request(&self) -> bool {
         self.info() & (0b1 << 6) != 0
     }
@@ -483,7 +483,7 @@ impl EspTwaiFrame {
     /// Data Length Code (DLC): specifies the number of data bytes for a data frame, or the number
     /// of data bytes requested by a remote frame.
     ///
-    /// Note: although no frame can have a payload longer than 8, the DLC can be greater than 8 in
+    /// Although no frame can have a payload longer than 8, the DLC can be greater than 8 in
     /// rare cases (payload length then is still 8).
     pub fn data_length_code(&self) -> usize {
         (self.info() & 0b1111) as usize
@@ -559,7 +559,7 @@ impl EspTwaiFrame {
         &self.bytes[0..len]
     }
 
-    /// Make a new [`EspTwaiFrame`] from TWAI_DATA_x_REG registers.
+    /// Creates a new [`EspTwaiFrame`] from TWAI_DATA_x_REG registers.
     pub(super) fn new_from_registers(register_block: &RegisterBlock) -> Self {
         let mut bytes: [u8; 13] = [0; 13];
         // SAFETY: Safe because it is a constant-size, read-only access to the 13 data registers
@@ -569,7 +569,7 @@ impl EspTwaiFrame {
         Self { bytes }
     }
 
-    /// Make a new [`EspTwaiFrame`] from parameters.
+    /// Creates a new [`EspTwaiFrame`] from parameters.
     fn new_from_parameters(
         id: impl Into<Id>,
         remote_request: bool,
@@ -625,18 +625,18 @@ impl EspTwaiFrame {
         Ok(Self { bytes })
     }
 
-    /// Create a new `EspTwaiFrame` with the specified ID and data payload.
+    /// Creates a new `EspTwaiFrame` with the specified ID and data payload.
     pub fn new(id: impl Into<Id>, data: &[u8]) -> Option<Self> {
         Self::new_from_parameters(id.into(), false, false, data.len(), data).ok()
     }
 
-    /// Create a new `EspTwaiFrame` for a transmission request with the
+    /// Creates a new `EspTwaiFrame` for a transmission request with the
     /// specified ID and data length (DLC).
     pub fn new_remote(id: impl Into<Id>, dlc: usize) -> Option<Self> {
         Self::new_from_parameters(id.into(), true, false, dlc, &[]).ok()
     }
 
-    /// Create a new `EspTwaiFrame` ready for self-reception with the specified
+    /// Creates a new `EspTwaiFrame` ready for self-reception with the specified
     /// ID and data payload.
     pub fn new_self_reception(id: impl Into<Id>, data: &[u8]) -> Option<Self> {
         Self::new_from_parameters(id.into(), false, true, data.len(), data).ok()
@@ -706,7 +706,7 @@ pub struct TimingConfig {
 
 /// A selection of pre-determined baudrates for the TWAI driver.
 /// Currently these timings are sourced from the ESP IDF C driver which assumes
-/// an APB clock of 80MHz.
+/// an APB clock of 80 MHz.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BaudRate {
@@ -718,15 +718,14 @@ pub enum BaudRate {
     B500K,
     /// A baud rate of 1 Mbps.
     B1000K,
-    /// A custom baud rate defined by the user.
+    /// A custom baud rate.
     ///
-    /// This variant allows users to specify their own timing configuration
-    /// using a `TimingConfig` struct.
+    /// Specifies a custom timing configuration using a `TimingConfig` struct.
     Custom(TimingConfig),
 }
 
 impl BaudRate {
-    /// Convert the BaudRate into the timings that the peripheral needs.
+    /// Converts the BaudRate into the timings that the peripheral needs.
     // See: https://github.com/espressif/esp-idf/tree/ab4200e/components/esp_hal_twai/include/hal/twai_types.h
     const fn timing(self) -> TimingConfig {
         #[cfg(not(esp32h2))]
@@ -909,9 +908,9 @@ where
         crate::interrupt::bind_handler(self.twai.interrupt(), handler);
     }
 
-    /// Set the bitrate of the bus.
+    /// Sets the bitrate of the bus.
     ///
-    /// Note: The timings currently assume a APB_CLK of 80MHz.
+    /// The timings currently assume an APB_CLK of 80 MHz.
     fn set_baud_rate(&mut self, baud_rate: BaudRate) {
         // TWAI is clocked from the APB_CLK according to Table 6-4 [ESP32C3 Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-c3_technical_reference_manual_en.pdf)
         // Included timings are all for 80MHz so assert that we are running at 80MHz.
@@ -970,15 +969,15 @@ where
             .modify(|_, w| w.clock_off().set_bit());
     }
 
-    /// Set up the acceptance filter on the device.
+    /// Sets up the acceptance filter on the device.
     ///
-    /// NOTE: On a bus with mixed 11-bit and 29-bit packet id's, you may
-    /// experience an 11-bit filter match against a 29-bit frame and vice
-    /// versa. Your application should check the id again once a frame has
-    /// been received to make sure it is the expected value.
+    /// NOTE: On a bus with mixed 11-bit and 29-bit packet id's, an 11-bit filter
+    /// match against a 29-bit frame and vice versa may occur. Applications should
+    /// verify the id again once a frame has been received to make sure it is the
+    /// expected value.
     ///
-    /// You may use a `const {}` block to ensure that the filter is parsed
-    /// during program compilation.
+    /// A `const {}` block can ensure that the filter is parsed during program
+    /// compilation.
     ///
     /// The filter is not applied to the peripheral until [`Self::start`] is
     /// called.
@@ -1006,7 +1005,7 @@ where
         }
     }
 
-    /// Set the error warning threshold.
+    /// Sets the error warning threshold.
     ///
     /// In the case when any of an error counter value exceeds the threshold, or
     /// all the error counter values are below the threshold, an error
@@ -1018,7 +1017,7 @@ where
             .write(|w| unsafe { w.err_warning_limit().bits(limit) });
     }
 
-    /// Set the operating mode based on provided option
+    /// Sets the operating mode based on provided option.
     fn set_mode(&self, mode: TwaiMode) {
         self.regs().mode().modify(|_, w| {
             // self-test mode turns off acknowledgement requirement
@@ -1027,7 +1026,7 @@ where
         });
     }
 
-    /// Put the peripheral into Operation Mode, allowing the transmission and
+    /// Puts the peripheral into Operation Mode, allowing the transmission and
     /// reception of packets using the new object.
     pub fn start(self) -> Twai<'d, Dm> {
         self.apply_filter();
@@ -1056,6 +1055,8 @@ where
         // Clear any interrupts by reading the status register
         let _ = self.regs().int_raw().read();
 
+        self.twai.async_state().counts.reset();
+
         // Put the peripheral into operation mode by clearing the reset mode bit.
         self.regs().mode().modify(|_, w| w.reset_mode().clear_bit());
 
@@ -1077,9 +1078,9 @@ where
 }
 
 impl<'d> TwaiConfiguration<'d, Blocking> {
-    /// Create a new instance of [TwaiConfiguration]
+    /// Creates a new instance of [TwaiConfiguration].
     ///
-    /// You will need to use a transceiver to connect to the TWAI bus
+    /// A transceiver is required to connect to the TWAI bus.
     pub fn new(
         peripheral: impl Instance + 'd,
         rx_pin: impl PeripheralInput<'d>,
@@ -1090,11 +1091,11 @@ impl<'d> TwaiConfiguration<'d, Blocking> {
         Self::new_internal(peripheral.degrade(), rx_pin, tx_pin, baud_rate, false, mode)
     }
 
-    /// Create a new instance of [TwaiConfiguration] meant to connect two ESP32s
-    /// directly
+    /// Creates a new instance of [`TwaiConfiguration`] meant to connect two ESP32s
+    /// directly.
     ///
-    /// You don't need a transceiver by following the description in the
-    /// `twai.rs` example
+    /// A transceiver is not required when following the description in the
+    /// `twai.rs` example.
     pub fn new_no_transceiver(
         peripheral: impl Instance + 'd,
         rx_pin: impl PeripheralInput<'d>,
@@ -1105,7 +1106,7 @@ impl<'d> TwaiConfiguration<'d, Blocking> {
         Self::new_internal(peripheral.degrade(), rx_pin, tx_pin, baud_rate, true, mode)
     }
 
-    /// Convert the configuration into an async configuration.
+    /// Converts the configuration into an async configuration.
     pub fn into_async(mut self) -> TwaiConfiguration<'d, Async> {
         self.set_interrupt_handler(self.twai.async_handler());
         TwaiConfiguration {
@@ -1119,8 +1120,7 @@ impl<'d> TwaiConfiguration<'d, Blocking> {
 
     /// Registers an interrupt handler for the TWAI peripheral.
     ///
-    /// Note that this will replace any previously registered interrupt
-    /// handlers.
+    /// Replaces any previously registered interrupt handlers.
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: crate::interrupt::InterruptHandler) {
         self.internal_set_interrupt_handler(handler);
@@ -1128,7 +1128,7 @@ impl<'d> TwaiConfiguration<'d, Blocking> {
 }
 
 impl<'d> TwaiConfiguration<'d, Async> {
-    /// Convert the configuration into a blocking configuration.
+    /// Converts the configuration into a blocking configuration.
     pub fn into_blocking(self) -> TwaiConfiguration<'d, Blocking> {
         use crate::{interrupt, system::Cpu};
 
@@ -1185,7 +1185,7 @@ where
         }
     }
 
-    /// Stop the peripheral, putting it into reset mode and enabling
+    /// Stops the peripheral, putting it into reset mode and enabling
     /// reconfiguration.
     pub fn stop(self) -> TwaiConfiguration<'d, Dm> {
         // Put the peripheral into reset/configuration mode by setting the reset mode
@@ -1214,7 +1214,14 @@ where
         self.regs().tx_err_cnt().read().tx_err_cnt().bits()
     }
 
-    /// Check if the controller is in a bus off state.
+    /// What the controller has reported since the driver was started (see
+    /// [`ErrorCounts`])
+    #[instability::unstable]
+    pub fn error_counts(&self) -> ErrorCounts {
+        self.twai.async_state().counts.snapshot()
+    }
+
+    /// Returns whether the controller is in a bus off state.
     pub fn is_bus_off(&self) -> bool {
         self.regs().status().read().bus_off_st().bit_is_set()
     }
@@ -1237,11 +1244,11 @@ where
         }
     }
 
-    /// Get the number of messages that the peripheral has available in the
+    /// Returns the number of messages that the peripheral has available in the
     /// receive FIFO.
     ///
-    /// Note that this may not be the number of valid messages in the receive
-    /// FIFO due to fifo overflow/overrun.
+    /// May not be the number of valid messages in the receive FIFO due to fifo
+    /// overflow or overrun.
     pub fn num_available_messages(&self) -> u8 {
         self.regs()
             .rx_message_cnt()
@@ -1250,7 +1257,7 @@ where
             .bits()
     }
 
-    /// Clear the receive FIFO, discarding any valid, partial, or invalid
+    /// Clears the receive FIFO, discarding any valid, partial, or invalid
     /// packets.
     ///
     /// This is typically used to clear an overrun receive FIFO.
@@ -1295,12 +1302,12 @@ where
         self.twai.register_block()
     }
 
-    /// Transmit a frame.
+    /// Transmits a frame.
     ///
-    /// Because of how the TWAI registers are set up, we have to do some
-    /// assembly of bytes. Note that these registers serve a filter
-    /// configuration role when the device is in configuration mode so
-    /// patching the svd files to improve this may be non-trivial.
+    /// Because of how the TWAI registers are set up, bytes must be assembled
+    /// manually. These registers serve a filter configuration role when the
+    /// device is in configuration mode, so patching the SVD files to improve
+    /// this may be non-trivial.
     ///
     /// [ESP32C3 Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-c3_technical_reference_manual_en.pdf#subsubsection.29.4.4.2)
     ///
@@ -1354,7 +1361,14 @@ where
         self.twai.register_block()
     }
 
-    /// Receive a frame
+    /// What the controller has reported since the driver was started (see
+    /// [`ErrorCounts`])
+    #[instability::unstable]
+    pub fn error_counts(&self) -> ErrorCounts {
+        self.twai.async_state().counts.snapshot()
+    }
+
+    /// Receives a frame.
     pub fn receive(&mut self) -> nb::Result<EspTwaiFrame, EspTwaiError> {
         let status = self.regs().status().read();
 
@@ -1370,6 +1384,10 @@ where
 
         // Check if the packet in the receive buffer is valid or overrun.
         if status.miss_st().bit_is_set() {
+            // The FIFO entry is what is left of an overrun, not a frame:
+            // release it, or every later call would report it again. The
+            // async interrupt handler does the same.
+            release_receive_fifo(self.regs());
             return nb::Result::Err(nb::Error::Other(EspTwaiError::EmbeddedHAL(
                 ErrorKind::Overrun,
             )));
@@ -1403,9 +1421,37 @@ pub enum TwaiInterrupt {
     ErrorWarning,
 }
 
-/// Represents errors that can occur in the TWAI driver.
-/// This enum defines the possible errors that can be encountered when
-/// interacting with the TWAI peripheral.
+/// What the controller has reported since the driver was last started
+/// ([`TwaiConfiguration::start`]), as counted by the async driver's interrupt
+/// handler (a blocking driver counts nothing).
+///
+/// Bus errors are classified from the error code capture register as
+/// ESP-IDF does: bit, form and stuff errors by type, an acknowledgement
+/// error by the ACK slot segment, anything else as `other`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+#[instability::unstable]
+pub struct ErrorCounts {
+    /// Bit errors
+    pub bit: u32,
+    /// Form errors
+    pub form: u32,
+    /// Stuff errors
+    pub stuff: u32,
+    /// Acknowledgement errors: nobody acknowledged a transmitted frame
+    pub acknowledge: u32,
+    /// Other bus errors
+    pub other: u32,
+    /// Arbitration lost while transmitting (the controller retries)
+    pub arbitration_lost: u32,
+    /// Frames lost in the controller: its receive FIFO overran
+    pub overrun: u32,
+    /// Frames lost because the driver's receive queue was full
+    pub queue_full: u32,
+}
+
+/// Errors that can occur when interacting with the TWAI peripheral.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum EspTwaiError {
@@ -1434,14 +1480,14 @@ impl embedded_can::Error for EspTwaiError {
     }
 }
 
-/// Copy data from multiple TWAI_DATA_x_REG registers, packing the source into
+/// Copies data from multiple TWAI_DATA_x_REG registers, packing the source into
 /// the destination.
 ///
 /// # Safety
-/// This function is marked unsafe because it reads arbitrarily from
-/// memory-mapped registers. Specifically, this function is used with the
-/// TWAI_DATA_x_REG registers which has different results based on the mode of
-/// the peripheral.
+///
+/// Reads arbitrarily from memory-mapped registers. Specifically, this function
+/// is used with the TWAI_DATA_x_REG registers, which have different results
+/// based on the mode of the peripheral.
 #[inline(always)]
 unsafe fn copy_from_data_register(dest: &mut [u8], src: *const u32) {
     for (i, dest) in dest.iter_mut().enumerate() {
@@ -1452,14 +1498,14 @@ unsafe fn copy_from_data_register(dest: &mut [u8], src: *const u32) {
     }
 }
 
-/// Copy data to multiple TWAI_DATA_x_REG registers, unpacking the source into
+/// Copies data to multiple TWAI_DATA_x_REG registers, unpacking the source into
 /// the destination.
 ///
 /// # Safety
-/// This function is marked unsafe because it writes arbitrarily to
-/// memory-mapped registers. Specifically, this function is used with the
-/// TWAI_DATA_x_REG registers which has different results based on the mode of
-/// the peripheral.
+///
+/// Writes arbitrarily to memory-mapped registers. Specifically, this function
+/// is used with the TWAI_DATA_x_REG registers, which have different results
+/// based on the mode of the peripheral.
 #[inline(always)]
 unsafe fn copy_to_data_register(dest: *mut u32, src: &[u8]) {
     for (i, src) in src.iter().enumerate() {
@@ -1478,7 +1524,7 @@ where
     type Frame = EspTwaiFrame;
     type Error = EspTwaiError;
 
-    /// Transmit a frame.
+    /// Transmits a frame.
     fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
         self.tx.transmit(frame)?;
 
@@ -1488,7 +1534,7 @@ where
         nb::Result::Ok(None)
     }
 
-    /// Return a received frame if there are any available.
+    /// Returns the next received frame, or a would-block error when none is available.
     fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
         self.rx.receive()
     }
@@ -1513,7 +1559,7 @@ pub trait PrivateInstance: crate::private::Sealed {
     /// Returns a reference to the register block for TWAI instance.
     fn register_block(&self) -> &RegisterBlock;
 
-    /// Enables/disables interrupts for the TWAI peripheral based on the `enable` flag.
+    /// Enables or disables interrupts for the TWAI peripheral based on the `enable` flag.
     fn enable_interrupts(&self, interrupts: EnumSet<TwaiInterrupt>, enable: bool) {
         self.register_block().int_ena().modify(|_, w| {
             for interrupt in interrupts {
@@ -1530,12 +1576,12 @@ pub trait PrivateInstance: crate::private::Sealed {
         });
     }
 
-    /// Listen for given interrupts.
+    /// Listens for given interrupts.
     fn listen(&mut self, interrupts: impl Into<EnumSet<TwaiInterrupt>>) {
         self.enable_interrupts(interrupts.into(), true);
     }
 
-    /// Unlisten the given interrupts.
+    /// Unlistens from the given interrupts.
     fn unlisten(&mut self, interrupts: impl Into<EnumSet<TwaiInterrupt>>) {
         self.enable_interrupts(interrupts.into(), false);
     }
@@ -1543,21 +1589,21 @@ pub trait PrivateInstance: crate::private::Sealed {
     fn async_state(&self) -> &asynch::TwaiAsyncState;
 }
 
-/// Release the message in the buffer. This will decrement the received
+/// Releases the message in the buffer. This will decrement the received
 /// message counter and prepare the next message in the FIFO for
 /// reading.
 fn release_receive_fifo(register_block: &RegisterBlock) {
     register_block.cmd().write(|w| w.release_buf().set_bit());
 }
 
-/// Check if the peripheral is in the error-passive state, i.e. one of the
+/// Returns whether the peripheral is in the error-passive state, i.e. one of the
 /// error counters has reached 128.
 fn is_error_passive(register_block: &RegisterBlock) -> bool {
     register_block.tx_err_cnt().read().tx_err_cnt().bits() >= 128
         || register_block.rx_err_cnt().read().rx_err_cnt().bits() >= 128
 }
 
-/// Write a frame to the peripheral.
+/// Writes a frame to the peripheral.
 fn write_frame(register_block: &RegisterBlock, frame: &EspTwaiFrame) {
     // SAFETY: safe because there are 13 data registers and the slice is 13 bytes long max
     unsafe {
@@ -1699,6 +1745,8 @@ mod asynch {
 
     use embassy_sync::{channel::Channel, waitqueue::AtomicWaker};
     use esp_sync::RawMutex;
+    // `portable_atomic`: the ESP32-C3 has no atomic read-modify-write
+    use portable_atomic::{AtomicU32, Ordering};
 
     use super::*;
     use crate::rtc_cntl::WakeLock;
@@ -1707,6 +1755,83 @@ mod asynch {
         pub tx_waker: AtomicWaker,
         pub err_waker: AtomicWaker,
         pub rx_queue: Channel<RawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
+        pub counts: Counts,
+    }
+
+    /// [`ErrorCounts`], kept by the interrupt handler
+    pub struct Counts {
+        bit: AtomicU32,
+        form: AtomicU32,
+        stuff: AtomicU32,
+        acknowledge: AtomicU32,
+        other: AtomicU32,
+        arbitration_lost: AtomicU32,
+        overrun: AtomicU32,
+        queue_full: AtomicU32,
+    }
+
+    /// ECC: the error type in bits 7-6, the segment in bits 4-0
+    const ECC_TYPE_OTHER: u8 = 3;
+    const ECC_SEGMENT_ACK_SLOT: u8 = 25;
+
+    impl Counts {
+        const fn new() -> Self {
+            Self {
+                bit: AtomicU32::new(0),
+                form: AtomicU32::new(0),
+                stuff: AtomicU32::new(0),
+                acknowledge: AtomicU32::new(0),
+                other: AtomicU32::new(0),
+                arbitration_lost: AtomicU32::new(0),
+                overrun: AtomicU32::new(0),
+                queue_full: AtomicU32::new(0),
+            }
+        }
+
+        fn count(counter: &AtomicU32) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// A bus error, from the error code capture register
+        fn bus_error(&self, ecc: u8) {
+            let counter = match ecc >> 6 {
+                0 => &self.bit,
+                1 => &self.form,
+                2 => &self.stuff,
+                ECC_TYPE_OTHER if ecc & 0x1F == ECC_SEGMENT_ACK_SLOT => &self.acknowledge,
+                _ => &self.other,
+            };
+            Self::count(counter);
+        }
+
+        pub fn reset(&self) {
+            for counter in [
+                &self.bit,
+                &self.form,
+                &self.stuff,
+                &self.acknowledge,
+                &self.other,
+                &self.arbitration_lost,
+                &self.overrun,
+                &self.queue_full,
+            ] {
+                counter.store(0, Ordering::Relaxed);
+            }
+        }
+
+        pub fn snapshot(&self) -> ErrorCounts {
+            let get = |c: &AtomicU32| c.load(Ordering::Relaxed);
+            ErrorCounts {
+                bit: get(&self.bit),
+                form: get(&self.form),
+                stuff: get(&self.stuff),
+                acknowledge: get(&self.acknowledge),
+                other: get(&self.other),
+                arbitration_lost: get(&self.arbitration_lost),
+                overrun: get(&self.overrun),
+                queue_full: get(&self.queue_full),
+            }
+        }
     }
 
     impl Default for TwaiAsyncState {
@@ -1721,6 +1846,7 @@ mod asynch {
                 tx_waker: AtomicWaker::new(),
                 err_waker: AtomicWaker::new(),
                 rx_queue: Channel::new(),
+                counts: Counts::new(),
             }
         }
     }
@@ -1868,8 +1994,31 @@ mod asynch {
 
     pub(super) fn handle_interrupt(register_block: &RegisterBlock, async_state: &TwaiAsyncState) {
         let int_raw = register_block.int_raw().read();
-        let int_ena_reg = register_block.int_ena();
-        let int_ena = int_ena_reg.read();
+
+        // Disable the interrupts that fired (except the receive interrupt)
+        // before waking anyone: a woken task on a higher priority executor
+        // runs as soon as it is woken, before this handler returns. A
+        // transmit future polled then enables the transmit interrupt for its
+        // next frame, and clearing the bits afterwards from a copy read
+        // before the wake would disable it again - the next frame's
+        // completion would wake nobody.
+        let int_ena = register_block.int_ena().read();
+        unsafe {
+            register_block
+                .int_ena()
+                .modify(|r, w| w.bits(r.bits() & (!int_raw.bits() | 1)));
+        }
+        // ... except the bus error and arbitration lost interrupts: they only
+        // feed `ErrorCounts`, and reading their capture registers below
+        // re-arms them. Masking them until the next future poll calls
+        // `listen` would drop every error in between. ESP-IDF keeps them
+        // enabled as well.
+        register_block.int_ena().modify(|_, w| {
+            w.bus_err_int_ena()
+                .bit(int_ena.bus_err_int_ena().bit())
+                .arb_lost_int_ena()
+                .bit(int_ena.arb_lost_int_ena().bit())
+        });
 
         // The error warning interrupt fires on every change of the error or
         // bus status. Entering bus-off sets both the bus-off and the error
@@ -1906,6 +2055,7 @@ mod asynch {
                 let msg = if status_reg.read().miss_st().bit_is_set() {
                     // Current frame is incomplete (Rx FIFO has overrun)
                     release_receive_fifo(register_block);
+                    Counts::count(&async_state.counts.overrun);
                     Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun))
                 } else {
                     // Current frame is complete
@@ -1913,8 +2063,10 @@ mod asynch {
                     release_receive_fifo(register_block);
                     Ok(frame)
                 };
-                // Rx queue is full? Stop consuming Rx frames
+                // Rx queue is full? Stop consuming Rx frames. The one just
+                // taken was released already: it is lost, and counted.
                 if rx_queue.try_send(msg).is_err() {
+                    Counts::count(&async_state.counts.queue_full);
                     break;
                 }
             }
@@ -1924,24 +2076,35 @@ mod asynch {
             async_state.tx_waker.wake();
         }
 
+        if int_raw.arb_lost_int_st().bit_is_set() {
+            // Reading the capture register re-arms the interrupt; nothing
+            // else did, so it fired once per driver lifetime
+            let _ = register_block.arb_lost_cap().read();
+            Counts::count(&async_state.counts.arbitration_lost);
+        }
+
         if int_raw.err_warn_int_st().bit_is_set()
             || int_raw.err_passive_int_st().bit_is_set()
             || int_raw.bus_err_int_st().bit_is_set()
         {
-            // We might want to use the error code to gather statistics in the
-            // future.
-            let _ = register_block.err_code_cap().read();
+            // Reading the capture register also re-arms the bus error
+            // interrupt. The error that takes the controller bus-off raises
+            // no bus error interrupt of its own (ESP-IDF counts it from the
+            // error warning interrupt), so it is counted here too.
+            let ecc = register_block.err_code_cap().read().bits() as u8;
+            let status = register_block.status().read();
+            let entered_bus_off = int_raw.err_warn_int_st().bit_is_set()
+                && status.bus_off_st().bit_is_set()
+                && status.err_st().bit_is_set();
+            if int_raw.bus_err_int_st().bit_is_set() || entered_bus_off {
+                async_state.counts.bus_error(ecc);
+            }
             async_state.err_waker.wake();
             // A frame that cannot be transmitted never raises the transmit
             // interrupt, so wake transmitters on errors to let them
             // re-evaluate their pending frame and give up once the peripheral
             // reaches the error-passive or bus-off state.
             async_state.tx_waker.wake();
-        }
-
-        // Clear interrupt request bits
-        unsafe {
-            int_ena_reg.modify(|_, w| w.bits(int_ena.bits() & (!int_raw.bits() | 1)));
         }
     }
 }

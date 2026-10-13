@@ -29,13 +29,13 @@ pub const RTC_CNTL_DBIAS_1V25: u8 = 7;
 pub const RTC_CNTL_XTL_BUF_WAIT_SLP_US: u32 = 1000;
 /// Cycles to wait for PLL buffer stabilization.
 pub const RTC_CNTL_PLL_BUF_WAIT_SLP_CYCLES: u8 = 1;
-/// Cycles to wait for the 8MHz clock to stabilize.
+/// Cycles to wait for the 8 MHz clock to stabilize.
 pub const RTC_CNTL_CK8M_WAIT_SLP_CYCLES: u8 = 4;
 /// Delay in cycles for wakeup signal to be applied.
 pub const RTC_CNTL_WAKEUP_DELAY_CYCLES: u8 = 7;
 /// Power-up cycles for other blocks.
 pub const RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES: u8 = 1;
-/// Wait cycles for other blocks.
+/// Waits cycles for other blocks.
 pub const RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES: u16 = 1;
 /// Minimum sleep value (in cycles).
 pub const RTC_CNTL_MIN_SLP_VAL_MIN: u8 = 128;
@@ -44,28 +44,28 @@ pub const RTC_CNTL_DBG_ATTEN_DEFAULT: u8 = 3;
 
 /// Power-up cycles for RTC memory.
 pub const RTC_MEM_POWERUP_CYCLES: u8 = RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES;
-/// Wait cycles for RTC memory.
+/// Waits cycles for RTC memory.
 pub const RTC_MEM_WAIT_CYCLES: u16 = RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES;
 /// Power-up cycles for ROM and RAM.
 pub const ROM_RAM_POWERUP_CYCLES: u8 = RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES;
-/// Wait cycles for ROM and RAM.
+/// Waits cycles for ROM and RAM.
 pub const ROM_RAM_WAIT_CYCLES: u16 = RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES;
 /// Power-up cycles for Wi-Fi.
 pub const WIFI_POWERUP_CYCLES: u8 = RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES;
-/// Wait cycles for Wi-Fi.
+/// Waits cycles for Wi-Fi.
 pub const WIFI_WAIT_CYCLES: u16 = RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES;
 /// Power-up cycles for RTC components.
 pub const RTC_POWERUP_CYCLES: u8 = RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES;
-/// Wait cycles for RTC components.
+/// Waits cycles for RTC components.
 pub const RTC_WAIT_CYCLES: u16 = RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES;
 /// Power-up cycles for the digital wrap components.
 pub const DG_WRAP_POWERUP_CYCLES: u8 = RTC_CNTL_OTHER_BLOCKS_POWERUP_CYCLES;
-/// Wait cycles for the digital wrap components.
+/// Waits cycles for the digital wrap components.
 pub const DG_WRAP_WAIT_CYCLES: u16 = RTC_CNTL_OTHER_BLOCKS_WAIT_CYCLES;
 
-/// Default wait cycles for the 8MHz clock.
+/// Default wait cycles for the 8 MHz clock.
 pub const RTC_CNTL_CK8M_WAIT_DEFAULT: u8 = 20;
-/// Default wait cycles to enable the 8MHz clock.
+/// Default wait cycles to enable the 8 MHz clock.
 pub const RTC_CK8M_ENABLE_WAIT_DEFAULT: u8 = 5;
 
 bitfield::bitfield! {
@@ -87,7 +87,7 @@ bitfield::bitfield! {
     pub rtc_peri_pd_en, set_rtc_peri_pd_en: 5;
     /// power down WiFi
     pub wifi_pd_en, set_wifi_pd_en: 6;
-    /// Power down Internal 8M oscillator
+    /// Powers down Internal 8M oscillator.
     pub int_8m_pd_en, set_int_8m_pd_en: 7;
     /// power down main RAM and ROM
     pub rom_mem_pd_en, set_rom_mem_pd_en: 8;
@@ -160,90 +160,54 @@ impl RtcSleepConfig {
         let rtc_cntl = LPWR::regs();
 
         rtc_cntl.options0().modify(|_, w| {
-            w.bias_core_force_pu()
-                .clear_bit()
-                .bias_core_folw_8m()
-                .set_bit()
-                .bias_i2c_force_pu()
-                .clear_bit()
-                .bias_i2c_folw_8m()
-                .set_bit()
-                .bias_force_nosleep()
-                .clear_bit()
-                .bias_sleep_folw_8m()
-                .set_bit()
-                .xtl_force_pu()
-                .clear_bit()
+            w.bias_core_force_pu().clear_bit();
+            w.bias_core_folw_8m().set_bit();
+            w.bias_i2c_force_pu().clear_bit();
+            w.bias_i2c_folw_8m().set_bit();
+            w.bias_force_nosleep().clear_bit();
+            w.bias_sleep_folw_8m().set_bit();
+            w.xtl_force_pu().clear_bit()
         });
 
         rtc_cntl.reg().modify(|_, w| {
-            w.force_pu()
-                .clear_bit()
-                .dboost_force_pu()
-                .clear_bit()
-                .dboost_force_pd()
-                .set_bit()
+            w.force_pu().clear_bit();
+            w.dboost_force_pu().clear_bit();
+            w.dboost_force_pd().set_bit()
         });
 
         rtc_cntl.pwc().modify(|_, w| {
-            w.slowmem_force_pu()
-                .clear_bit()
-                .fastmem_force_pu()
-                .clear_bit()
-                .force_noiso()
-                .clear_bit()
-                .slowmem_force_noiso()
-                .clear_bit()
-                .fastmem_force_noiso()
-                .clear_bit()
+            w.slowmem_force_pu().clear_bit();
+            w.fastmem_force_pu().clear_bit();
+            w.force_noiso().clear_bit();
+            w.slowmem_force_noiso().clear_bit();
+            w.fastmem_force_noiso().clear_bit()
         });
 
         rtc_cntl.dig_pwc().modify(|_, w| {
-            w.dg_wrap_force_pu()
-                .clear_bit()
-                .wifi_force_pu()
-                .clear_bit()
-                .wifi_force_pd()
-                .set_bit()
-                .inter_ram4_force_pu()
-                .clear_bit()
-                .inter_ram3_force_pu()
-                .clear_bit()
-                .inter_ram2_force_pu()
-                .clear_bit()
-                .inter_ram1_force_pu()
-                .clear_bit()
-                .inter_ram0_force_pu()
-                .clear_bit()
-                .rom0_force_pu()
-                .clear_bit()
-                .lslp_mem_force_pu()
-                .clear_bit()
+            w.dg_wrap_force_pu().clear_bit();
+            w.wifi_force_pu().clear_bit();
+            w.wifi_force_pd().set_bit();
+            w.inter_ram4_force_pu().clear_bit();
+            w.inter_ram3_force_pu().clear_bit();
+            w.inter_ram2_force_pu().clear_bit();
+            w.inter_ram1_force_pu().clear_bit();
+            w.inter_ram0_force_pu().clear_bit();
+            w.rom0_force_pu().clear_bit();
+            w.lslp_mem_force_pu().clear_bit()
         });
 
         rtc_cntl.dig_iso().modify(|_, w| {
-            w.dg_wrap_force_noiso()
-                .clear_bit()
-                .wifi_force_noiso()
-                .clear_bit()
-                .wifi_force_iso()
-                .set_bit()
-                .inter_ram4_force_noiso()
-                .clear_bit()
-                .inter_ram3_force_noiso()
-                .clear_bit()
-                .inter_ram2_force_noiso()
-                .clear_bit()
-                .inter_ram1_force_noiso()
-                .clear_bit()
-                .inter_ram0_force_noiso()
-                .clear_bit()
-                .rom0_force_noiso()
-                .clear_bit()
-                .dg_pad_force_unhold()
-                .clear_bit()
-                .dg_pad_force_noiso()
-                .clear_bit()
+            w.dg_wrap_force_noiso().clear_bit();
+            w.wifi_force_noiso().clear_bit();
+            w.wifi_force_iso().set_bit();
+            w.inter_ram4_force_noiso().clear_bit();
+            w.inter_ram3_force_noiso().clear_bit();
+            w.inter_ram2_force_noiso().clear_bit();
+            w.inter_ram1_force_noiso().clear_bit();
+            w.inter_ram0_force_noiso().clear_bit();
+            w.rom0_force_noiso().clear_bit();
+            w.dg_pad_force_unhold().clear_bit();
+            w.dg_pad_force_noiso().clear_bit()
         });
 
         rtc_cntl.int_ena().modify(|_, w| w.brown_out().set_bit());
@@ -255,41 +219,28 @@ impl RtcSleepConfig {
             let rtc_cntl = LPWR::regs();
 
             rtc_cntl.timer5().modify(|_, w| {
-                w.min_slp_val()
-                    .bits(RTC_CNTL_MIN_SLP_VAL_MIN)
-                    // set rtc memory timer
-                    .rtcmem_powerup_timer()
-                    .bits(RTC_MEM_POWERUP_CYCLES)
-                    .rtcmem_wait_timer()
-                    .bits(RTC_MEM_WAIT_CYCLES)
+                w.min_slp_val().bits(RTC_CNTL_MIN_SLP_VAL_MIN);
+                // set rtc memory timer
+                w.rtcmem_powerup_timer().bits(RTC_MEM_POWERUP_CYCLES);
+                w.rtcmem_wait_timer().bits(RTC_MEM_WAIT_CYCLES)
             });
 
             rtc_cntl.timer3().modify(|_, w| {
-                w
-                    // set rom&ram timer
-                    .rom_ram_powerup_timer()
-                    .bits(ROM_RAM_POWERUP_CYCLES)
-                    .rom_ram_wait_timer()
-                    .bits(ROM_RAM_WAIT_CYCLES)
-                    // set wifi timer
-                    .wifi_powerup_timer()
-                    .bits(WIFI_POWERUP_CYCLES)
-                    .wifi_wait_timer()
-                    .bits(WIFI_WAIT_CYCLES)
+                // set rom&ram timer
+                w.rom_ram_powerup_timer().bits(ROM_RAM_POWERUP_CYCLES);
+                w.rom_ram_wait_timer().bits(ROM_RAM_WAIT_CYCLES);
+                // set wifi timer
+                w.wifi_powerup_timer().bits(WIFI_POWERUP_CYCLES);
+                w.wifi_wait_timer().bits(WIFI_WAIT_CYCLES)
             });
 
             rtc_cntl.timer4().modify(|_, w| {
-                w
-                    // set rtc peri timer
-                    .powerup_timer()
-                    .bits(RTC_POWERUP_CYCLES)
-                    .wait_timer()
-                    .bits(RTC_WAIT_CYCLES)
-                    // set digital wrap timer
-                    .dg_wrap_powerup_timer()
-                    .bits(DG_WRAP_POWERUP_CYCLES)
-                    .dg_wrap_wait_timer()
-                    .bits(DG_WRAP_WAIT_CYCLES)
+                // set rtc peri timer
+                w.powerup_timer().bits(RTC_POWERUP_CYCLES);
+                w.wait_timer().bits(RTC_WAIT_CYCLES);
+                // set digital wrap timer
+                w.dg_wrap_powerup_timer().bits(DG_WRAP_POWERUP_CYCLES);
+                w.dg_wrap_wait_timer().bits(DG_WRAP_WAIT_CYCLES)
             });
 
             rtc_cntl
@@ -303,10 +254,8 @@ impl RtcSleepConfig {
                     .modify(|_, w| w.lslp_mem_force_pu().clear_bit());
 
                 rtc_cntl.pwc().modify(|_, w| {
-                    w.slowmem_force_pu()
-                        .clear_bit()
-                        .fastmem_force_pu()
-                        .clear_bit()
+                    w.slowmem_force_pu().clear_bit();
+                    w.fastmem_force_pu().clear_bit()
                 });
 
                 // esp-idf also clears these:
@@ -324,12 +273,9 @@ impl RtcSleepConfig {
                     .modify(|_, w| w.fft_force_pu().clear_bit().dc_est_force_pu().clear_bit());
 
                 NRX::regs().nrxpd_ctrl().modify(|_, w| {
-                    w.rx_rot_force_pu()
-                        .clear_bit()
-                        .vit_force_pu()
-                        .clear_bit()
-                        .demap_force_pu()
-                        .clear_bit()
+                    w.rx_rot_force_pu().clear_bit();
+                    w.vit_force_pu().clear_bit();
+                    w.demap_force_pu().clear_bit()
                 });
                 // (&*esp32::FE::ptr()).gen_ctrl.modify(|_, w| w
                 //     .iq_est_force_pu().clear_bit()
@@ -365,41 +311,28 @@ impl RtcSleepConfig {
 
             if self.deep_slp() {
                 rtc_cntl.dig_iso().modify(|_, w| {
-                    w.dg_wrap_force_noiso()
-                        .clear_bit()
-                        .wifi_force_noiso()
-                        .clear_bit()
-                        .dg_pad_force_iso()
-                        .clear_bit()
-                        .dg_pad_force_noiso()
-                        .clear_bit()
+                    w.dg_wrap_force_noiso().clear_bit();
+                    w.wifi_force_noiso().clear_bit();
+                    w.dg_pad_force_iso().clear_bit();
+                    w.dg_pad_force_noiso().clear_bit()
                 });
 
                 rtc_cntl.dig_pwc().modify(|_, w| {
-                    w.dg_wrap_pd_en()
-                        .set_bit()
-                        .dg_wrap_force_pu()
-                        .clear_bit()
-                        .dg_wrap_force_pd()
-                        .clear_bit()
+                    w.dg_wrap_pd_en().set_bit();
+                    w.dg_wrap_force_pu().clear_bit();
+                    w.dg_wrap_force_pd().clear_bit()
                 });
 
                 rtc_cntl.options0().modify(|_, w| {
-                    w.bias_force_nosleep()
-                        .clear_bit()
-                        .bb_i2c_force_pu()
-                        .clear_bit()
+                    w.bias_force_nosleep().clear_bit();
+                    w.bb_i2c_force_pu().clear_bit()
                 });
 
                 rtc_cntl.ana_conf().modify(|_, w| {
-                    w.ckgen_i2c_pu()
-                        .clear_bit()
-                        .pll_i2c_pu()
-                        .clear_bit()
-                        .rfrx_pbus_pu()
-                        .clear_bit()
-                        .txrf_i2c_pu()
-                        .clear_bit()
+                    w.ckgen_i2c_pu().clear_bit();
+                    w.pll_i2c_pu().clear_bit();
+                    w.rfrx_pbus_pu().clear_bit();
+                    w.txrf_i2c_pu().clear_bit()
                 });
             } else {
                 rtc_cntl
@@ -420,35 +353,27 @@ impl RtcSleepConfig {
             // enable VDDSDIO control by state machine
 
             rtc_cntl.sdio_conf().modify(|_, w| {
-                w.sdio_force()
-                    .clear_bit()
-                    .sdio_pd_en()
-                    .bit(self.vddsdio_pd_en())
+                w.sdio_force().clear_bit();
+                w.sdio_pd_en().bit(self.vddsdio_pd_en())
             });
 
             rtc_cntl.reg().modify(|_, w| {
-                w.dbias_slp()
-                    .bits(self.rtc_dbias_slp())
-                    .dbias_wak()
-                    .bits(self.rtc_dbias_wak())
-                    .dig_dbias_slp()
-                    .bits(self.dig_dbias_slp())
-                    .dig_dbias_wak()
-                    .bits(self.dig_dbias_wak())
+                w.dbias_slp().bits(self.rtc_dbias_slp());
+                w.dbias_wak().bits(self.rtc_dbias_wak());
+                w.dig_dbias_slp().bits(self.dig_dbias_slp());
+                w.dig_dbias_wak().bits(self.dig_dbias_wak())
             });
 
             rtc_cntl.slp_reject_conf().modify(|_, w| {
-                w.deep_slp_reject_en()
-                    .bit(self.deep_slp_reject())
-                    .light_slp_reject_en()
-                    .bit(self.light_slp_reject())
+                w.deep_slp_reject_en().bit(self.deep_slp_reject());
+                w.light_slp_reject_en().bit(self.light_slp_reject())
             });
         }
     }
 
-    /// Configures the wakeup options and requests the sleep.
+    /// Configures the wakeup and reject sources of the sleep.
     ///
-    /// The caller waits for the result of the request.
+    /// [`Self::enter_sleep`] requests the sleep after this call.
     pub(crate) fn start_sleep(&self, wakeup_mask: u32, reject_mask: u32) {
         LPWR::regs()
             .reset_state()
@@ -466,17 +391,22 @@ impl RtcSleepConfig {
             w.gpio_reject_en().bit(rejects.contains(WakeupSource::Gpio));
             w.sdio_reject_en().bit(rejects.contains(WakeupSource::Sdio))
         });
+    }
 
+    /// Requests the sleep.
+    ///
+    /// The caller waits for the result of the request.
+    #[inline(always)]
+    pub(crate) fn enter_sleep(&self) -> bool {
         LPWR::regs().state0().modify(|_, w| w.sleep_en().set_bit());
+        super::wait_for_sleep_result()
     }
 
     pub(crate) fn finish_sleep(&self) {
         // In deep sleep mode, we never get here
         LPWR::regs().int_clr().write(|w| {
-            w.slp_reject()
-                .clear_bit_by_one()
-                .slp_wakeup()
-                .clear_bit_by_one()
+            w.slp_reject().clear_bit_by_one();
+            w.slp_wakeup().clear_bit_by_one()
         });
 
         // restore DBG_ATTEN to the default value

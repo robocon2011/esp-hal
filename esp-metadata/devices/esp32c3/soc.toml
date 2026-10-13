@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-c3_t
 page_size = 0x10000
 entry_num = 128
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -53,7 +56,7 @@ peripherals = [
     { name = "HMAC" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
     { name = "INTERRUPT_CORE0" },
     { name = "IO_MUX" },
     { name = "LEDC" },
@@ -80,13 +83,15 @@ peripherals = [
     { name = "XTS_AES" },
 
     { name = "ADC1", virtual = true },
-    { name = "ADC2", virtual = true },
     { name = "BT", virtual = true, interrupts = { rwbt = "RWBT", rwble = "RWBLE", bb = "BT_BB" } },
     { name = "FLASH", virtual = true },
     { name = "GPIO_DEDICATED", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "TSENS", virtual = true },
     { name = "WIFI", virtual = true, interrupts = { mac = "WIFI_MAC", pwr = "WIFI_PWR" }, stable = true },
+    { name = "FROM_CPU_INTR0", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR1", virtual = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
@@ -94,9 +99,14 @@ peripherals = [
 
 [device.adc]
 support_status = "partial"
+# ADC2 is deliberately absent. Its digital controller is broken on this chip and the chip has no
+# RTC ADC controller to fall back on, so there is no way to read it reliably. ESP-IDF refuses to
+# create a one-shot unit for it unless `CONFIG_ADC_ONESHOT_FORCE_USE_ADC2_ON_C3` is set.
+#
+# See `SOC_ADC_DIG_SUPPORTED_UNIT` in `components/soc/esp32c3/include/soc/soc_caps.h`, and the
+# ESP32-C3 series SoC errata.
 instances = [
     { name = "adc1" },
-    { name = "adc2" },
 ]
 
 [device.aes]
@@ -168,7 +178,7 @@ bus_timeout_is_exponential = true
 has_pd_en = true
 
 [device.i2c_slave]
-support_status = "supported"
+support_status = "partial"
 instances = [
     { name = "i2c0" },
 ]
@@ -177,7 +187,9 @@ instances = [
 support_status = "partial"
 status_registers = 2
 software_interrupt_count = 4
-controller = { Riscv = { flavour = "basic", interrupts = 32, priority_levels = 15 } }
+controller = { Riscv = { flavour = "basic", interrupts = 32, priority_levels = 15, context_switch_interrupt = true } }
+# The CPU has no CLINT.
+context_switch_source = "from_cpu"
 
 [device.rmt]
 support_status = "partial"
@@ -239,6 +251,7 @@ instances = [
 support_status = "partial"
 instances = [{ name = "timg0" }, { name = "timg1" }]
 timg_has_divcnt_rst = true
+wdt_has_conf_update = true
 
 [device.uart]
 support_status = "supported"
@@ -282,6 +295,13 @@ wakeup_sources = {
     Bt = 10,
 }
 
+[device.sleep.retention]
+cpu_retention = "rtc_cntl"
+cpu_retention_mem_size = 1744
+cpu_retention_mem_align = 16
+cpu_retention_mem_start = 0x3FCC0000
+cpu_retention_mem_end = 0x3FCE0000
+
 # Other drivers which are partially supported but have no other configuration:
 
 ## Crypto
@@ -290,7 +310,6 @@ wakeup_sources = {
 ## Interfaces
 [device.i2s]
 version = 2
-default_clock_source = 2
 mclk_divider_bit_width = 9
 max_ws_width = 128
 instances = [
@@ -326,6 +345,7 @@ channel_count = 6
 [device.wifi]
 mac_version = 1
 csi_supported = true
+has_ftm = true
 
 [device.bt]
 support_status = "partial"

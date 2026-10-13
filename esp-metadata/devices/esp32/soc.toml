@@ -12,10 +12,14 @@ target = "xtensa-esp32-none-elf"
 cores  = 2
 datasheet = "https://www.espressif.com/sites/default/files/documentation/esp32_datasheet_en.pdf"
 trm    = "https://www.espressif.com/sites/default/files/documentation/esp32_technical_reference_manual_en.pdf"
+support_note = "Revisions below v3.0 are not supported."
 
 [device.mmu]
 page_size = 0x10000
 entry_num = 256
+
+[device.flash]
+support_status = "partial"
 
 [device.rom]
 has_crc_le  = true
@@ -39,10 +43,10 @@ peripherals = [
     { name = "DPORT" },
     { name = "SYSTEM", pac = "DPORT" },
     { name = "EFUSE", hidden = true },
-    { name = "ETH", virtual = true },
-    { name = "EMAC_DMA", hidden = true },
+    { name = "ETH", virtual = true, interrupts = { peri = "ETH_MAC" } },
+    { name = "EMAC_DMA", pac = "GMAC_DMA", hidden = true },
     { name = "EMAC_EXT", hidden = true },
-    { name = "EMAC_MAC", hidden = true },
+    { name = "EMAC_MAC", pac = "GMAC", hidden = true },
     { name = "FLASH_ENCRYPTION" },
     { name = "FRC_TIMER" },
     { name = "GPIO" },
@@ -50,15 +54,15 @@ peripherals = [
     { name = "HINF" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
     { name = "I2C1", interrupts = { peri = "I2C_EXT1" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
-    { name = "I2S1", interrupts = { peri = "I2S1" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
+    { name = "I2S1", interrupts = { peri = "I2S1" }, clock_group = "I2S" },
     { name = "IO_MUX" },
     { name = "LEDC" },
     { name = "MCPWM0", clock_group = "MCPWM" },
     { name = "MMU_TABLE", hidden = true },
     { name = "MCPWM1", clock_group = "MCPWM" },
     { name = "NRX" },
-    { name = "PCNT" },
+    { name = "PCNT", interrupts = { peri = "PCNT" } },
     { name = "RMT", clock_group = "RMT" },
     { name = "RNG" },
     { name = "RSA", interrupts = { peri = "RSA" } },
@@ -93,8 +97,12 @@ peripherals = [
     { name = "DAC2", virtual = true },
     { name = "FLASH", virtual = true },
     { name = "PSRAM", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "TOUCH", virtual = true },
+    { name = "IPC", virtual = true },
+    { name = "FROM_CPU_INTR0", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR1", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
@@ -184,6 +192,8 @@ support_status = "partial"
 status_registers = 3
 software_interrupt_count = 4
 controller = "Xtensa"
+# The Bluetooth controller uses `Software0`.
+context_switch_source = "ipc"
 
 [device.rmt]
 support_status = "partial"
@@ -270,11 +280,18 @@ support_status = "not_supported"
 
 [device.ethernet]
 support_status = "partial"
+rx_store_and_forward = true
+# Type-2 COE can mark valid frames as checksum errors (and CIC insertion
+# is also unreliable), so both directions stay in software.
+rx_checksum_offload = false
+tx_checksum_offload = false
+dma_burst_len = 32
 
 [device.camera]
 support_status = "not_supported"
 [device.rgb_display]
 support_status = "partial"
+output_lines = 24
 
 [device.rng]
 support_status = { status = "partial", issue = 5979 }
@@ -308,7 +325,6 @@ wakeup_sources = {
 ## Interfaces
 [device.i2s]
 version = 1
-default_clock_source = 2
 mclk_divider_bit_width = 6
 max_ws_width = 128
 instances = [
@@ -344,6 +360,22 @@ version = 1
 channel_count = 8
 [device.mcpwm]
 [device.pcnt]
+instances = {
+    PCNT = {
+        sys_instance = "Pcnt",
+        interrupt = "PCNT",
+        units = [
+            { sig_ch0 = "PCNT0_SIG_CH0", sig_ch1 = "PCNT0_SIG_CH1", ctrl_ch0 = "PCNT0_CTRL_CH0", ctrl_ch1 = "PCNT0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_SIG_CH0", sig_ch1 = "PCNT1_SIG_CH1", ctrl_ch0 = "PCNT1_CTRL_CH0", ctrl_ch1 = "PCNT1_CTRL_CH1" },
+            { sig_ch0 = "PCNT2_SIG_CH0", sig_ch1 = "PCNT2_SIG_CH1", ctrl_ch0 = "PCNT2_CTRL_CH0", ctrl_ch1 = "PCNT2_CTRL_CH1" },
+            { sig_ch0 = "PCNT3_SIG_CH0", sig_ch1 = "PCNT3_SIG_CH1", ctrl_ch0 = "PCNT3_CTRL_CH0", ctrl_ch1 = "PCNT3_CTRL_CH1" },
+            { sig_ch0 = "PCNT4_SIG_CH0", sig_ch1 = "PCNT4_SIG_CH1", ctrl_ch0 = "PCNT4_CTRL_CH0", ctrl_ch1 = "PCNT4_CTRL_CH1" },
+            { sig_ch0 = "PCNT5_SIG_CH0", sig_ch1 = "PCNT5_SIG_CH1", ctrl_ch0 = "PCNT5_CTRL_CH0", ctrl_ch1 = "PCNT5_CTRL_CH1" },
+            { sig_ch0 = "PCNT6_SIG_CH0", sig_ch1 = "PCNT6_SIG_CH1", ctrl_ch0 = "PCNT6_CTRL_CH0", ctrl_ch1 = "PCNT6_CTRL_CH1" },
+            { sig_ch0 = "PCNT7_SIG_CH0", sig_ch1 = "PCNT7_SIG_CH1", ctrl_ch0 = "PCNT7_CTRL_CH0", ctrl_ch1 = "PCNT7_CTRL_CH1" },
+        ],
+    },
+}
 
 [device.sdmmc]
 support_status = "partial"
@@ -388,6 +420,7 @@ support_status = { status = "not_supported", issue = 376 }
 [device.wifi]
 mac_version = 1
 csi_supported = true
+has_nan = true
 
 [device.bt]
 support_status = "partial"

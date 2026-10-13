@@ -9,8 +9,7 @@
 //!
 //! ## Setup
 //!
-//! This crate requires an `esp-hal` timer, as well as the `FROM_CPU0` software interrupt to
-//! operate, and needs to be started like so:
+//! This crate requires an `esp-hal` timer to operate, and needs to be started like so:
 //!
 //! ```rust, no_run
 #![doc = esp_hal::before_snippet!()]
@@ -28,9 +27,7 @@
 //! use esp_hal::timer::timg::TimerGroup;
 //! let timg0 = TimerGroup::new(peripherals.TIMG0);
 //!
-//! use esp_hal::interrupt::software::SoftwareInterruptControl;
-//! let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-//! esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
+//! esp_rtos::start(timg0.timer0);
 #![cfg_attr(
     multi_core,
     doc = "
@@ -41,7 +38,6 @@ use esp_hal::system::Stack;
 static STACK: ConstStaticCell<Stack<8192>> = ConstStaticCell::new(Stack::new());
 esp_rtos::start_second_core(
     peripherals.CPU_CTRL,
-    software_interrupt.software_interrupt1,
     STACK.take(),
     || {}, // Second core's main function.
 );
@@ -53,6 +49,11 @@ esp_rtos::start_second_core(
 #![doc = esp_hal::after_snippet!()]
 //! ```
 //! 
+//! ## Threads
+//!
+//! Use the [`thread`] module to run code on a separate stack. See its documentation for the
+//! details.
+//!
 //! To write `async` code, enable the `embassy` feature, and make the main function `async`.
 //! This will create a thread-mode executor on the main thread. Note that, to create async tasks, you will need
 //! the `task` macro from the `embassy-executor` crate. Do NOT enable any of the `arch-*` features on `embassy-executor`.
@@ -113,20 +114,17 @@ light sleep may cause unexpected behavior.
 # #[global_allocator]
 # static ALLOCATOR: FakeHeap = FakeHeap;
 
-use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::timer::timg::TimerGroup;
 
 # fn main() {
 let p = esp_hal::init(esp_hal::Config::default());
 
-let sw_int = SoftwareInterruptControl::new(p.SW_INTERRUPT);
 let timg0 = TimerGroup::new(p.TIMG0);
 
 let sleep = esp_rtos::sleep::configure(p.LPWR);
 
 esp_rtos::start_with_idle_hook(
     timg0.timer0,
-    sw_int.software_interrupt0,
     sleep.light_sleep_hook,
 );
 # }
@@ -161,9 +159,8 @@ mod scheduler;
 pub mod sleep;
 mod syscall;
 mod task;
+pub mod thread;
 mod timer;
-// TODO: these esp-radio gates will need to be cleaned up once we re-introduce IPC objects.
-#[cfg(feature = "esp-radio")]
 mod wait_queue;
 
 #[cfg(feature = "embassy")]
@@ -180,7 +177,6 @@ use esp_hal::timer::systimer::Alarm;
 use esp_hal::timer::timg::Timer;
 use esp_hal::{
     Blocking,
-    interrupt::software::SoftwareInterrupt,
     system::Cpu,
     time::Instant,
     timer::{AnyTimer, OneShotTimer, any::Degrade},
@@ -360,6 +356,7 @@ fn init_tracing() {
     }
 }
 
+#[track_caller]
 fn assert_thread_mode(function: &str) {
     assert!(
         esp_hal::interrupt::RunLevel::current().is_thread(),
@@ -376,8 +373,8 @@ fn assert_thread_mode(function: &str) {
 /// idle hook will wait for an interrupt.
 ///
 /// For information about the arguments, see [`start_with_idle_hook`].
-pub fn start(timer: impl TimerSource, int0: SoftwareInterrupt<'static, 0>) {
-    start_with_idle_hook(timer, int0, crate::task::idle_hook)
+pub fn start(timer: impl TimerSource) {
+    start_with_idle_hook(timer, crate::task::idle_hook)
 }
 
 /// Starts the scheduler, with a custom idle hook.
@@ -396,15 +393,8 @@ pub fn start(timer: impl TimerSource, int0: SoftwareInterrupt<'static, 0>) {
 /// - An `AnyTimer` instance
 /// - A `OneShotTimer` instance
 ///
-/// The `int0` argument must be `SoftwareInterrupt<0>` which will be used to trigger context
-/// switches.
-///
 /// For an example, see the [crate-level documentation][self].
-pub fn start_with_idle_hook(
-    timer: impl TimerSource,
-    int0: SoftwareInterrupt<'static, 0>,
-    idle_hook: IdleFn,
-) {
+pub fn start_with_idle_hook(timer: impl TimerSource, idle_hook: IdleFn) {
     init_tracing();
 
     trace!("Starting scheduler for the first core");
@@ -438,7 +428,7 @@ pub fn start_with_idle_hook(
             unsafe { (&raw const __stack_chk_guard).read_volatile() },
         );
 
-        task::setup_multitasking(int0);
+        task::setup_multitasking();
 
         // Set up the main task's context.
         task::yield_task();
@@ -458,11 +448,10 @@ pub fn start_with_idle_hook(
 #[cfg(multi_core)]
 pub fn start_second_core<const STACK_SIZE: usize>(
     cpu_control: CPU_CTRL,
-    int1: SoftwareInterrupt<'static, 1>,
     stack: &'static mut Stack<STACK_SIZE>,
     func: impl FnOnce() + Send + 'static,
 ) {
-    start_second_core_with_stack_guard_offset::<STACK_SIZE>(cpu_control, int1, stack, None, func);
+    start_second_core_with_stack_guard_offset::<STACK_SIZE>(cpu_control, stack, None, func);
 }
 
 /// The stack of the second core, in a form that can be moved into the second core's main function.
@@ -549,7 +538,6 @@ fn suspend_main_task() {
 #[cfg(multi_core)]
 pub fn start_second_core_with_stack_guard_offset<const STACK_SIZE: usize>(
     cpu_control: CPU_CTRL,
-    int1: SoftwareInterrupt<'static, 1>,
     stack: &'static mut Stack<STACK_SIZE>,
     stack_guard_offset: Option<usize>,
     func: impl FnOnce() + Send + 'static,
@@ -569,7 +557,7 @@ pub fn start_second_core_with_stack_guard_offset<const STACK_SIZE: usize>(
         .start_app_core_with_stack_guard_offset(stack, Some(stack_guard_offset), move || {
             trace!("Second core running");
             SCHEDULER.with(move |scheduler| {
-                task::setup_smp(int1);
+                task::setup_multitasking();
                 assert!(
                     scheduler.time_driver.is_some(),
                     "The scheduler must be started on the first core first."
@@ -635,7 +623,6 @@ pub fn start_second_core_with_stack_guard_offset<const STACK_SIZE: usize>(
 /// # #[global_allocator]
 /// # static ALLOCATOR: FakeHeap = FakeHeap;
 /// use esp_hal::{
-///     interrupt::software::SoftwareInterruptControl,
 ///     system::Stack,
 ///     timer::timg::TimerGroup,
 /// };
@@ -644,11 +631,9 @@ pub fn start_second_core_with_stack_guard_offset<const STACK_SIZE: usize>(
 /// static STACK: ConstStaticCell<Stack<8192>> = ConstStaticCell::new(Stack::new());
 ///
 /// let timg0 = TimerGroup::new(peripherals.TIMG0);
-/// let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 ///
 /// esp_rtos::start_on_second_core_only(
 ///     peripherals.CPU_CTRL,
-///     software_interrupt.software_interrupt1,
 ///     timg0.timer0,
 ///     STACK.take(),
 ///     || {
@@ -662,7 +647,6 @@ pub fn start_second_core_with_stack_guard_offset<const STACK_SIZE: usize>(
 #[cfg(multi_core)]
 pub fn start_on_second_core_only<const STACK_SIZE: usize>(
     cpu_control: CPU_CTRL<'static>,
-    int1: SoftwareInterrupt<'static, 1>,
     timer: impl TimerSource + Send,
     stack: &'static mut Stack<STACK_SIZE>,
     func: impl FnOnce() + Send + 'static,
@@ -686,7 +670,7 @@ pub fn start_on_second_core_only<const STACK_SIZE: usize>(
         .start_app_core_with_stack_guard_offset(stack, Some(stack_guard_offset), move || {
             trace!("Second core running");
             SCHEDULER.with(move |scheduler| {
-                task::setup_multitasking(int1);
+                task::setup_multitasking();
 
                 // The time driver must be created here, and not on the first core:
                 // `Timer::set_interrupt_handler` binds the timer interrupt to the core that calls

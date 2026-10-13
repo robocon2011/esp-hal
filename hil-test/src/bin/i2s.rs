@@ -51,6 +51,8 @@ macro_rules! i2s_instance_resources {
 
 #[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
 mod tests {
+    #[cfg(not(i2s_version = "1"))]
+    use esp_hal::i2s::master::Alignment;
     use esp_hal::{
         Async,
         delay::Delay,
@@ -246,10 +248,12 @@ mod tests {
 
         let mut samples = SampleSource::new();
         tx_buffer.push_with(|buf| {
-            for b in buf.iter_mut() {
+            // test everything still works if the buffer is not completely pre-filled
+            let fill_up_to = BUFFER_SIZE * 2 + 100;
+            for b in buf[..fill_up_to].iter_mut() {
                 *b = samples.next().unwrap();
             }
-            buf.len()
+            fill_up_to
         });
 
         let mut rcv = [0u8; 11000];
@@ -696,6 +700,125 @@ mod tests {
         }
     }
 
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn run_test_i2s0_loopback_data_formats(
+        tx_data_format: DataFormat,
+        rx_data_format: DataFormat,
+        tx_alignment: Alignment,
+        rx_alignment: Alignment,
+        mut expected: &[u8],
+    ) {
+        use core::cmp::min;
+
+        use esp_hal::i2s::master::{Endianness, TdmUnitConfig};
+
+        let (i2s, dma_channel, dout): (AnyI2s, AnyI2sDmaChannel, AnyPin) =
+            i2s_instance_resources!(I2S0);
+        let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
+
+        let rx_buffer = dma_rx_stream_buffer!(BUFFER_SIZE, 128);
+        let tx_buffer = dma_tx_stream_buffer!(BUFFER_SIZE, 128);
+
+        let i2s = I2s::new(
+            i2s,
+            dma_channel,
+            TdmConfig::default()
+                .with_signal_loopback(true)
+                .with_tx_config(
+                    TdmUnitConfig::new_tdm_philips()
+                        .with_sample_rate(Rate::from_hz(16000))
+                        .with_data_format(tx_data_format)
+                        // By using big-endian we maintain the byte ordering between the
+                        // representation in memory and in the i2s stream (the naming is very
+                        // confusing here). This simplifies the loopback test.
+                        .with_endianness(Endianness::BigEndian)
+                        // Ensures that all the data goes out to i2s stream unchanged
+                        .with_channels(Channels::STEREO)
+                        .with_alignment(tx_alignment),
+                )
+                .with_rx_config(
+                    TdmUnitConfig::new_tdm_philips()
+                        .with_sample_rate(Rate::from_hz(16000))
+                        .with_data_format(rx_data_format)
+                        // By using big-endian we maintain the byte ordering between the
+                        // representation in memory and in the i2s stream (the naming is very
+                        // confusing here). This simplifies the loopback test.
+                        .with_endianness(Endianness::BigEndian)
+                        // Ensures that all the data fron the i2s stream comes back in
+                        .with_channels(Channels::STEREO)
+                        .with_alignment(rx_alignment),
+                ),
+        )
+        .unwrap()
+        .into_async();
+
+        let (din, dout) = unsafe { dout.split() };
+
+        let i2s_tx = i2s
+            .i2s_tx
+            .with_bclk(NoPin)
+            .with_ws(NoPin)
+            .with_dout(dout)
+            .build();
+
+        let i2s_rx = i2s
+            .i2s_rx
+            .with_bclk(NoPin)
+            .with_ws(NoPin)
+            .with_din(din)
+            .build();
+
+        let mut rx_transfer = i2s_rx.read(rx_buffer).ok().unwrap();
+        spawner.spawn(writer(tx_buffer, i2s_tx).unwrap());
+
+        let mut buffer = [0u8; 8];
+        while !expected.is_empty() {
+            rx_transfer.wait_for_available_async().await.unwrap();
+            let len = min(buffer.len(), expected.len());
+            let n = rx_transfer.pop(&mut buffer[..len]);
+            assert_eq!(&buffer[..n], &expected[..n]);
+            expected = &expected[n..];
+        }
+    }
+
+    // For the tests where we change the tx data format we want to keep rx on Data8Channel8 so
+    // that we capture all the data
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn run_test_data_formats_tx(
+        data_format: DataFormat,
+        alignment: Alignment,
+        expected: &[u8],
+    ) {
+        use esp_hal::i2s::master::Alignment;
+
+        run_test_i2s0_loopback_data_formats(
+            data_format,
+            DataFormat::Data8Channel8,
+            alignment,
+            Alignment::Left,
+            expected,
+        )
+        .await;
+    }
+
+    // For the tests where we change the rx data format we want to keep tx on Data32Channel32 so
+    // that we know we're sending all the data
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn run_test_data_formats_rx(
+        data_format: DataFormat,
+        alignment: Alignment,
+        expected: &[u8],
+    ) {
+        run_test_i2s0_loopback_data_formats(
+            DataFormat::Data32Channel32,
+            data_format,
+            Alignment::Left,
+            alignment,
+            expected,
+        )
+        .await;
+    }
+
     #[test]
     #[cfg(soc_has_i2s0)]
     async fn test_i2s_loopback_async_i2s0() {
@@ -870,20 +993,293 @@ mod tests {
         let (i2s, dma_channel, _) = i2s_instance_resources!(I2S0);
         run_test_i2s_rx_half_sample_bits_regression(i2s, dma_channel);
     }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_32() {
+        run_test_data_formats_rx(
+            DataFormat::Data32Channel32,
+            Alignment::Left,
+            &[1, 6, 11, 16, 21, 26, 31, 36],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_32_24_left() {
+        run_test_data_formats_rx(
+            DataFormat::Data32Channel24,
+            Alignment::Left,
+            &[1, 6, 11, 21, 26, 31, 41, 46],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_32_16_left() {
+        run_test_data_formats_rx(
+            DataFormat::Data32Channel16,
+            Alignment::Left,
+            &[1, 6, 21, 26, 41, 46, 61, 66],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_32_16_right() {
+        run_test_data_formats_rx(
+            DataFormat::Data32Channel16,
+            Alignment::Right,
+            &[11, 16, 31, 36, 51, 56, 71, 76],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_32_8_left() {
+        run_test_data_formats_rx(
+            DataFormat::Data32Channel8,
+            Alignment::Left,
+            &[1, 21, 41, 61, 81, 101, 8, 28],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_16() {
+        run_test_data_formats_rx(
+            DataFormat::Data16Channel16,
+            Alignment::Left,
+            &[1, 6, 11, 16, 21, 26, 31, 36],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_16_8_left() {
+        run_test_data_formats_rx(
+            DataFormat::Data16Channel8,
+            Alignment::Left,
+            &[1, 11, 21, 31, 41, 51, 61, 71],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_rx_8() {
+        run_test_data_formats_rx(
+            DataFormat::Data8Channel8,
+            Alignment::Left,
+            &[1, 6, 11, 16, 21, 26, 31, 36],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_32_24_left() {
+        run_test_data_formats_tx(
+            DataFormat::Data32Channel24,
+            Alignment::Left,
+            &[1, 6, 11, 0, 16, 21, 26, 0],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_32_16_left() {
+        run_test_data_formats_tx(
+            DataFormat::Data32Channel16,
+            Alignment::Left,
+            &[1, 6, 0, 0, 11, 16, 0, 0],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_32_16_right() {
+        use esp_hal::i2s::master::Alignment;
+
+        run_test_data_formats_tx(
+            DataFormat::Data32Channel16,
+            Alignment::Right,
+            &[0, 0, 1, 6, 0, 0, 11, 16],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_32_8_left() {
+        run_test_data_formats_tx(
+            DataFormat::Data32Channel8,
+            Alignment::Left,
+            &[1, 0, 0, 0, 6, 0, 0, 0],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_16() {
+        run_test_data_formats_tx(
+            DataFormat::Data16Channel16,
+            Alignment::Left,
+            &[1, 6, 11, 16, 21, 26, 31, 36],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_16_8_left() {
+        run_test_data_formats_tx(
+            DataFormat::Data16Channel8,
+            Alignment::Left,
+            &[1, 0, 6, 0, 11, 0, 16, 0],
+        )
+        .await;
+    }
+
+    #[test]
+    #[cfg(all(soc_has_i2s0, not(i2s_version = "1")))]
+    async fn test_tx_8() {
+        run_test_data_formats_tx(
+            DataFormat::Data8Channel8,
+            Alignment::Left,
+            &[1, 6, 11, 16, 21, 26, 31, 36],
+        )
+        .await;
+    }
 }
 
 #[cfg(esp32)]
 #[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
 mod i2s_parallel_tests {
+    use core::cell::RefCell;
+
+    use critical_section::Mutex as CsMutex;
     use esp_hal::{
+        Blocking,
         dma::I2sDmaChannel,
         gpio::NoPin,
         i2s::{
             AnyI2s,
-            parallel::{I2sParallel, TxSixteenBits},
+            parallel::{I2sParallel, I2sParallelInterrupt, I2sParallelTransfer, TxSixteenBits},
         },
+        interrupt::{InterruptHandler, Priority},
         time::Rate,
     };
+    use portable_atomic::{AtomicUsize, Ordering};
+
+    static ISR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    type BlockingTransfer = I2sParallelTransfer<'static, esp_hal::dma::DmaTxBuf, Blocking>;
+
+    // The ongoing transfer, so the ISR can query and clear interrupt flags
+    // through it (the driver itself is consumed by `send`).
+    static TRANSFER: CsMutex<RefCell<Option<BlockingTransfer>>> = CsMutex::new(RefCell::new(None));
+
+    extern "C" fn i2s_parallel_isr() {
+        critical_section::with(|cs| {
+            if let Some(xfer) = TRANSFER.borrow_ref(cs).as_ref() {
+                let active = xfer.interrupts();
+                xfer.clear_interrupts(active);
+            }
+        });
+        ISR_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn poll_until(mut condition: impl FnMut() -> bool, message: &str) {
+        let delay = esp_hal::delay::Delay::new();
+        for _ in 0..1000 {
+            if condition() {
+                return;
+            }
+            delay.delay_millis(1);
+        }
+        panic!("{}", message);
+    }
+
+    fn run_i2s_parallel_interrupt(i2s: AnyI2s<'static>, dma_channel: I2sDmaChannel<'static>) {
+        ISR_COUNT.store(0, Ordering::Relaxed);
+        critical_section::with(|cs| TRANSFER.replace(cs, None));
+
+        let pins = TxSixteenBits::new(
+            NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin,
+            NoPin, NoPin, NoPin, NoPin,
+        );
+        let mut i2s = I2sParallel::new(i2s, dma_channel, Rate::from_mhz(20), pins, NoPin);
+        i2s.set_interrupt_handler(InterruptHandler::new(i2s_parallel_isr, Priority::Priority1));
+
+        let mut tx_buf = esp_hal::dma_tx_buffer!(4096).unwrap();
+        tx_buf.fill(&[0x55; 512]);
+
+        // Publish the transfer so the ISR can use it, then listen.
+        // The transfer may complete before we listen; the flags still assert,
+        // so the ISR still fires.
+        let xfer = i2s
+            .send(tx_buf)
+            .map_err(|_| "failed to send buffer")
+            .unwrap();
+        critical_section::with(|cs| TRANSFER.replace(cs, Some(xfer)));
+        critical_section::with(|cs| {
+            if let Some(xfer) = TRANSFER.borrow_ref(cs).as_ref() {
+                xfer.listen(I2sParallelInterrupt::TotalEof | I2sParallelInterrupt::Done);
+            }
+        });
+
+        // Wait for the transfer to complete and the ISR to fire.
+        poll_until(
+            || {
+                critical_section::with(|cs| {
+                    TRANSFER
+                        .borrow_ref(cs)
+                        .as_ref()
+                        .is_some_and(|xfer| xfer.is_done())
+                }) && ISR_COUNT.load(Ordering::Relaxed) > 0
+            },
+            "transfer did not complete or ISR did not fire",
+        );
+        assert!(
+            ISR_COUNT.load(Ordering::Relaxed) > 0,
+            "ISR should have fired at least once"
+        );
+
+        let xfer = critical_section::with(|cs| TRANSFER.take(cs)).unwrap();
+        let (_i2s, _tx_buf) = xfer.wait();
+    }
+
+    #[test]
+    #[cfg(soc_has_i2s0)]
+    fn i2s_parallel_interrupt_i2s0() {
+        let peripherals = esp_hal::init(
+            esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+        );
+        let i2s = peripherals.I2S0.into();
+        let dma_channel: I2sDmaChannel<'static> = peripherals.DMA_I2S0.into();
+        run_i2s_parallel_interrupt(i2s, dma_channel);
+    }
+
+    #[test]
+    #[cfg(soc_has_i2s1)]
+    fn i2s_parallel_interrupt_i2s1() {
+        let peripherals = esp_hal::init(
+            esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+        );
+        let i2s = peripherals.I2S1.into();
+        let dma_channel: I2sDmaChannel<'static> = peripherals.DMA_I2S1.into();
+        run_i2s_parallel_interrupt(i2s, dma_channel);
+    }
 
     async fn run_driver_does_not_hang_when_async(
         i2s: AnyI2s<'static>,
@@ -994,7 +1390,8 @@ mod pdm_tx_tests {
         let tx_cfg = if info.pcm2pdm {
             PdmTxConfig::new_codec_default(Rate::from_hz(16_000), PdmSlotMode::Mono)
         } else {
-            PdmTxConfig::new_raw_default(Rate::from_hz(2_048_000), PdmSlotMode::Mono)
+            // 1.024 MHz: raw MCLK is sample_rate * 16; 2.048 MHz exceeds S31's 40 MHz XTAL.
+            PdmTxConfig::new_raw_default(Rate::from_hz(1_024_000), PdmSlotMode::Mono)
         };
         assert!(tx_cfg.validate(info).is_ok());
     }
@@ -1009,7 +1406,7 @@ mod pdm_tx_tests {
         let tx_cfg = if info.pcm2pdm {
             PdmTxConfig::new_codec_default(Rate::from_hz(16_000), PdmSlotMode::Mono)
         } else {
-            PdmTxConfig::new_raw_default(Rate::from_hz(2_048_000), PdmSlotMode::Mono)
+            PdmTxConfig::new_raw_default(Rate::from_hz(1_024_000), PdmSlotMode::Mono)
         };
         let pdm_cfg = PdmConfig::tx_only(tx_cfg);
 
@@ -1093,7 +1490,8 @@ mod pdm_rx_tests {
         let rx_cfg = if info.pdm2pcm {
             PdmRxConfig::new_pcm_default(Rate::from_hz(16_000), PdmSlotMode::Mono)
         } else {
-            PdmRxConfig::new_raw_default(Rate::from_hz(2_048_000), PdmSlotMode::Mono)
+            // 1.024 MHz: raw MCLK is sample_rate * 16; 2.048 MHz exceeds S31's 40 MHz XTAL.
+            PdmRxConfig::new_raw_default(Rate::from_hz(1_024_000), PdmSlotMode::Mono)
         };
         assert!(rx_cfg.validate(info).is_ok());
     }
@@ -1108,7 +1506,7 @@ mod pdm_rx_tests {
         let rx_cfg = if info.pdm2pcm {
             PdmRxConfig::new_pcm_default(Rate::from_hz(16_000), PdmSlotMode::Mono)
         } else {
-            PdmRxConfig::new_raw_default(Rate::from_hz(2_048_000), PdmSlotMode::Mono)
+            PdmRxConfig::new_raw_default(Rate::from_hz(1_024_000), PdmSlotMode::Mono)
         };
         let pdm_cfg = PdmConfig::rx_only(rx_cfg);
 
@@ -1173,7 +1571,7 @@ mod pdm_rx_tests {
 
 struct EdgeCounter<'a> {
     #[cfg(pcnt_driver_supported)]
-    unit: esp_hal::pcnt::unit::Unit<'a, 0>,
+    unit: esp_hal::pcnt::unit::Unit<'a>,
 
     phantom: core::marker::PhantomData<&'a ()>,
 }
@@ -1181,8 +1579,7 @@ struct EdgeCounter<'a> {
 #[cfg(pcnt_driver_supported)]
 impl<'a> EdgeCounter<'a> {
     fn new<'i>(input: impl esp_hal::gpio::interconnect::PeripheralInput<'i>) -> Self {
-        let pcnt = esp_hal::pcnt::Pcnt::new(unsafe { esp_hal::peripherals::PCNT::steal() });
-        let unit = pcnt.unit0;
+        let unit = esp_hal::pcnt::Unit::new(unsafe { esp_hal::peripherals::PCNT0_UNIT0::steal() });
         unit.channel0.set_edge_signal(input);
         unit.channel0.set_input_mode(
             esp_hal::pcnt::channel::EdgeMode::Hold,

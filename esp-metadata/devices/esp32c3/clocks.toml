@@ -2,11 +2,11 @@ system_clocks = { clock_tree = [
     # High-speed clock sources
     { name = "XTAL_CLK",    type = "source",  values = "40",                          output = "VALUE * 1_000_000", always_on = true },
     { name = "PLL_CLK",     type = "derived", from = "XTAL_CLK", values = "320, 480", output = "VALUE * 1_000_000" },
-    { name = "RC_FAST_CLK", type = "source",                                          output = "17_500_000" },
+    { name = "RC_FAST_CLK", type = "source",                                          output = "17_500_000", adjustable = "8_750_000..=26_250_000" },
 
     # Low-speed clocks
-    { name = "XTAL32K_CLK",     type = "source",  output = "32768" },
-    { name = "RC_SLOW_CLK",     type = "source",  output = "136_000" },
+    { name = "XTAL32K_CLK",     type = "source",  output = "32768", cfg = "use_xtal32k" },
+    { name = "RC_SLOW_CLK",     type = "source",  output = "136_000", adjustable = "68_000..=204_000" },
     { name = "RC_FAST_DIV_CLK", type = "generic", output = "RC_FAST_CLK / 256" },
 
     # CPU clock source dividers
@@ -43,9 +43,15 @@ system_clocks = { clock_tree = [
     { name = "RC_FAST_CLK_DIV_N", type = "generic", params = { divisor = "0 ..= 3" }, output = "RC_FAST_CLK / (divisor + 1)" },
     { name = "XTAL_DIV_CLK",      type = "generic", output = "XTAL_CLK / 2" },
     { name = "RTC_SLOW_CLK", type = "mux", variants = [
-        { name = "XTAL32K", outputs = "XTAL32K_CLK" },
+        { name = "XTAL32K", outputs = "XTAL32K_CLK", cfg = "use_xtal32k" },
         { name = "RC_SLOW", outputs = "RC_SLOW_CLK" },
         { name = "RC_FAST", outputs = "RC_FAST_DIV_CLK" },
+    ] },
+    # BLE modem-sleep clock. The BTDM blob programs the source and divider.
+    { name = "BLE_LP_XTAL_CLK", type = "derived", from = "XTAL_CLK", output = "1_000_000" },
+    { name = "BLE_LP_CLK", type = "mux", variants = [
+        { name = "XTAL",     outputs = "BLE_LP_XTAL_CLK" },
+        { name = "RTC_SLOW", outputs = "RTC_SLOW_CLK" },
     ] },
     { name = "RTC_FAST_CLK", type = "mux", variants = [
         { name = "XTAL", outputs = "XTAL_DIV_CLK" },
@@ -56,7 +62,7 @@ system_clocks = { clock_tree = [
     { name = "LOW_POWER_CLK", type = "mux", variants = [
         { name = "XTAL",     outputs = "XTAL_CLK" },
         { name = "RC_FAST",  outputs = "RC_FAST_CLK" },
-        { name = "XTAL32K",  outputs = "XTAL32K_CLK" },
+        { name = "XTAL32K",  outputs = "XTAL32K_CLK", cfg = "use_xtal32k" },
         { name = "RTC_SLOW", outputs = "RTC_SLOW_CLK" },
     ] },
 
@@ -70,7 +76,7 @@ system_clocks = { clock_tree = [
     { name = "TIMG_CALIBRATION_CLOCK", type = "mux", wake_locking = true, variants = [
         { name = "RC_SLOW_CLK",     outputs = "RC_SLOW_CLK" },
         { name = "RC_FAST_DIV_CLK", outputs = "RC_FAST_DIV_CLK" },
-        { name = "XTAL32K_CLK",     outputs = "XTAL32K_CLK" },
+        { name = "XTAL32K_CLK",     outputs = "XTAL32K_CLK", cfg = "use_xtal32k" },
     ] },
 ], template_groups = [
     { group = "TIMG", clocks = [
@@ -110,10 +116,36 @@ system_clocks = { clock_tree = [
     ] },
     { group = "SPI", clocks = [
         { name = "FUNCTION_CLOCK", type = "mux", wake_locking = true, variants = [
-            { name = "XTAL",    outputs = "XTAL_CLK", default = true },
-            { name = "PLL_80M", outputs = "PLL_80M" },
+            { name = "XTAL",    outputs = "XTAL_CLK" },
+            { name = "PLL_80M", outputs = "PLL_80M", default = true },
         ] },
     ] },
+    { group = "I2S",
+      presets = {
+        CLK = {
+          type = "generic",
+          wake_locking = true,
+          output = "(sclk * div_a) / (div_num * div_a + div_b)",
+          params = {
+            sclk = [
+              { name = "XTAL",     outputs = "XTAL_CLK" },
+              { name = "PLL_160M", outputs = "PLL_160M", default = true },
+            ],
+            div_num = "1 ..= 255",
+            div_a   = "1 ..= 511",
+            div_b   = "0 ..= 511",
+          },
+        },
+      },
+      clocks = [
+        { name = "TX_CLK",   preset = "CLK" },
+        { name = "RX_CLK",   preset = "CLK" },
+        { name = "MCLK_OUT", type = "mux", variants = [
+          { name = "TX", outputs = "TX_CLK" },
+          { name = "RX", outputs = "RX_CLK", default = true },
+        ] },
+      ],
+    },
 ] }
 
 peripheral_clocks = { templates = [

@@ -8,19 +8,13 @@
 crate::unstable_module! {
     pub mod clocks;
     pub mod trng;
+    // The light sleep path stalls the other core, and it is not gated on the feature.
+    pub mod cpu_control;
 }
-#[cfg(feature = "unstable")]
-pub mod cpu_control;
 pub mod gpio;
 pub(crate) mod regi2c;
 
 pub(crate) use esp32 as pac;
-
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_f160m_clk_frequency()
-}
 
 pub(crate) unsafe fn configure_cpu_caches() {}
 

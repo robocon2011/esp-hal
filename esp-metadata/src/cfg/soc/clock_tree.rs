@@ -32,7 +32,6 @@
 //       be simplified. (Probably the ones that only have one user, or those that are always on).
 // TODO: ClockConfig doc comment should be tailored to the specific chip
 // TODO: finalize public API
-// TODO: define clock IDs and maintain active clocks as a bitmap
 // TODO: classified clocks should be returned in a topological order
 // TODO: ClockConfig should configure clocks in topological order
 
@@ -65,6 +64,17 @@ mod generic;
 mod mux;
 mod source;
 
+/// Builds `#[cfg(...)]` from a metadata `cfg` property, or an empty token stream.
+pub(crate) fn rustc_cfg_attr(cfg: Option<&str>) -> TokenStream {
+    let Some(cfg) = cfg.filter(|cfg| !cfg.is_empty()) else {
+        return quote! {};
+    };
+    let cfg = TokenStream::from_str(cfg).unwrap_or_else(|err| {
+        panic!("Invalid clock-tree `cfg` expression `{cfg}`: {err}");
+    });
+    quote! { #[cfg(#cfg)] }
+}
+
 /// Returns the name of the config type generated for a node.
 ///
 /// `group` is the template group the node belongs to, or an empty string for standalone nodes.
@@ -88,6 +98,35 @@ pub(crate) struct Function {
     pub implementation: TokenStream,
 }
 
+/// One arm of a [`RootSource::Selector`].
+pub(crate) struct RootSourceArm {
+    /// The `#[cfg(...)]` of the selected option, if it has one.
+    pub cfg_attr: TokenStream,
+    /// The configuration value that selects this arm.
+    pub pattern: TokenStream,
+    /// The name of the node this arm selects.
+    pub upstream: String,
+}
+
+/// How a clock tree node reaches the clock source it runs on.
+pub(crate) enum RootSource {
+    /// The node is a clock source.
+    Itself,
+
+    /// The node always runs on the output of one other node.
+    PassThrough(String),
+
+    /// The node's configuration selects which other node it runs on.
+    Selector {
+        /// The value to match, with the node's configuration in scope as `config`.
+        subject: TokenStream,
+        arms: Vec<RootSourceArm>,
+    },
+
+    /// The node cannot answer.
+    Unknown,
+}
+
 pub(crate) enum SourceFrequencySignature {
     Skip,
     Parameterless(TokenStream),
@@ -100,6 +139,7 @@ pub(crate) enum SourceFrequencySignature {
 
 pub(crate) struct ClockNodeFunctions {
     pub impl_type: Option<Ident>,
+    pub cfg: Option<String>,
 
     pub request: Function,
     pub release: Function,
@@ -113,12 +153,24 @@ pub(crate) struct ClockNodeFunctions {
 
 impl ClockNodeFunctions {
     pub fn implement_functions(&self) -> TokenStream {
-        let request_impl = &self.request.implementation;
-        let release_impl = &self.release.implementation;
-        let apply_impl = &self.apply_config.implementation;
-        let current_config_impl = &self.current_config.implementation;
-        let frequency_impl = &self.frequency.implementation;
-        let source_frequency_impl = &self.source_frequency.implementation;
+        let cfg_attr = rustc_cfg_attr(self.cfg.as_deref());
+        let wrap = |implementation: &TokenStream| {
+            if implementation.is_empty() {
+                quote! {}
+            } else {
+                quote! {
+                    #cfg_attr
+                    #implementation
+                }
+            }
+        };
+
+        let apply_impl = wrap(&self.apply_config.implementation);
+        let current_config_impl = wrap(&self.current_config.implementation);
+        let request_impl = wrap(&self.request.implementation);
+        let release_impl = wrap(&self.release.implementation);
+        let frequency_impl = wrap(&self.frequency.implementation);
+        let source_frequency_impl = wrap(&self.source_frequency.implementation);
 
         quote! {
             #apply_impl
@@ -436,6 +488,12 @@ pub(crate) trait ClockTreeNodeType: Any {
         Bounds::UNKNOWN
     }
 
+    /// Returns the range (`min`, `max`) that the node's frequency can be adjusted to at runtime,
+    /// or `None` if the node is not adjustable.
+    fn adjustable_range(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Returns which clock nodes' configurations are affected when this node is configured.
     // TODO: pass instance to apply template naming scheme to returned clocks
     // (e.g. FUNCTION_CLOCK -> UART0_FUNCTION_CLOCK)
@@ -449,6 +507,19 @@ pub(crate) trait ClockTreeNodeType: Any {
         _tree: &ProcessedClockData,
     ) -> Vec<String> {
         vec![]
+    }
+
+    /// Returns how the node reaches the clock source it runs on.
+    ///
+    /// Sleep code needs this to keep a clock running through a sleep: it asks a node for the source
+    /// it currently runs on, and keeps that source powered. The default implementation has no
+    /// answer, which leaves the node without a getter.
+    fn root_source(
+        &self,
+        _instance: &ClockTreeNodeInstance,
+        _tree: &ProcessedClockData,
+    ) -> RootSource {
+        RootSource::Unknown
     }
 
     fn always_on(&self) -> bool {
@@ -553,8 +624,21 @@ pub(crate) trait ClockTreeNodeType: Any {
     ///
     /// `group` is the name of the template group the node belongs to, or an empty string for
     /// standalone nodes. It is needed to reconstruct the names of the generated config types.
-    fn property_macro_branches(&self, _path: &str, _group: &str) -> TokenStream {
+    ///
+    /// `config_type_stem` is the clock name used in the generated config type (`PARL_IO` + `CLK` →
+    /// `ParlIoClkConfig`). For a preset instantiation this is the preset name, not the node name.
+    fn property_macro_branches(
+        &self,
+        _path: &str,
+        _group: &str,
+        _config_type_stem: &str,
+    ) -> TokenStream {
         quote! {}
+    }
+
+    /// Optional `#[cfg(...)]` expression that disables this node when false.
+    fn rustc_cfg(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -594,12 +678,61 @@ impl ClockTreeItem {
         }
     }
 
-    pub(crate) fn property_macro_branches(&self, path: &str, group: &str) -> TokenStream {
+    pub(crate) fn is_configurable(&self) -> bool {
         match self {
-            ClockTreeItem::Multiplexer(mux) => mux.property_macro_branches(path, group),
-            ClockTreeItem::Source(src) => src.property_macro_branches(path, group),
-            ClockTreeItem::Generic(div) => div.property_macro_branches(path, group),
-            ClockTreeItem::Derived(drv) => drv.property_macro_branches(path, group),
+            ClockTreeItem::Multiplexer(mux) => mux.is_configurable(),
+            ClockTreeItem::Source(src) => src.is_configurable(),
+            ClockTreeItem::Generic(div) => div.is_configurable(),
+            ClockTreeItem::Derived(drv) => drv.is_configurable(),
+        }
+    }
+
+    pub(crate) fn property_macro_branches(
+        &self,
+        path: &str,
+        group: &str,
+        config_type_stem: &str,
+    ) -> TokenStream {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => {
+                mux.property_macro_branches(path, group, config_type_stem)
+            }
+            ClockTreeItem::Source(src) => {
+                src.property_macro_branches(path, group, config_type_stem)
+            }
+            ClockTreeItem::Generic(div) => {
+                div.property_macro_branches(path, group, config_type_stem)
+            }
+            ClockTreeItem::Derived(drv) => {
+                drv.property_macro_branches(path, group, config_type_stem)
+            }
+        }
+    }
+
+    pub(crate) fn set_name(&mut self, name: String) {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => mux.name = name,
+            ClockTreeItem::Source(src) => src.name = name,
+            ClockTreeItem::Generic(div) => div.name = name,
+            ClockTreeItem::Derived(drv) => drv.source_options.name = name,
+        }
+    }
+
+    pub(crate) fn set_wake_locking(&mut self, wake_locking: bool) {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => mux.set_wake_locking(wake_locking),
+            ClockTreeItem::Source(src) => src.set_wake_locking(wake_locking),
+            ClockTreeItem::Generic(div) => div.set_wake_locking(wake_locking),
+            ClockTreeItem::Derived(drv) => drv.source_options.set_wake_locking(wake_locking),
+        }
+    }
+
+    pub(crate) fn set_always_on(&mut self, always_on: bool) {
+        match self {
+            ClockTreeItem::Multiplexer(mux) => mux.set_always_on(always_on),
+            ClockTreeItem::Source(src) => src.set_always_on(always_on),
+            ClockTreeItem::Generic(div) => div.set_always_on(always_on),
+            ClockTreeItem::Derived(drv) => drv.source_options.set_always_on(always_on),
         }
     }
 }

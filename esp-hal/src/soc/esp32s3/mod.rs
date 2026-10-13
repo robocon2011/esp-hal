@@ -9,19 +9,13 @@ crate::unstable_module! {
     pub mod clocks;
     pub mod trng;
     pub mod lp_core;
+    // The light sleep path stalls the other core, and it is not gated on the feature.
+    pub mod cpu_control;
 }
-#[cfg(feature = "unstable")]
-pub mod cpu_control;
 pub mod gpio;
 pub(crate) mod regi2c;
 
 pub use esp32s3 as pac;
-
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_160m_frequency()
-}
 
 pub(crate) const CONFIG_INSTRUCTION_CACHE_SIZE: usize = cfg_select! {
     instruction_cache_size_32kb => 0x8000,
@@ -68,7 +62,7 @@ pub(crate) unsafe fn configure_cpu_caches() {
     // see https://github.com/apache/nuttx/blob/f25db331136351dbf8ebe6925a98d3b77e1ca983/arch/xtensa/src/esp32s3/esp32s3_start.c#L213
 
     unsafe extern "C" {
-        fn Cache_Suspend_DCache();
+        fn Cache_Suspend_DCache() -> u32;
 
         fn Cache_Resume_DCache(param: u32);
 
@@ -106,7 +100,7 @@ pub(crate) unsafe fn configure_cpu_caches() {
     }
 }
 
-/// Write back a specific range of data in the cache.
+/// Writes back a specific range of data in the cache.
 #[doc(hidden)]
 #[unsafe(link_section = ".rwtext")]
 pub unsafe fn cache_writeback_addr(addr: u32, size: u32) {
@@ -132,6 +126,42 @@ pub unsafe fn cache_invalidate_addr(addr: u32, size: u32) {
     }
     unsafe {
         Cache_Invalidate_Addr(addr, size);
+    }
+}
+
+/// Writes back all dirty data cache lines.
+#[doc(hidden)]
+#[unsafe(link_section = ".rwtext")]
+pub unsafe fn cache_writeback_all() {
+    unsafe extern "C" {
+        fn Cache_WriteBack_All();
+    }
+    unsafe {
+        Cache_WriteBack_All();
+    }
+}
+
+/// Invalidates the entire instruction cache.
+#[doc(hidden)]
+#[unsafe(link_section = ".rwtext")]
+pub unsafe fn cache_invalidate_icache_all() {
+    unsafe extern "C" {
+        fn Cache_Invalidate_ICache_All();
+    }
+    unsafe {
+        Cache_Invalidate_ICache_All();
+    }
+}
+
+/// Invalidates the entire data cache.
+#[doc(hidden)]
+#[unsafe(link_section = ".rwtext")]
+pub unsafe fn cache_invalidate_dcache_all() {
+    unsafe extern "C" {
+        fn Cache_Invalidate_DCache_All();
+    }
+    unsafe {
+        Cache_Invalidate_DCache_All();
     }
 }
 

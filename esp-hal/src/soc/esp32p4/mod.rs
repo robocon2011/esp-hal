@@ -1,5 +1,6 @@
 crate::unstable_module! {
     pub mod clocks;
+    pub mod trng;
 }
 
 pub(crate) mod cpu_control;
@@ -28,16 +29,25 @@ pub(crate) fn pre_init() {
     }
 }
 
+const MHCR_RS: u32 = 1 << 4;
+const MHCR_BFE: u32 = 1 << 5;
+const MHCR_BTB: u32 = 1 << 12;
+const MHCR_BRANCH_PREDICTOR: u32 = MHCR_RS | MHCR_BFE | MHCR_BTB;
+
 pub(crate) fn enable_branch_predictor() {
-    // Enable branch predictor
-    // Note that the branch predictor will start cache requests and needs to be disabled when
-    // the cache is disabled.
-    // MHCR: CSR 0x7c1
-    const MHCR_RS: u32 = 1 << 4; // R/W, address return stack set bit
-    const MHCR_BFE: u32 = 1 << 5; // R/W, allow predictive jump set bit
-    const MHCR_BTB: u32 = 1 << 12; // R/W, branch target prediction enable bit
+    // MHCR: CSR 0x7c1 — sourced from `components/riscv/include/riscv/rv_utils.h`. The predictor
+    // starts cache requests of its own, so it must be off while the cache is off.
     unsafe {
-        core::arch::asm!("csrrs x0, 0x7c1, {0}", in(reg) MHCR_RS | MHCR_BFE | MHCR_BTB);
+        core::arch::asm!("csrrs x0, 0x7c1, {0}", in(reg) MHCR_BRANCH_PREDICTOR);
+    }
+}
+
+#[cfg(any(feature = "rt", feature = "unstable"))]
+pub(crate) fn disable_branch_predictor() {
+    // Clears the bits set by `enable_branch_predictor`.
+    // `rt` covers the CPU-retention rendezvous; `unstable` covers flash cache suspend.
+    unsafe {
+        core::arch::asm!("csrrc x0, 0x7c1, {0}", in(reg) MHCR_BRANCH_PREDICTOR);
     }
 }
 
@@ -52,7 +62,7 @@ fn cache_l2_bus(addr: u32) -> u32 {
     if internal { 0 } else { CACHE_MAP_L2_CACHE }
 }
 
-/// Write back a specific range of data in the cache.
+/// Writes back a specific range of data in the cache.
 pub(crate) unsafe fn cache_writeback_addr(addr: u32, size: u32) {
     unsafe extern "C" {
         fn Cache_WriteBack_Addr(bus: u32, addr: u32, size: u32);
@@ -86,10 +96,4 @@ pub(crate) unsafe fn cache_invalidate_icache_addr(addr: u32, size: u32) {
             size,
         );
     }
-}
-
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_f160m_frequency()
 }

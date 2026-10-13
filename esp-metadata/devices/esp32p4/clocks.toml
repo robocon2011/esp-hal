@@ -2,14 +2,14 @@ system_clocks = { clock_tree = [
     # High-speed clock sources
     { name = "XTAL_CLK",    type = "source",  output = "40_000_000", always_on = true },
     { name = "CPLL_CLK",    type = "derived", from = "XTAL_CLK", values = "360, 400", output = "VALUE * 1_000_000" },
-    { name = "SPLL_CLK",    type = "derived", from = "XTAL_CLK", values = "240, 480", output = "VALUE * 1_000_000" },
+    { name = "SPLL_CLK",    type = "derived", from = "XTAL_CLK", output = "480 * 1_000_000" },
     { name = "MPLL_CLK",    type = "derived", from = "XTAL_CLK", values = "320, 400, 500", output = "VALUE * 1_000_000" },
-    { name = "RC_FAST_CLK", type = "source",                     output = "20_000_000" },
+    { name = "RC_FAST_CLK", type = "source",                     output = "20_000_000", adjustable = "10_000_000..=30_000_000" },
 
     # Low-speed clocks
-    { name = "XTAL32K_CLK",  type = "source", output = "32768"   },
+    { name = "XTAL32K_CLK",  type = "source", output = "32768", cfg = "use_xtal32k" },
     { name = "OSC_SLOW_CLK", type = "source", output = "32768"   },
-    { name = "RC_SLOW_CLK",  type = "source", output = "136_000" },
+    { name = "RC_SLOW_CLK",  type = "source", output = "136_000", adjustable = "68_000..=204_000" },
     { name = "RC32K_CLK",    type = "source", output = "32768"   },
 
     # SPLL divider taps
@@ -18,6 +18,9 @@ system_clocks = { clock_tree = [
     { name = "PLL_F120M", type = "generic", output = "SPLL_CLK / 4"  },
     { name = "PLL_F160M", type = "generic", output = "SPLL_CLK / 3"  },
     { name = "PLL_F240M", type = "generic", output = "SPLL_CLK / 2"  },
+
+    # Virtual clock node for peripherals that can be sourced from SPLL but have a 160MHz max constraint.
+    { name = "SPLL_D3_CLOCK", type = "generic", output = "SPLL_CLK / 3" },
 
     {
         name = "IOMUX_FUNCTION_CLOCK", type = "generic", output = "source / (div_num + 1)", always_on = true,
@@ -45,7 +48,7 @@ system_clocks = { clock_tree = [
     ] },
 
     # TODO: model fractional divider parameters
-    # CPU_CLK divider (HP_SYS_CLKRST.root_clk_ctrl0.cpu_clk_div_num)
+    # CPU_CLK divider
     { name = "CPU_CLK", type = "generic", params = { divisor = "0..256" }, output = "CPU_ROOT_CLK / (divisor + 1)" },
     # MEM_CLK divider
     { name = "MEM_CLK", type = "generic", params = { divisor = "0..256" }, output = "CPU_CLK / (divisor + 1)" },
@@ -61,9 +64,18 @@ system_clocks = { clock_tree = [
     ] },
     { name = "LP_SLOW_CLK", type = "mux", variants = [
         { name = "RC_SLOW",  outputs = "RC_SLOW_CLK" },
-        { name = "XTAL32K",  outputs = "XTAL32K_CLK" },
+        { name = "XTAL32K",  outputs = "XTAL32K_CLK", cfg = "use_xtal32k" },
         #{ name = "RC32K",    outputs = "RC32K_CLK" },
         { name = "OSC_SLOW", outputs = "OSC_SLOW_CLK" },
+    ] },
+
+    # Global peripheral-related clocks
+    # HP_SYS_CLKRST.peri_clk_ctrl25.crypto_clk_src_sel
+    { name = "CRYPTO_CLK", type = "mux", variants = [
+        { name = "XTAL",      outputs = "XTAL_CLK"    },
+        { name = "RC_FAST",   outputs = "RC_FAST_CLK" },
+        { name = "PLL_F240M", outputs = "PLL_F240M"   },
+        { name = "PLL_F160M", outputs = "PLL_F160M"   },
     ] },
 
     # TIMG0-only?
@@ -77,10 +89,18 @@ system_clocks = { clock_tree = [
         #{ name = "SDIO_PLL2_CLK",   outputs = "SDIO_PLL2_CLK" },
         { name = "RC_FAST_DIV_CLK", outputs = "RC_FAST_CLK" },
         { name = "RC_SLOW_CLK",     outputs = "LP_SLOW_CLK" },
-        { name = "XTAL32K_CLK",     outputs = "XTAL32K_CLK" },
+        { name = "XTAL32K_CLK",     outputs = "XTAL32K_CLK", cfg = "use_xtal32k" },
         #{ name = "PLL_LP_CLK",      outputs = "PLL_LP_CLK" },
     ] },
 ], template_groups = [
+    { group = "PSRAM", clocks = [
+        { name = "FUNCTION_CLOCK", type = "mux", variants = [
+            { name = "XTAL", outputs = "XTAL_CLK", default = true },
+            { name = "MPLL", outputs = "MPLL_CLK" },
+            { name = "SPLL", outputs = "SPLL_CLK" },
+            { name = "CPLL", outputs = "CPLL_CLK" },
+        ] },
+    ] },
     { group = "UART", clocks = [
         { name = "FUNCTION_CLOCK", type = "generic", output = "sclk / (div_num + 1)", params = { sclk = [
             { name = "XTAL",     outputs = "XTAL_CLK", default = true },
@@ -110,15 +130,48 @@ system_clocks = { clock_tree = [
             { name = "RC_FAST", outputs = "RC_FAST_CLK" },
         ], div_num = "0 .. 0x100" } },
     ] },
+    { group = "RMT", clocks = [
+        { name = "SCLK", type = "mux", wake_locking = true, variants = [
+            { name = "PLL_F80M",    outputs = "PLL_F80M", default = true },
+            { name = "RC_FAST_CLK", outputs = "RC_FAST_CLK" },
+            { name = "XTAL_CLK",    outputs = "XTAL_CLK" },
+        ] },
+    ] },
     { group = "SPI", clocks = [
         { name = "FUNCTION_CLOCK", type = "mux", variants = [
-            { name = "XTAL",    outputs = "XTAL_CLK", default = true },
+            { name = "XTAL",    outputs = "XTAL_CLK" },
             { name = "RC_FAST", outputs = "RC_FAST_CLK" },
             # { name = "SDIO_PLL0", outputs = "SDIO_PLL0_CLK" },
             # { name = "APLL", outputs = "APLL_CLK" },
-            { name = "SPLL",    outputs = "SPLL_CLK" },
+            { name = "SPLL",    outputs = "SPLL_D3_CLOCK", default = true },
         ] },
     ] },
+    { group = "I2S",
+      presets = {
+        CLK = {
+          type = "generic",
+          wake_locking = true,
+          output = "(sclk * div_a) / (div_num * div_a + div_b)",
+          params = {
+            sclk = [
+              { name = "XTAL",      outputs = "XTAL_CLK" },
+              { name = "PLL_F160M", outputs = "PLL_F160M", default = true },
+            ],
+            div_num = "1 ..= 255",
+            div_a   = "1 ..= 511",
+            div_b   = "0 ..= 511",
+          },
+        },
+      },
+      clocks = [
+        { name = "TX_CLK",   preset = "CLK" },
+        { name = "RX_CLK",   preset = "CLK" },
+        { name = "MCLK_OUT", type = "mux", variants = [
+          { name = "TX", outputs = "TX_CLK" },
+          { name = "RX", outputs = "RX_CLK", default = true },
+        ] },
+      ],
+    },
     # APLL (register value 1 on PHY_PLL_REFCLK) is intentionally omitted
     # because it is not yet modelled in the clock tree.
     { group = "MIPI_DSI", clocks = [
@@ -224,8 +277,8 @@ peripheral_clocks = { templates = [
     { name = "AhbGdma", template_params = { clk_en_template = "{{sys_clk_template}}", clk_field = "ahb_pdma", rst_group = "1", rst_field = "ahb_pdma" } },
     { name = "AxiGdma", template_params = { clk_en_template = "{{sys_clk_template}}", clk_field = "axi_pdma", rst_group = "1", rst_field = "axi_pdma" } },
     { name = "Vdma",    template_params = { clk_en_template = "{{sys_clk_template}}", clk_field = "gdma",     rst_group = "0", rst_field = "gdma" } },
-    # ADC.
-    { name = "Adc", template_params = { clk_en_template = "{{apb_clk_template}}", rst_group = "2" } },
+    # ADC -- the digital controller needs both the APB gate and the PERI_CLK_CTRL23 function clock.
+    { name = "ApbSarAdc", template_params = { clk_en_template = "{{apb_clk_template}} {{control}}::regs().peri_clk_ctrl23().modify(|_, w| w.adc_clk_en().bit(enable));", clk_field = "adc", rst_group = "2", rst_field = "adc" } },
     # Parallel IO -- reset asserts the parlio block plus its rx/tx subreset bits in one write.
     { name = "ParlIo", template_params = { clk_en_template = "{{sys_apb_clk_template}}", clk_field = "parlio", rst_template = "{{control}}::regs().hp_rst_en2().modify(|_, w| w.rst_en_parlio().bit(reset).rst_en_parlio_rx().bit(reset).rst_en_parlio_tx().bit(reset));" } },
     # LCD/CAM -- clock gate lives in SOC_CLK_CTRL3 (not modelled), only reset is wired up.

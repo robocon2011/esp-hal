@@ -68,7 +68,7 @@ use crate::{
 /// [`Pull::None`][crate::gpio::Pull::None] and no external resistor therefore floats during the
 /// sleep, and a floating pad wakes the chip immediately and every time.
 ///
-/// Give a level-triggered wake pin a pull against the level that wakes the chip, or an external
+/// A level-triggered wake pin needs a pull against the level that wakes the chip, or an external
 /// resistor. For a pin that wakes the chip on a low level, use an external pull-up.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, procmacros::BuilderLite)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -393,7 +393,7 @@ fn collect(buffer: &mut [Armed; MAX_ARMED]) -> (&[Armed], bool) {
 /// Returns the level that wakes the chip through this pad, or `None` if the trigger sets no level.
 ///
 /// The wake paths accept a level only, so an edge trigger becomes the level at the end of the edge.
-/// This keeps the request of the user. `AnyEdge` ends at the level that the pin is not at now,
+/// This keeps the configured request. `AnyEdge` ends at the level that the pin is not at now,
 /// which is the meaning of "wake when the pin changes". This read of the pin can race with the pin,
 /// but the result is safe. If the pin changes before the sleep starts, the path arms a level that
 /// is already present, and the sleep is rejected or ends immediately.
@@ -445,7 +445,7 @@ fn prepare_pad(pin: &Armed, deep: bool) {
 /// peripheral function that drove it. It therefore runs at sleep entry, on the chips that cannot
 /// hold a single pad through a deep sleep, and after the wakeup sources take the holds that they
 /// need.
-#[cfg(sleep_deep_sleep_needs_gpio_isolation)]
+#[cfg(all(sleep_deep_sleep_needs_gpio_isolation, feature = "rt"))]
 pub(crate) fn isolate_pads_for_deep_sleep() {
     use crate::{
         gpio::{AlternateFunction, OutputSignal, io_mux_reg},
@@ -485,4 +485,38 @@ pub(crate) fn isolate_pads_for_deep_sleep() {
             w.mcu_sel().bits(AlternateFunction::GPIO as u8)
         });
     }
+}
+
+/// Isolates digital pads when a power domain that feeds them is powered down.
+///
+/// ESP-IDF does this when `SOC_GPIO_NEED_SOFT_ISOLATE_DURING_PD` is set. The chip can still hold a
+/// single pad, so a held pad is left alone. The pad list comes from `for_each_gpio_soft_isolate`,
+/// which already omits low-power pads and the flash or PSRAM interface.
+#[cfg(gpio_need_soft_isolate_during_pd)]
+pub(crate) fn isolate_pads_for_deep_sleep() {
+    for_each_gpio_soft_isolate! {
+        ($n:literal) => {
+            isolate_soft_isolate_pad($n);
+        };
+    }
+}
+
+/// Disconnects one digital pad so that a powered-down driver does not increase the sleep current.
+#[cfg(gpio_need_soft_isolate_during_pd)]
+fn isolate_soft_isolate_pad(gpio: u8) {
+    use crate::gpio::{AlternateFunction, io_mux_reg, low_level};
+
+    if crate::gpio::lp_io::low_level::is_digital_pad_held(gpio) {
+        return;
+    }
+
+    io_mux_reg(gpio).modify(|_, w| unsafe {
+        w.fun_wpu().clear_bit();
+        w.fun_wpd().clear_bit();
+        w.fun_ie().clear_bit();
+        w.mcu_sel().bits(AlternateFunction::GPIO as u8)
+    });
+
+    let bank = low_level::bank(gpio);
+    bank.write_out_en_clear(1 << (gpio - bank.offset()));
 }

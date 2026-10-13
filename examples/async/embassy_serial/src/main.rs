@@ -13,7 +13,6 @@ use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use esp_backtrace as _;
 use esp_hal::{
     Async,
-    interrupt::software::SoftwareInterruptControl,
     timer::timg::TimerGroup,
     uart::{AtCmdConfig, Config, RxConfig, Uart, UartRx, UartTx},
 };
@@ -71,9 +70,8 @@ async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    esp_rtos::start(timg0.timer0);
 
     // Default pins for Uart communication
     let (tx_pin, rx_pin) = cfg_select! {
@@ -84,6 +82,7 @@ async fn main(spawner: Spawner) {
         feature = "esp32c6" => (peripherals.GPIO16, peripherals.GPIO17),
         feature = "esp32c61" => (peripherals.GPIO11, peripherals.GPIO10),
         feature = "esp32h2" => (peripherals.GPIO24, peripherals.GPIO23),
+        feature = "esp32h4" => (peripherals.GPIO24, peripherals.GPIO23),
         feature = "esp32p4" => (peripherals.GPIO6, peripherals.GPIO5),
         feature = "esp32s31" => (peripherals.GPIO3, peripherals.GPIO2),
         any(feature = "esp32s2", feature = "esp32s3") => {

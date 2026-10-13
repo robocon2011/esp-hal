@@ -235,6 +235,8 @@ string_enum! {
         Esp32c61 = "esp32c61",
         /// ESP32-H2
         Esp32h2 = "esp32h2",
+        /// ESP32-H4
+        Esp32h4 = "esp32h4",
         /// ESP32-P4 (chip revision v3.x / eco5 only)
         Esp32p4 = "esp32p4",
         /// ESP32-S2
@@ -300,6 +302,7 @@ impl Chip {
             Chip::Esp32c6 => "Esp32c6",
             Chip::Esp32c61 => "Esp32c61",
             Chip::Esp32h2 => "Esp32h2",
+            Chip::Esp32h4 => "Esp32h4",
             Chip::Esp32p4 => "Esp32p4",
             Chip::Esp32s2 => "Esp32s2",
             Chip::Esp32s3 => "Esp32s3",
@@ -316,6 +319,7 @@ impl Chip {
             Chip::Esp32c6 => "ESP32-C6",
             Chip::Esp32c61 => "ESP32-C61",
             Chip::Esp32h2 => "ESP32-H2",
+            Chip::Esp32h4 => "ESP32-H4",
             Chip::Esp32p4 => "ESP32-P4",
             Chip::Esp32s2 => "ESP32-S2",
             Chip::Esp32s3 => "ESP32-S3",
@@ -418,6 +422,8 @@ struct Device {
     cores: usize,
     datasheet: String,
     trm: String,
+    #[serde(default)]
+    support_note: String,
 
     // Peripheral driver configuration:
     #[serde(flatten)]
@@ -452,6 +458,7 @@ impl Config {
             Chip::Esp32c6 => cached_device_config!("devices/esp32c6/soc.toml"),
             Chip::Esp32c61 => cached_device_config!("devices/esp32c61/soc.toml"),
             Chip::Esp32h2 => cached_device_config!("devices/esp32h2/soc.toml"),
+            Chip::Esp32h4 => cached_device_config!("devices/esp32h4/soc.toml"),
             Chip::Esp32p4 => cached_device_config!("devices/esp32p4/soc.toml"),
             Chip::Esp32s2 => cached_device_config!("devices/esp32s2/soc.toml"),
             Chip::Esp32s3 => cached_device_config!("devices/esp32s3/soc.toml"),
@@ -470,6 +477,7 @@ impl Config {
                 datasheet: String::new(),
                 trm: String::new(),
                 peri_config: PeriConfig::default(),
+                support_note: String::new(),
             },
             all_symbols: OnceLock::new(),
         }
@@ -730,6 +738,12 @@ impl Config {
         if let Some(peri) = self.device.peri_config.spi_slave.as_ref() {
             tokens.extend(cfg::generate_spi_slave_peripherals(peri));
         };
+        if let Some(peri) = self.device.peri_config.pcnt.as_ref() {
+            tokens.extend(cfg::generate_pcnt_peripherals(peri));
+        };
+        if let Some(peri) = self.device.peri_config.canfd.as_ref() {
+            tokens.extend(cfg::generate_canfd_peripherals(peri));
+        };
 
         tokens.extend(self.generate_peripherals_macro());
 
@@ -830,6 +844,36 @@ This pin may be available with certain limitations. Check your hardware to make 
                     all_peripherals.push(quote! { @peri_type #tokens (unstable) });
                     singleton_peripherals.push(unstable_singleton(&quote! {}, &ch_name));
                 }
+            }
+        }
+
+        if let Some(pcnt) = self.device.peri_config.pcnt.as_ref()
+            && pcnt.support_status.is_supported()
+        {
+            for instance in pcnt.instances.iter() {
+                for unit in 0..instance.instance_config.units.len() {
+                    let name = format_ident!("{}", cfg::singleton_name(&instance.name, unit));
+                    let singleton_doc = format!("{} peripheral singleton", name);
+                    let tokens = quote! {
+                        #[doc = #singleton_doc] #name <= virtual ()
+                    };
+                    all_peripherals.push(quote! { @peri_type #tokens (unstable) });
+                    singleton_peripherals.push(unstable_singleton(&quote! {}, &name));
+                }
+            }
+        }
+
+        if let Some(sdm) = self.device.peri_config.sdm.as_ref()
+            && sdm.support_status.is_supported()
+        {
+            for channel in 0..sdm.channel_count.count {
+                let ch_name = format_ident!("SDM_CH{channel}");
+                let singleton_doc = format!("SDM_CH{channel} peripheral singleton");
+                let tokens = quote! {
+                    #[doc = #singleton_doc] #ch_name <= virtual ()
+                };
+                all_peripherals.push(quote! { @peri_type #tokens (unstable) });
+                singleton_peripherals.push(unstable_singleton(&quote! {}, &ch_name));
             }
         }
 
@@ -1607,22 +1651,17 @@ fn write_support_table(
 }
 
 pub fn generate_supported_devices_table(output: &mut impl Write) -> std::fmt::Result {
-    writeln!(
-        output,
-        "| Chip | Datasheet | Technical Reference Manual | Target |"
-    )?;
-    writeln!(
-        output,
-        "| :---: | :-------: | :------------------------: | :----: |"
-    )?;
+    writeln!(output, "| Chip  | Documentation | Target | Note  |")?;
+    writeln!(output, "| :---: | :-----------: | :----: | :---: |")?;
 
     for chip in Chip::iter() {
         let config = Config::for_chip(&chip);
         writeln!(
             output,
-            "| {pretty} | [{pretty}][{chip}-datasheet] | [{pretty}][{chip}-trm] | `{target}` |",
+            "| {pretty} | [Datasheet][{chip}-datasheet] [TRM][{chip}-trm] | `{target}` | {note} |",
             pretty = chip.pretty_name(),
             target = config.device.target,
+            note = config.device.support_note,
         )?;
     }
 
@@ -1630,8 +1669,8 @@ pub fn generate_supported_devices_table(output: &mut impl Write) -> std::fmt::Re
 
     for chip in Chip::iter() {
         let config = Config::for_chip(&chip);
-        writeln!(output, "[{chip}-datasheet]: {}", config.device.datasheet,)?;
-        writeln!(output, "[{chip}-trm]: {}", config.device.trm,)?;
+        writeln!(output, "[{chip}-datasheet]: {}", config.device.datasheet)?;
+        writeln!(output, "[{chip}-trm]: {}", config.device.trm)?;
     }
 
     Ok(())

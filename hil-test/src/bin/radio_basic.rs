@@ -1,8 +1,8 @@
 //% CHIP_FILTER(no_wifi):      bt_driver_supported && !wifi_driver_supported
 //% CHIP_FILTER(no_ble):       wifi_driver_supported && !bt_driver_supported
 //% CHIP_FILTER(no_radio):     !wifi_driver_supported && !bt_driver_supported
-//% CHIP_FILTER(has_wifi_ble): wifi_driver_supported && bt_driver_supported
 //% CHIP_FILTER(stable_wifi):  wifi_driver_supported
+//% CHIP_FILTER(has_wifi_ble): wifi_driver_supported && bt_driver_supported
 
 //% FEATURES: unstable esp-alloc embassy
 //% FEATURES(no_radio): rtos-radio-driver
@@ -29,6 +29,12 @@ fn init_heap() {
     cfg_select! {
         esp32h2 => {
             esp_alloc::heap_allocator!(size: 72 * 1024);
+        }
+        // The reclaimed region (dram2_seg) is only 56 KiB on the H4.
+        esp32h4 => {
+            use esp_hal::ram;
+            esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 56 * 1024);
+            esp_alloc::heap_allocator!(size: 56 * 1024);
         }
         _ => {
             use esp_hal::ram;
@@ -57,6 +63,11 @@ mod ble_controller;
 #[path = "radio_basic/wifi_controller.rs"]
 #[cfg(feature = "esp-radio")]
 mod wifi_controller;
+
+#[cfg(any(esp32c5, esp32c6, esp32c61, esp32h2))]
+#[path = "radio_basic/adc.rs"]
+#[cfg(feature = "esp-radio-unstable")]
+mod adc;
 
 #[cfg(soc_has_wifi)]
 #[path = "radio_basic/esp_now_config.rs"]

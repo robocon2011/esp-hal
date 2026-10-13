@@ -184,7 +184,7 @@ impl<'d, T> TimerGroup<'d, T>
 where
     T: TimerGroupInstance + 'd,
 {
-    /// Construct a new instance of [`TimerGroup`] in blocking mode
+    /// Creates a new instance of [`TimerGroup`] in blocking mode.
     pub fn new(_timer_group: T) -> Self {
         // TODO: use PeripheralGuard
         if PeripheralClockControl::enable(T::peripheral()) {
@@ -332,7 +332,7 @@ impl Timer<'_> {
     ///
     /// # Safety
     ///
-    /// You must ensure that you're only using one instance of this type at a
+    /// The caller must ensure that only one instance of this type is used at a
     /// time.
     pub unsafe fn clone_unchecked(&self) -> Self {
         Self {
@@ -345,8 +345,8 @@ impl Timer<'_> {
 
     /// Creates a new peripheral reference with a shorter lifetime.
     ///
-    /// Use this method if you would like to keep working with the peripheral
-    /// after you dropped the driver that consumes this.
+    /// Use this method to keep working with the peripheral after dropping the
+    /// driver that consumes this.
     ///
     /// See [Peripheral singleton] section for more information.
     ///
@@ -557,11 +557,11 @@ fn timeout_to_ticks(timeout: Duration, clock: Rate, divider: u32) -> Option<u64>
 pub enum MwdtStageAction {
     /// No effect on the system.
     Off         = 0,
-    /// Trigger an interrupt.
+    /// Triggers an interrupt.
     Interrupt   = 1,
-    /// Reset the CPU core.
+    /// Resets the CPU core.
     ResetCpu    = 2,
-    /// Reset the main system, power management unit and RTC peripherals.
+    /// Resets the main system, power management unit and RTC peripherals.
     ResetSystem = 3,
 }
 
@@ -591,7 +591,7 @@ impl<TG> Wdt<TG>
 where
     TG: TimerGroupInstance,
 {
-    /// Construct a new instance of [`Wdt`]
+    /// Creates a new instance of [`Wdt`].
     pub fn new() -> Self {
         let mut this = Self {
             phantom: PhantomData,
@@ -607,14 +607,14 @@ where
         this
     }
 
-    /// Enable the watchdog timer instance
+    /// Enables the watchdog timer instance.
     pub fn enable(&mut self) {
         // SAFETY: The `TG` instance being modified is owned by `self`, which is behind
         //         a mutable reference.
         unsafe { self.set_wdt_enabled(true) };
     }
 
-    /// Disable the watchdog timer instance
+    /// Disables the watchdog timer instance.
     pub fn disable(&mut self) {
         // SAFETY: The `TG` instance being modified is owned by `self`, which is behind
         //         a mutable reference.
@@ -651,12 +651,12 @@ where
                 w.wdt_stg2().bits(MwdtStageAction::Off as u8);
                 w.wdt_stg3().bits(MwdtStageAction::Off as u8)
             });
-
-            #[cfg(any(esp32c2, esp32c3, esp32c6))]
-            reg_block
-                .wdtconfig0()
-                .modify(|_, w| w.wdt_conf_update_en().set_bit());
         }
+
+        #[cfg(timergroup_wdt_has_conf_update)]
+        reg_block
+            .wdtconfig0()
+            .modify(|_, w| w.wdt_conf_update_en().set_bit());
 
         #[cfg(soc_has_clock_node_timg_wdt_clock)]
         if !enabled {
@@ -666,7 +666,7 @@ where
         self.set_write_protection(true);
     }
 
-    /// Feed the watchdog timer
+    /// Feeds the watchdog timer.
     pub fn feed(&mut self) {
         let reg_block = unsafe { &*TG::register_block() };
 
@@ -687,7 +687,7 @@ where
             .write(|w| unsafe { w.wdt_wkey().bits(wkey) });
     }
 
-    /// Set the timeout, in microseconds, of the watchdog timer
+    /// Sets the timeout, in microseconds, of the watchdog timer.
     pub fn set_timeout(&mut self, stage: MwdtStage, timeout: Duration) {
         cfg_select! {
             soc_has_clock_node_timg_wdt_clock => {
@@ -731,7 +731,7 @@ where
 
         config_register.write(|w| unsafe { w.hold().bits(timeout) });
 
-        #[cfg(any(esp32c2, esp32c3, esp32c6))]
+        #[cfg(timergroup_wdt_has_conf_update)]
         reg_block
             .wdtconfig0()
             .modify(|_, w| w.wdt_conf_update_en().set_bit());
@@ -739,10 +739,10 @@ where
         self.set_write_protection(true);
     }
 
-    /// Set the stage action of the MWDT for a specific stage.
+    /// Sets the stage action of the MWDT for a specific stage.
     ///
-    /// This function modifies MWDT behavior only if a custom bootloader with
-    /// the following modifications is used:
+    /// Modifies MWDT behavior only if a custom bootloader with the following modifications is
+    /// used:
     /// - `ESP_TASK_WDT_EN` parameter **disabled**
     /// - `ESP_INT_WDT` parameter **disabled**
     pub fn set_stage_action(&mut self, stage: MwdtStage, action: MwdtStageAction) {
@@ -758,6 +758,11 @@ where
                 MwdtStage::Stage3 => w.wdt_stg3().bits(action as u8),
             }
         });
+
+        #[cfg(timergroup_wdt_has_conf_update)]
+        reg_block
+            .wdtconfig0()
+            .modify(|_, w| w.wdt_conf_update_en().set_bit());
 
         self.set_write_protection(true);
     }

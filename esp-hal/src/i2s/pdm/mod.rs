@@ -142,7 +142,7 @@ impl PdmSlotMask {
     /// Line 3, right slot.
     pub const LINE3_RIGHT: Self = Self(1 << 6);
 
-    /// Create a mask from raw slot bits.
+    /// Creates a new mask from raw slot bits.
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
@@ -176,7 +176,7 @@ pub enum PdmDownsampleRate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PdmSigScaling {
-    /// Divide input by 2.
+    /// Divides input by 2.
     Div2,
     /// Multiply input by 1.
     #[default]
@@ -223,6 +223,8 @@ pub struct PdmTxClockConfig {
     pub up_sample_fs: u32,
     /// Bit clock divider.
     pub bclk_div: u32,
+    /// Source clock for the I2S module clock.
+    pub clock_source: crate::i2s::master::I2sClockSource,
 }
 
 /// PDM TX slot / filter configuration.
@@ -247,7 +249,7 @@ pub struct PdmTxSlotConfig {
     #[cfg(not(i2s_version = "1"))]
     /// Output line routing mode.
     pub line_mode: PdmTxLineMode,
-    /// Enable the TX high-pass filter.
+    /// Enables the TX high-pass filter.
     pub hp_en: bool,
     /// High-pass filter cut-off frequency in Hz.
     pub hp_cut_off_freq_hz: f32,
@@ -322,6 +324,8 @@ pub struct PdmRxClockConfig {
 
     /// Bit clock divider.
     pub bclk_div: u32,
+    /// Source clock for the I2S module clock.
+    pub clock_source: crate::i2s::master::I2sClockSource,
 }
 
 /// PDM RX slot configuration.
@@ -339,7 +343,7 @@ pub struct PdmRxSlotConfig {
     pub data_format: PdmDataFormat,
 
     #[cfg(i2s_supports_pdm_rx_hp_filter)]
-    /// Enable the RX high-pass filter.
+    /// Enables the RX high-pass filter.
     pub hp_en: bool,
 
     #[cfg(i2s_supports_pdm_rx_hp_filter)]
@@ -414,7 +418,7 @@ impl PdmTxConfig {
         }
     }
 
-    /// Validate TX configuration against hardware capabilities.
+    /// Validates TX configuration against hardware capabilities.
     pub fn validate(&self, info: &Info) -> Result<(), PdmError> {
         if self.slot.data_format == PdmDataFormat::Pcm && !info.pcm2pdm {
             return Err(PdmError::PcmFormatUnsupported);
@@ -468,7 +472,7 @@ impl PdmRxConfig {
         }
     }
 
-    /// Validate RX configuration against hardware capabilities.
+    /// Validates RX configuration against hardware capabilities.
     pub fn validate(&self, info: &Info) -> Result<(), PdmError> {
         if self.slot.data_format == PdmDataFormat::Pcm && !info.pdm2pcm {
             return Err(PdmError::PcmFormatUnsupported);
@@ -487,7 +491,7 @@ fn default_rx_slot(mode: PdmSlotMode) -> PdmRxSlotConfig {
     }
 }
 
-/// PDM mode configuration (simplex TX and/or RX).
+/// PDM mode configuration (simplex TX, RX, or both).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PdmConfig {
@@ -495,6 +499,9 @@ pub struct PdmConfig {
     pub tx: Option<PdmTxConfig>,
     /// Optional RX unit configuration.
     pub rx: Option<PdmRxConfig>,
+    /// Selects which module clock is routed to the MCLK pad.
+    #[cfg(not(i2s_version = "1"))]
+    pub mclk_out: crate::i2s::master::MclkOut,
 }
 
 impl PdmConfig {
@@ -504,6 +511,8 @@ impl PdmConfig {
         Self {
             tx: Some(tx),
             rx: None,
+            #[cfg(not(i2s_version = "1"))]
+            mclk_out: crate::i2s::master::MclkOut::Tx,
         }
     }
 
@@ -513,10 +522,12 @@ impl PdmConfig {
         Self {
             tx: None,
             rx: Some(rx),
+            #[cfg(not(i2s_version = "1"))]
+            mclk_out: crate::i2s::master::MclkOut::Rx,
         }
     }
 
-    /// Validate that exactly one direction is configured and that the settings
+    /// Validates that exactly one direction is configured and that the settings
     /// are valid for the given I2S instance.
     pub fn validate(&self, info: &Info) -> Result<(), PdmError> {
         if self.tx.is_none() && self.rx.is_none() {

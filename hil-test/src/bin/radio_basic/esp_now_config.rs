@@ -1,13 +1,8 @@
 #[embedded_test::tests(default_timeout = 10, executor = hil_test::Executor::new())]
 mod tests {
-    use esp_hal::{
-        clock::CpuClock,
-        interrupt::software::SoftwareInterruptControl,
-        peripherals::Peripherals,
-        timer::timg::TimerGroup,
-    };
+    use esp_hal::{clock::CpuClock, peripherals::Peripherals, timer::timg::TimerGroup};
     use esp_radio::{
-        esp_now::{Error, EspNowError, EspNowWifiInterface, PeerInfo},
+        esp_now::{BROADCAST_ADDRESS, Error, EspNowError, EspNowWifiInterface, PeerInfo},
         wifi::{ControllerConfig, WifiController},
     };
 
@@ -35,8 +30,7 @@ mod tests {
     #[test]
     fn espnow_max_encrypt_num_is_honored(p: Peripherals) {
         let timg0 = TimerGroup::new(p.TIMG0);
-        let sw_ints = SoftwareInterruptControl::new(p.SW_INTERRUPT);
-        esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let controller = WifiController::new(
             p.WIFI,
@@ -64,8 +58,7 @@ mod tests {
     #[test]
     fn espnow_max_encrypt_num_raises_the_limit(p: Peripherals) {
         let timg0 = TimerGroup::new(p.TIMG0);
-        let sw_ints = SoftwareInterruptControl::new(p.SW_INTERRUPT);
-        esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let controller = WifiController::new(
             p.WIFI,
@@ -84,10 +77,31 @@ mod tests {
     }
 
     #[test]
+    fn esp_now_survives_controller_drop(p: Peripherals) {
+        let timg0 = TimerGroup::new(p.TIMG0);
+        esp_rtos::start(timg0.timer0);
+
+        let mut wifi = p.WIFI;
+        let controller = WifiController::new(wifi.reborrow(), Default::default()).unwrap();
+        let mut esp_now = controller.esp_now();
+        drop(controller);
+
+        esp_now.set_channel(1).unwrap();
+        esp_now
+            .send(&BROADCAST_ADDRESS, b"hello")
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        drop(esp_now);
+
+        let _controller = WifiController::new(wifi, Default::default()).unwrap();
+    }
+
+    #[test]
     fn sta_disconnected_pm_can_be_configured(p: Peripherals) {
         let timg0 = TimerGroup::new(p.TIMG0);
-        let sw_ints = SoftwareInterruptControl::new(p.SW_INTERRUPT);
-        esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let mut wifi = p.WIFI;
         for enabled in [true, false] {

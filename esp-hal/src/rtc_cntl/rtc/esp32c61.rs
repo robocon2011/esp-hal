@@ -9,6 +9,17 @@ use crate::{
     },
 };
 
+// Trims the RTC bandgap using eFuse calibration data.
+//
+// See `esp_ocode_calib_init` in
+// <https://github.com/espressif/esp-idf/blob/v6.1/components/esp_hw_support/port/esp32c61/ocode_init.c>
+fn calibrate_ocode() {
+    super::calibrate_ocode(|| {
+        (crate::efuse::block_version() != (0, 0))
+            .then(|| crate::efuse::read_field_le::<u8>(crate::efuse::OCODE))
+    });
+}
+
 fn pmu_power_domain_force_default() {
     // for bypass reserved power domain
 
@@ -114,6 +125,7 @@ impl From<LpSlowClkConfig> for ModemClockLpclkSource {
     fn from(src: LpSlowClkConfig) -> Self {
         match src {
             LpSlowClkConfig::RcSlow => Self::RcSlow,
+            #[cfg(use_xtal32k)]
             LpSlowClkConfig::Xtal32k => Self::XTAL32K,
             LpSlowClkConfig::OscSlow => Self::EXT32K,
         }
@@ -1001,6 +1013,8 @@ pub(crate) fn init(config: &ClockConfig) {
 
     pmu_power_domain_force_default();
 
+    calibrate_ocode();
+
     // esp_perip_clk_init()
     modem_clock_domain_power_state_icg_map_init();
 
@@ -1086,7 +1100,7 @@ fn modem_clk_domain_active_state_icg_map_preinit() {
 /// SOC Reset Reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRepr)]
 pub enum SocResetReason {
-    /// Power on reset
+    /// Powers on reset.
     ///
     /// In ESP-IDF this value (0x01) can *also* be `ChipBrownOut` or
     /// `ChipSuperWdt`, however that is not really compatible with Rust-style
@@ -1108,7 +1122,7 @@ pub enum SocResetReason {
     Cpu0Sw        = 0x0C,
     /// RTC watch dog resets CPU 0
     Cpu0RtcWdt    = 0x0D,
-    /// VDD voltage is not stable and resets the digital core
+    /// VDD voltage is not stable and resets the digital core.
     SysBrownOut   = 0x0F,
     /// RTC watch dog resets digital core and rtc module
     SysRtcWdt     = 0x10,
@@ -1124,7 +1138,7 @@ pub enum SocResetReason {
     CoreUsbJtag   = 0x16,
     /// JTAG resets CPU
     Cpu0JtagCpu   = 0x18,
-    /// Power glitch resets CPU
+    /// Powers glitch resets CPU.
     PowerGlitch   = 0x19,
     /// CPU lockup reset
     CpuLockup     = 0x1A,

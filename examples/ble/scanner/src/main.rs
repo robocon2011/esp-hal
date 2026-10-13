@@ -13,11 +13,7 @@ use embassy_futures::join::join;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
-use esp_hal::{
-    clock::CpuClock,
-    interrupt::software::SoftwareInterruptControl,
-    timer::timg::TimerGroup,
-};
+use esp_hal::{clock::CpuClock, timer::timg::TimerGroup};
 use esp_radio::ble::controller::BleConnector;
 use heapless::Deque;
 use log::info;
@@ -32,9 +28,8 @@ async fn main(_s: Spawner) {
 
     esp_alloc::heap_allocator!(size: 72 * 1024);
 
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    esp_rtos::start(timg0.timer0);
 
     let bluetooth = peripherals.BT;
     let connector = BleConnector::new(bluetooth, Default::default()).unwrap();
@@ -57,18 +52,18 @@ where
 
     info!("Our address = {:?}", address);
 
-    let mut resources: HostResources<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();
     let mut runner = stack.runner();
-    let central = stack.central();
+    let mut central = stack.central();
 
     let printer = Printer {
         seen: RefCell::new(Deque::new()),
     };
-    let mut scanner = Scanner::new(central);
+    let mut scanner = Scanner::new(&mut central);
     let _ = join(runner.run_with_handler(&printer), async {
         let mut config = ScanConfig::default();
         config.active = true;

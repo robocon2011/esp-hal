@@ -1,5 +1,6 @@
 //! Interrupt Tests
 //!     "Disabled" for now - see https://github.com/esp-rs/esp-hal/pull/1635#issuecomment-2137405251
+//! MCPWM Tests
 //! PCNT Tests
 //! RNG Tests
 //! System Timer Tests
@@ -18,11 +19,24 @@ mod pcnt {
     use esp_hal::{
         delay::Delay,
         gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pin, Pull},
-        pcnt::{Pcnt, channel::EdgeMode},
+        handler,
+        pcnt::{Unit, channel::EdgeMode},
+        time::{Duration, Instant},
     };
+    use portable_atomic::{AtomicUsize, Ordering};
+
+    static HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[handler]
+    fn count_calls() {
+        HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 
     struct Context<'d> {
-        pcnt: Pcnt<'d>,
+        unit0: Unit<'d>,
+        unit1: Unit<'d>,
+        unit2: Unit<'d>,
+        unit3: Unit<'d>,
         input: AnyPin<'d>,
         output: AnyPin<'d>,
         delay: Delay,
@@ -37,7 +51,10 @@ mod pcnt {
         let dout = dout.degrade();
 
         Context {
-            pcnt: Pcnt::new(peripherals.PCNT),
+            unit0: Unit::new(peripherals.PCNT0_UNIT0),
+            unit1: Unit::new(peripherals.PCNT0_UNIT1),
+            unit2: Unit::new(peripherals.PCNT0_UNIT2),
+            unit3: Unit::new(peripherals.PCNT0_UNIT3),
             input: din,
             output: dout,
             delay: Delay::new(),
@@ -46,7 +63,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_on_pos_edge(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         // Setup channel 0 to increment the count when input changes LOW -> HIGH
         unit.channel0.set_edge_signal(Input::new(
@@ -85,7 +102,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_on_neg_edge(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit1;
+        let unit = ctx.unit1;
 
         // Setup channel 0 to increment the count when input changes HIGH -> LOW
         unit.channel0.set_edge_signal(Input::new(
@@ -124,7 +141,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_past_high_limit(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit3;
+        let unit = ctx.unit3;
 
         unit.set_high_limit(Some(3)).unwrap();
 
@@ -184,7 +201,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_past_thresholds(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         unit.set_threshold0(Some(2));
         unit.set_threshold1(Some(4));
@@ -252,7 +269,7 @@ mod pcnt {
 
     #[test]
     fn test_decrement_past_low_limit(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         unit.set_low_limit(Some(-3)).unwrap();
         // For some reason this is needed for the above limit to apply.
@@ -314,7 +331,7 @@ mod pcnt {
 
     #[test]
     fn test_unit_count_range(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit2;
+        let unit = ctx.unit2;
 
         // Setup channel 1 to increment the count when gpio2 does LOW -> HIGH
         unit.channel1.set_edge_signal(Input::new(
@@ -353,6 +370,139 @@ mod pcnt {
             output.set_high();
             ctx.delay.delay_micros(1);
         }
+    }
+
+    #[test]
+    fn test_unit_counts_after_previous_unit_dropped(ctx: Context<'static>) {
+        let input = Input::new(ctx.input, InputConfig::default().with_pull(Pull::Down));
+        let mut output = Output::new(ctx.output, Level::Low, OutputConfig::default());
+
+        let unit = ctx.unit0;
+        unit.channel0.set_edge_signal(input.peripheral_input());
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        output.set_high();
+        ctx.delay.delay_micros(1);
+        assert_eq!(1, unit.value());
+
+        core::mem::drop(unit);
+        output.set_low();
+        ctx.delay.delay_micros(1);
+
+        // A unit built from a fresh singleton must count without an explicit resume,
+        // the same as after a cold boot.
+        let unit = Unit::new(unsafe { esp_hal::peripherals::PCNT0_UNIT0::steal() });
+        unit.channel0.set_edge_signal(input.peripheral_input());
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        assert_eq!(0, unit.value());
+
+        output.set_high();
+        ctx.delay.delay_micros(1);
+
+        assert_eq!(1, unit.value());
+    }
+
+    #[test]
+    fn test_listening_unit_without_handler_does_not_stall_the_cpu(ctx: Context<'static>) {
+        let input = Input::new(ctx.input, InputConfig::default().with_pull(Pull::Down));
+        let mut output = Output::new(ctx.output, Level::Low, OutputConfig::default());
+
+        let mut unit0 = ctx.unit0;
+        unit0.set_interrupt_handler(count_calls);
+
+        let unit1 = ctx.unit1;
+        unit1.channel0.set_edge_signal(input.peripheral_input());
+        unit1
+            .channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+        unit1.set_high_limit(Some(1)).unwrap();
+        unit1.clear();
+        unit1.listen();
+
+        output.set_high();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {}
+
+        assert_eq!(0, HANDLER_CALLS.load(Ordering::Relaxed));
+        assert!(unit0.value() == 0);
+    }
+}
+
+#[cfg(all(mcpwm_driver_supported, pcnt_driver_supported))]
+#[embedded_test::tests(default_timeout = 3)]
+mod mcpwm {
+    use esp_hal::{
+        delay::Delay,
+        gpio::{AnyPin, Input, InputConfig, Pin, Pull},
+        mcpwm::{McPwm, PeripheralClockConfig, operator::PwmPinConfig, timer::PwmWorkingMode},
+        pcnt::{Unit, channel::EdgeMode},
+        peripherals::MCPWM0,
+        time::Rate,
+    };
+
+    struct Context<'d> {
+        mcpwm: MCPWM0<'d>,
+        unit: Unit<'d>,
+        input: AnyPin<'d>,
+        output: AnyPin<'d>,
+        delay: Delay,
+    }
+
+    #[init]
+    fn init() -> Context<'static> {
+        let peripherals = esp_hal::init(esp_hal::Config::default());
+
+        let (din, dout) = hil_test::common_test_pins!(peripherals);
+
+        Context {
+            mcpwm: peripherals.MCPWM0,
+            unit: Unit::new(peripherals.PCNT0_UNIT0),
+            input: din.degrade(),
+            output: dout.degrade(),
+            delay: Delay::new(),
+        }
+    }
+
+    #[test]
+    fn output_frequency_follows_peripheral_clock_prescaler(ctx: Context<'static>) {
+        // Divide the source clock by 8. On chips that divide the group clock in the PCR, the
+        // divider resets to 5, so this tells "prescaler applied" from "reset value left in place".
+        let clock_cfg = PeripheralClockConfig::with_prescaler(7);
+
+        let mut mcpwm = McPwm::new(ctx.mcpwm, clock_cfg);
+        mcpwm.operator0.set_timer(&mcpwm.timer0);
+        let mut pwm_pin = mcpwm
+            .operator0
+            .with_pin_a(ctx.output, PwmPinConfig::UP_ACTIVE_HIGH);
+        pwm_pin.set_timestamp(50);
+
+        // 10 kHz is an exact divisor of the peripheral clock on every chip with MCPWM.
+        let timer_clock_cfg = clock_cfg
+            .timer_clock_with_frequency(99, PwmWorkingMode::Increase, Rate::from_khz(10))
+            .unwrap();
+
+        let unit = ctx.unit;
+        unit.channel0.set_edge_signal(Input::new(
+            ctx.input,
+            InputConfig::default().with_pull(Pull::Down),
+        ));
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        mcpwm.timer0.start(timer_clock_cfg);
+
+        // 10 ms at 10 kHz is 100 rising edges.
+        unit.clear();
+        unit.resume();
+        ctx.delay.delay_millis(10);
+        unit.pause();
+
+        let edges = unit.value();
+        hil_test::assert!((98..=102).contains(&edges), "counted {} edges", edges);
     }
 }
 
@@ -528,7 +678,7 @@ mod twai {
         Blocking,
         DriverMode,
         interrupt,
-        interrupt::{Priority, software::SoftwareInterruptControl},
+        interrupt::Priority,
         peripherals::Interrupt::TWAI0,
         system::Cpu,
         timer::timg::TimerGroup,
@@ -583,6 +733,40 @@ mod twai {
             let frame = block!(ctx.twai.receive()).unwrap();
 
             assert_eq!(frame.data(), &[1, 2, 3])
+        }
+
+        #[test]
+        // The receive FIFO holds 64 bytes, four 8-byte standard frames; later
+        // frames overrun it. A blocking receiver must see the overrun once
+        // and then an empty FIFO, not the same overrun entry for ever.
+        fn test_blocking_receive_releases_overrun(mut ctx: Context<Blocking>) {
+            let frame = EspTwaiFrame::new_self_reception(StandardId::ZERO, b"12345678").unwrap();
+
+            const SENT: usize = 10;
+            for _ in 0..SENT {
+                block!(ctx.twai.transmit(&frame)).unwrap();
+            }
+
+            let mut frames = 0;
+            let mut overruns = 0;
+            loop {
+                match ctx.twai.receive() {
+                    Ok(received) => {
+                        assert_eq!(received.data(), b"12345678");
+                        frames += 1;
+                    }
+                    Err(nb::Error::Other(twai::EspTwaiError::EmbeddedHAL(ErrorKind::Overrun))) => {
+                        overruns += 1;
+                    }
+                    Err(nb::Error::WouldBlock) => break,
+                    Err(nb::Error::Other(err)) => panic!("{:?}", err),
+                }
+                assert!(frames + overruns <= SENT, "the same overrun reported again");
+            }
+
+            assert!(frames > 0, "no frame received");
+            assert!(overruns > 0, "no overrun reported");
+            assert!(frames < SENT, "the FIFO did not overrun");
         }
 
         fn no_init() {}
@@ -640,11 +824,9 @@ mod twai {
                 TwaiMode::SelfTest,
             );
 
-            let _sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-
             let timg0 = TimerGroup::new(peripherals.TIMG0);
 
-            esp_rtos::start(timg0.timer0, _sw_int.software_interrupt0);
+            esp_rtos::start(timg0.timer0);
 
             let twai = config.into_async().start();
 
@@ -705,6 +887,38 @@ mod twai {
             receive_frames(&mut ctx, NUM_SENT_FRAMES + NUM_ASYNC_SENT_FRAMES).await;
         }
 
+        #[test]
+        async fn test_overruns_are_counted(mut ctx: Context<Async>) {
+            let frame =
+                EspTwaiFrame::new_self_reception(StandardId::new(0).unwrap(), b"12345678").unwrap();
+
+            // Nothing drains the receive FIFO while the interrupt is off, so
+            // it overruns
+            interrupt::disable(Cpu::ProCpu, TWAI0);
+            const SENT: usize = 10;
+            for _ in 0..SENT {
+                block!(ctx.twai.transmit(&frame)).unwrap();
+            }
+            interrupt::enable(TWAI0, Priority3);
+
+            // Let the handler run, then take everything it queued
+            transmit_frames(&mut ctx, &frame, 1).await;
+            let mut overruns = 0;
+            for _ in 0..SENT + 1 {
+                match ctx.twai.receive_async().await {
+                    Ok(_) => {}
+                    Err(esp_hal::twai::EspTwaiError::EmbeddedHAL(ErrorKind::Overrun)) => {
+                        overruns += 1
+                    }
+                    Err(err) => panic!("{:#?}", err),
+                }
+            }
+
+            assert!(overruns > 0, "the FIFO did not overrun");
+            assert_eq!(ctx.twai.error_counts().overrun, overruns);
+            assert_eq!(ctx.twai.error_counts().bit, 0);
+        }
+
         fn no_init() {}
 
         #[test(init = no_init)]
@@ -712,9 +926,8 @@ mod twai {
         async fn test_write_into_the_void() {
             let peripherals = esp_hal::init(esp_hal::Config::default());
 
-            let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
             let timg0 = TimerGroup::new(peripherals.TIMG0);
-            esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+            esp_rtos::start(timg0.timer0);
 
             // The bus is permanently recessive, so every transmission attempt
             // fails immediately (a transmitted dominant bit reads back
@@ -737,6 +950,12 @@ mod twai {
                 twai.transmit_async(&frame).await,
                 Err(twai::EspTwaiError::TransmissionAborted)
             );
+
+            // Every attempt read its first dominant bit back recessive: bit
+            // errors, one per attempt until the controller went error passive
+            let counts = twai.error_counts();
+            assert!(counts.bit > 0, "{:?}", counts);
+            assert_eq!(counts.acknowledge, 0, "{:?}", counts);
         }
     }
 }

@@ -21,7 +21,7 @@ The CI will:
 
 1. Trigger appropriate workflow.
 2. Post a comment with a link to the triggered HIL run.
-3. Edit that comment later with a status update (succeeded / failed / cancelled / still running).
+3. Edit that comment when the run finishes with a status update (succeeded / failed / cancelled), and re-edit that same update whenever the run is re-run.
 
 In further commands, the feedback from the bot will be identical.
 
@@ -59,13 +59,23 @@ Use `binary::test_name` to run a single embedded-test case inside a matching HIL
 
 By default, `/hil` commands run the `hil-test` package. Include `hil-test-radio` in the comment body to run the radio HIL package instead.
 
-### `/test-size`
+### `/test-size <example> [--package <package>] <chip> [<chip> ...]`
 
 Triggers the binary size analysis workflow, which:
 
-- Builds selected binaries for the PR and for the base branch.
-- Runs `bloaty` to compare section sizes.
-- Generates a report.
+- Builds the selected example for the PR head and for the commit the PR branched from.
+- Compares the size of every section that ends up in the image.
+- Reports the flash and bss totals and the sections that changed in a comment on the PR.
+
+Examples:
+
+- `/test-size hello_world esp32c6`
+- `/test-size embassy_hello_world esp32 esp32c3 esp32s3`
+- `/test-size embassy-adc --package qa-test esp32c6`
+
+The example is the first word that is not a chip name. Separate chips with spaces, at least one is required.
+
+By default, the example comes from the `examples` package, the projects under `examples/`. Use `--package qa-test` for a binary from `examples/qa/src/bin`, named after its file.
 
 ## Trust Management Commands
 

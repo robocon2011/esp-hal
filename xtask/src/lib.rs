@@ -2,10 +2,12 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use cargo::CargoAction;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use pretty_yaml::{config::FormatOptions, format_text};
@@ -22,11 +24,13 @@ use crate::{
 pub mod cargo;
 pub mod changelog;
 pub mod commands;
+pub mod detect;
 pub mod documentation;
 pub mod firmware;
 pub mod git;
 pub mod metadata;
 pub mod pr_changelog;
+pub mod resolve;
 
 /// GitHub repository used for all `gh` CLI calls.
 pub const UPSTREAM_REPO: &str = "esp-rs/esp-hal";
@@ -102,9 +106,12 @@ pub enum Package {
     EspRadio,
     EspRadioRtosDriver,
     EspRtos,
+    #[value(alias = "example")]
     Examples,
+    #[value(alias = "test", alias = "tests")]
     HilTest,
     HilTestRadio,
+    #[value(alias = "qa")]
     QaTest,
     XtensaLx,
     XtensaLxRt,
@@ -131,6 +138,16 @@ fn repo_root() -> PathBuf {
 static TOML: Mutex<Option<HashMap<Package, Option<CargoToml>>>> = Mutex::new(None);
 
 impl Package {
+    /// Source directory relative to the workspace root.
+    ///
+    /// Usually matches the clap/package name. QA tests live under `examples/qa`.
+    pub fn directory(&self) -> &str {
+        match self {
+            Self::QaTest => "examples/qa",
+            other => other.as_ref(),
+        }
+    }
+
     /// Does the package have chip-specific cargo features?
     pub fn has_chip_features(&self) -> bool {
         use strum::IntoEnumIterator;
@@ -167,7 +184,7 @@ impl Package {
     pub fn skip_doctests(&self) -> bool {
         let toml = self.toml();
         let Some(ref toml) = *toml else {
-            // No Cargo.toml in the package, must be the examples
+            // No Cargo.toml in the package; it is a directory of standalone projects.
             return true;
         };
         toml.espressif_metadata_bool("skip-doctests")
@@ -185,7 +202,7 @@ impl Package {
             return true;
         }
 
-        let lib_rs_path = workspace.join(self.to_string()).join("src").join("lib.rs");
+        let lib_rs_path = workspace.join(self.directory()).join("src").join("lib.rs");
         let Ok(source) = std::fs::read_to_string(&lib_rs_path) else {
             return false;
         };
@@ -246,7 +263,7 @@ impl Package {
         if *self == Package::HilTest || *self == Package::HilTestRadio {
             return false;
         }
-        let package_path = workspace.join(self.to_string()).join("src");
+        let package_path = workspace.join(self.directory()).join("src");
 
         walkdir::WalkDir::new(package_path)
             .into_iter()
@@ -271,6 +288,11 @@ impl Package {
             .as_ref()
             .and_then(|toml| toml.espressif_metadata_bool("chip-features-matter"))
             .unwrap_or(false)
+    }
+
+    /// Is this "package" a directory of standalone projects rather than a single crate?
+    pub fn contains_standalone_projects(&self) -> bool {
+        matches!(self, Package::Examples | Package::CompileTests)
     }
 
     /// Should documentation be built for the package, and should the package be
@@ -528,7 +550,7 @@ impl Package {
     }
 
     fn targets_lp_core(&self) -> bool {
-        if *self == Package::Examples || *self == Package::CompileTests {
+        if self.contains_standalone_projects() {
             return false;
         }
 
@@ -702,13 +724,23 @@ pub fn generate_build_command(
     if !features.is_empty() {
         log::info!("  Features:      {}", features.join(", "));
     }
-    features.push(chip.to_string());
 
-    let cwd = if package_path.ends_with("examples") || package_path.ends_with("compile-tests") {
+    // A standalone project is a directory with its own manifest, anything else is a source file
+    // inside the package.
+    let standalone_project = package.extension().is_none();
+
+    let cwd = if standalone_project {
         package_path.join(package).to_path_buf()
     } else {
         package_path.to_path_buf()
     };
+
+    // Host-package and self-contained builds enable the bare chip feature;
+    // metadata-driven compile-tests have no per-chip `[features]` table and carry
+    // the chip through forwarded `<dep>/<chip>` features, so it must not be added.
+    if !standalone_project || firmware::project_has_chip_feature_table(&cwd) {
+        features.push(chip.to_string());
+    }
 
     let mut builder = CargoArgsBuilder::new(app.output_file_name())
         .manifest_path(cwd.join("Cargo.toml"))
@@ -725,7 +757,7 @@ pub fn generate_build_command(
 
     let bin_arg = if package.starts_with("src/bin") {
         Some(format!("--bin={}", app.binary_name()))
-    } else if !package_path.ends_with("examples") && !package_path.ends_with("compile-tests") {
+    } else if !standalone_project {
         Some(format!("--example={}", app.binary_name()))
     } else {
         None
@@ -860,9 +892,9 @@ pub fn format_package(
     format_rules: Option<&Path>,
 ) -> Result<()> {
     log::info!("Formatting package: {}", package);
-    let package_path = workspace.join(package.as_ref());
+    let package_path = workspace.join(package.directory());
 
-    let paths = if package == Package::Examples || package == Package::CompileTests {
+    let paths = if package.contains_standalone_projects() {
         crate::find_packages(&package_path)?
     } else {
         vec![package_path]
@@ -883,7 +915,7 @@ pub fn format_package(
 /// with the correct `cargo test` flags/features. See `xtask/README.md` ("Host tests").
 pub fn run_host_tests(workspace: &Path, package: Package) -> Result<()> {
     log::info!("Running host tests for package: {}", package);
-    let package_path = workspace.join(package.as_ref());
+    let package_path = workspace.join(package.directory());
 
     let cmd = CargoArgsBuilder::default();
 
@@ -984,7 +1016,10 @@ const WRITE_ATTEMPTS: usize = 5;
 /// Writing files can transiently fail if another process (an editor, a virus
 /// scanner, ...) holds a lock on them, so give the lock a chance to disappear
 /// before propagating the error.
-fn retry_on_failure<T>(what: &str, mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+pub(crate) fn retry_on_failure<T>(
+    what: &str,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
     for attempt in 1..=WRITE_ATTEMPTS {
         match operation() {
             Ok(value) => return Ok(value),
@@ -1166,6 +1201,257 @@ impl ChipFilterEval<'_> {
             Err(err) => {
                 Err(anyhow::anyhow!("{err:?}").context("Failed to evaluate chip expression"))
             }
+        }
+    }
+}
+
+/// The repository root, for tests which need to inspect the real workspace.
+#[cfg(test)]
+pub(crate) fn repo_root_for_tests() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must live in a subdirectory of the repository")
+        .to_path_buf()
+}
+
+/// Spawn `command`, capture stdout/stderr, kill it if it exceeds `timeout`.
+pub(crate) fn run_command_with_output_timeout(
+    mut command: Command,
+    name: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn {name}: {e}"))?;
+    let start = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child
+                .wait_with_output()
+                .map_err(|e| anyhow!("Failed to collect {name} output: {e}"));
+        }
+
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{name} timed out after {}s", timeout.as_secs());
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use strum::IntoEnumIterator;
+
+    use super::*;
+
+    fn split_chip_suffix(name: &str) -> Option<(&str, String)> {
+        // `esp32` is a suffix of `esp32c5`, so the longest match is the right one.
+        let chip = Chip::iter()
+            .map(|chip| chip.to_string())
+            .filter(|chip| name.ends_with(chip.as_str()))
+            .max_by_key(String::len)?;
+
+        Some((&name[..name.len() - chip.len()], chip))
+    }
+
+    /// Chips that the manifest declares a dependency for, grouped by shared prefix.
+    fn declared_chip_dependencies(toml: &mut CargoToml) -> BTreeMap<String, BTreeSet<String>> {
+        let mut declared = BTreeMap::<String, BTreeSet<_>>::new();
+
+        toml.visit_dependencies(|_, _, table| {
+            for (name, _) in table.iter() {
+                if let Some((prefix, chip)) = split_chip_suffix(name) {
+                    declared.entry(prefix.to_owned()).or_default().insert(chip);
+                }
+            }
+        });
+
+        declared
+    }
+
+    /// Chips that each feature forwards to, keyed by feature, prefix and forwarded feature.
+    fn forwarded_chip_features(
+        toml: &CargoToml,
+    ) -> BTreeMap<(String, String, String), BTreeSet<String>> {
+        let mut forwarded = BTreeMap::<_, BTreeSet<_>>::new();
+
+        let Some(Item::Table(features)) = toml.manifest.get("features") else {
+            return forwarded;
+        };
+
+        for (feature, entries) in features.iter() {
+            let Item::Value(Value::Array(entries)) = entries else {
+                continue;
+            };
+
+            for entry in entries {
+                let Some((dependency, forwarded_feature)) =
+                    entry.as_str().and_then(|entry| entry.split_once('/'))
+                else {
+                    continue;
+                };
+
+                let dependency = dependency.strip_suffix('?').unwrap_or(dependency);
+                let Some((prefix, chip)) = split_chip_suffix(dependency) else {
+                    continue;
+                };
+
+                forwarded
+                    .entry((
+                        feature.to_owned(),
+                        prefix.to_owned(),
+                        forwarded_feature.to_owned(),
+                    ))
+                    .or_default()
+                    .insert(chip);
+            }
+        }
+
+        forwarded
+    }
+
+    /// Whether the per-chip dependency of `chip` should receive `forwarded_feature`.
+    fn chip_expects_feature(chip: &str, forwarded_feature: &str) -> bool {
+        let symbol = format!("{}_driver_supported", forwarded_feature.replace('-', "_"));
+        if !Chip::all_symbols().contains(&symbol) {
+            return true;
+        }
+
+        let chip = chip
+            .parse::<Chip>()
+            .unwrap_or_else(|_| panic!("unknown chip `{chip}`"));
+
+        Config::for_chip(&chip).symbols.contains(&symbol)
+    }
+
+    #[test]
+    fn chip_coverage_dependency_features_are_forwarded() {
+        let mut problems = Vec::new();
+
+        for package in Package::iter() {
+            let mut toml = package.toml();
+            let Some(toml) = toml.as_mut() else {
+                continue;
+            };
+
+            let declared = declared_chip_dependencies(toml);
+
+            for ((feature, prefix, forwarded_feature), chips) in forwarded_chip_features(toml) {
+                let Some(declared) = declared.get(&prefix) else {
+                    continue;
+                };
+
+                let missing = declared
+                    .difference(&chips)
+                    .filter(|chip| chip_expects_feature(chip, &forwarded_feature))
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    problems.push(format!(
+                        "{package}: feature `{feature}` forwards `{prefix}<chip>?/{forwarded_feature}`, but not for {missing:?}"
+                    ));
+                }
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn chip_coverage_dependency_feature_support() {
+        assert!(chip_expects_feature("esp32", "wifi"));
+        assert!(!chip_expects_feature("esp32h2", "wifi"));
+        assert!(chip_expects_feature("esp32h2", "bt"));
+        assert!(!chip_expects_feature("esp32s2", "bt"));
+        assert!(chip_expects_feature("esp32s2", "defmt"));
+    }
+
+    #[test]
+    fn packages_are_either_crates_or_collections_of_standalone_projects() {
+        let workspace = repo_root_for_tests();
+
+        for package in Package::iter() {
+            let package_path = workspace.join(package.directory());
+            assert!(
+                package_path.is_dir(),
+                "package '{package}' has no directory at {}",
+                package_path.display()
+            );
+
+            let has_manifest = package_path.join("Cargo.toml").exists();
+            assert_eq!(
+                has_manifest,
+                !package.contains_standalone_projects(),
+                "package '{package}' has {} Cargo.toml, but contains_standalone_projects() is {}",
+                if has_manifest { "a" } else { "no" },
+                package.contains_standalone_projects(),
+            );
+        }
+
+        assert_eq!(Package::QaTest.to_string(), "qa-test");
+        assert_eq!(Package::QaTest.directory(), "examples/qa");
+    }
+
+    #[test]
+    fn chip_coverage_standalone_projects_declare_required_chips() {
+        let workspace = repo_root_for_tests();
+
+        for package in [Package::Examples, Package::CompileTests] {
+            crate::firmware::load_package(&workspace, package)
+                .unwrap_or_else(|err| panic!("failed to load '{package}': {err}"));
+        }
+    }
+
+    #[test]
+    fn chip_coverage_missing_chip_is_an_error_for_feature_table_projects() {
+        let omitted = Chip::Esp32c61;
+
+        // A project with a `[features]` chip table and no CHIP_FILTER must list every chip,
+        // otherwise a newly added chip silently drops out of its coverage.
+        let with_table = tempfile::TempDir::new().unwrap();
+        let project = with_table.path().join("with-features");
+        fs::create_dir_all(project.join("src")).unwrap();
+        let mut features = String::from("[features]\n");
+        for chip in Chip::iter() {
+            if chip != omitted {
+                features.push_str(&format!("{chip} = []\n"));
+            }
+        }
+        fs::write(project.join("Cargo.toml"), features).unwrap();
+        fs::write(project.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let err = crate::firmware::load_cargo_toml(with_table.path()).unwrap_err();
+        assert!(format!("{err:#}").contains(&format!("{omitted:?}")));
+
+        // A project without a `[features]` table (compile-tests shape) is exempt: its chips ride
+        // on CHIP_FILTER and forwarded `<dep>/<chip>` features, not a per-chip table.
+        let without_table = tempfile::TempDir::new().unwrap();
+        let project = without_table.path().join("without-features");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[dependencies]\n").unwrap();
+        fs::write(project.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        crate::firmware::load_cargo_toml(without_table.path()).unwrap();
+    }
+
+    #[test]
+    fn collections_of_standalone_projects_are_not_empty() {
+        let workspace = repo_root_for_tests();
+
+        for package in Package::iter().filter(Package::contains_standalone_projects) {
+            let projects = find_packages(&workspace.join(package.directory()))
+                .unwrap_or_else(|err| panic!("could not enumerate projects of '{package}': {err}"));
+
+            assert!(
+                !projects.is_empty(),
+                "package '{package}' contains no standalone projects"
+            );
         }
     }
 }

@@ -16,7 +16,7 @@ mod timers_executors {
     #[cfg(not(feature = "esp32"))]
     use esp_hal::timer::systimer::SystemTimer;
     use esp_hal::{
-        interrupt::{Priority, software::SoftwareInterruptControl},
+        interrupt::Priority,
         peripherals::Peripherals,
         time,
         timer::{AnyTimer, OneShotTimer, PeriodicTimer, timg::TimerGroup},
@@ -69,6 +69,11 @@ mod timers_executors {
             "diff: {:?}",
             (t2 - t1).as_millis()
         );
+        assert!(
+            (t2 - t1).as_millis() < 80u64,
+            "diff: {:?}",
+            (t2 - t1).as_millis()
+        );
     }
 
     pub async fn run_join_test() {
@@ -86,16 +91,14 @@ mod timers_executors {
     }
 
     fn set_up_embassy_with_timg0(peripherals: Peripherals) {
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
     }
 
     #[cfg(not(feature = "esp32"))]
     fn set_up_embassy_with_systimer(peripherals: Peripherals) {
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         let systimer = SystemTimer::new(peripherals.SYSTIMER);
-        esp_rtos::start(systimer.alarm0, sw_int.software_interrupt0);
+        esp_rtos::start(systimer.alarm0);
     }
 
     #[init]
@@ -167,12 +170,11 @@ mod timers_executors {
     #[test]
     async fn test_interrupt_executor(peripherals: Peripherals) {
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let executor = mk_static!(
             InterruptExecutor<2>,
-            InterruptExecutor::new(sw_int.software_interrupt2)
+            InterruptExecutor::new(peripherals.FROM_CPU_INTR2)
         );
 
         #[embassy_executor::task]
@@ -256,13 +258,7 @@ mod timers_executors {
 #[embedded_test::tests(default_timeout = 3)]
 mod interrupt_executor {
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
-    use esp_hal::{
-        interrupt::{
-            Priority,
-            software::{SoftwareInterrupt, SoftwareInterruptControl},
-        },
-        timer::timg::TimerGroup,
-    };
+    use esp_hal::{interrupt::Priority, peripherals::FROM_CPU_INTR2, timer::timg::TimerGroup};
     #[cfg(multi_core)]
     use esp_hal::{
         peripherals::CPU_CTRL,
@@ -316,9 +312,7 @@ mod interrupt_executor {
     }
 
     struct Context {
-        #[cfg(multi_core)]
-        sw_int1: SoftwareInterrupt<'static, 1>,
-        sw_int2: SoftwareInterrupt<'static, 2>,
+        sw_int2: FROM_CPU_INTR2<'static>,
         #[cfg(multi_core)]
         cpu_control: CPU_CTRL<'static>,
     }
@@ -327,14 +321,11 @@ mod interrupt_executor {
     fn init() -> Context {
         let peripherals = esp_hal::init(esp_hal::Config::default());
 
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         Context {
-            #[cfg(multi_core)]
-            sw_int1: sw_int.software_interrupt1,
-            sw_int2: sw_int.software_interrupt2,
+            sw_int2: peripherals.FROM_CPU_INTR2,
             #[cfg(multi_core)]
             cpu_control: peripherals.CPU_CTRL,
         }
@@ -392,7 +383,7 @@ mod interrupt_executor {
         let response = &*mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
         let signal = &*mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
-        esp_rtos::start_second_core(ctx.cpu_control, ctx.sw_int1, app_core_stack, || {
+        esp_rtos::start_second_core(ctx.cpu_control, app_core_stack, || {
             let interrupt_executor =
                 mk_static!(InterruptExecutor<2>, InterruptExecutor::new(ctx.sw_int2));
 
@@ -414,7 +405,7 @@ mod interrupt_executor {
         let signal = mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
         let response = mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
-        esp_rtos::start_second_core(ctx.cpu_control, ctx.sw_int1, app_core_stack, || {
+        esp_rtos::start_second_core(ctx.cpu_control, app_core_stack, || {
             let executor = mk_static!(Executor, Executor::new());
             executor.run(|spawner| {
                 spawner.spawn(responder_task(signal, response).unwrap());
@@ -436,7 +427,7 @@ mod interrupt_spi_dma {
         Blocking,
         dma_rx_buffer,
         dma_tx_buffer,
-        interrupt::{Priority, software::SoftwareInterruptControl},
+        interrupt::Priority,
         spi::{
             Mode,
             master::{Config, Spi},
@@ -501,10 +492,9 @@ mod interrupt_spi_dma {
     #[test]
     async fn dma_does_not_lock_up_when_used_in_different_executors() {
         let peripherals = esp_hal::init(esp_hal::Config::default());
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let (dma_channel1, dma_channel2) =
             cfg_select! {
@@ -555,8 +545,8 @@ mod interrupt_spi_dma {
         .unwrap();
 
         let interrupt_executor = mk_static!(
-            InterruptExecutor<1>,
-            InterruptExecutor::new(sw_int.software_interrupt1)
+            InterruptExecutor<2>,
+            InterruptExecutor::new(peripherals.FROM_CPU_INTR2)
         );
 
         let spawner = interrupt_executor.start(Priority::Priority3);
@@ -623,12 +613,16 @@ mod interrupt_spi_dma {
             let dma_rx_buf = dma_rx_buffer!(3200).unwrap();
             let dma_tx_buf = dma_tx_buffer!(3200).unwrap();
 
-            let mut spi = Spi::new(
-                peripherals.spi,
-                Config::default()
+            let mut spi = Spi::new(peripherals.spi, {
+                let config = Config::default()
                     .with_frequency(Rate::from_khz(100))
-                    .with_mode(Mode::_0),
-            )
+                    .with_mode(Mode::_0);
+
+                #[cfg(soc_clock_node_spi_function_clock_is_configurable)]
+                let config = config.with_clock_source(esp_hal::spi::master::ClockSource::Xtal);
+
+                config
+            })
             .unwrap()
             .with_dma(peripherals.dma_channel)
             .with_buffers(dma_rx_buf, dma_tx_buf)
@@ -646,9 +640,8 @@ mod interrupt_spi_dma {
 
         let peripherals = esp_hal::init(esp_hal::Config::default());
 
-        let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        esp_rtos::start(timg0.timer0);
 
         let dma_channel = cfg_select! {
             spi_master_dma_engine = "SPI_DMA" => peripherals.DMA_SPI2,
@@ -665,23 +658,18 @@ mod interrupt_spi_dma {
 
         let app_core_stack = mk_static!(Stack<8192>, Stack::new());
 
-        esp_rtos::start_second_core(
-            peripherals.CPU_CTRL,
-            sw_int.software_interrupt1,
-            app_core_stack,
-            || {
-                use esp_hal::interrupt::Priority;
-                let software_interrupt = sw_int.software_interrupt2;
-                let hp_executor = mk_static!(
-                    InterruptExecutor<2>,
-                    InterruptExecutor::new(software_interrupt)
-                );
-                let high_pri_spawner = hp_executor.start(Priority::Priority2);
+        esp_rtos::start_second_core(peripherals.CPU_CTRL, app_core_stack, || {
+            use esp_hal::interrupt::Priority;
+            let software_interrupt = peripherals.FROM_CPU_INTR2;
+            let hp_executor = mk_static!(
+                InterruptExecutor<2>,
+                InterruptExecutor::new(software_interrupt)
+            );
+            let high_pri_spawner = hp_executor.start(Priority::Priority2);
 
-                // spi runs as high priority task
-                high_pri_spawner.spawn(run_spi(spi_peripherals, transfer_finished).unwrap());
-            },
-        );
+            // spi runs as high priority task
+            high_pri_spawner.spawn(run_spi(spi_peripherals, transfer_finished).unwrap());
+        });
 
         // Wait for a few SPI transfers to happen
         for _ in 0..5 {

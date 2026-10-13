@@ -1,4 +1,5 @@
 pub(crate) mod aes;
+pub(crate) mod canfd;
 pub(crate) mod dma;
 pub(crate) mod ecc;
 pub(crate) mod gpio;
@@ -6,6 +7,7 @@ pub(crate) mod i2c_master;
 pub(crate) mod i2s;
 pub(crate) mod interrupt;
 pub(crate) mod lp_io;
+pub(crate) mod pcnt;
 pub(crate) mod rmt;
 pub(crate) mod rsa;
 pub(crate) mod sdm;
@@ -19,6 +21,7 @@ pub(crate) mod timergroup;
 pub(crate) mod uart;
 
 pub(crate) use aes::*;
+pub(crate) use canfd::*;
 pub(crate) use dma::*;
 pub(crate) use ecc::*;
 pub(crate) use gpio::*;
@@ -26,6 +29,7 @@ pub(crate) use i2c_master::*;
 pub(crate) use i2s::*;
 pub(crate) use interrupt::*;
 pub(crate) use lp_io::*;
+pub(crate) use pcnt::*;
 pub(crate) use rmt::*;
 pub(crate) use sdm::*;
 pub(crate) use sdmmc::*;
@@ -110,6 +114,52 @@ pub(crate) struct PeriInstance<I = EmptyInstanceConfig> {
     pub instance_config: I,
 }
 
+/// Accepts either a sequence of `{ name, ... }` tables or a map keyed by instance name.
+pub(crate) fn deserialize_peri_instances<'de, D, I>(
+    deserializer: D,
+) -> Result<Vec<PeriInstance<I>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    I: serde::Deserialize<'de>,
+{
+    struct InstancesVisitor<I>(core::marker::PhantomData<I>);
+
+    impl<'de, I: serde::Deserialize<'de>> serde::de::Visitor<'de> for InstancesVisitor<I> {
+        type Value = Vec<PeriInstance<I>>;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+            formatter.write_str("a sequence or a map of peripheral instances")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut instances = Vec::new();
+            while let Some(instance) = seq.next_element()? {
+                instances.push(instance);
+            }
+            Ok(instances)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut instances = Vec::new();
+            while let Some((name, instance_config)) = map.next_entry()? {
+                instances.push(PeriInstance {
+                    name,
+                    instance_config,
+                });
+            }
+            Ok(instances)
+        }
+    }
+
+    deserializer.deserialize_any(InstancesVisitor(core::marker::PhantomData))
+}
+
 /// A single cell in the peripheral support table.
 pub(crate) struct SupportItem {
     /// The human-readable name of the driver in the table (leftmost cell.)
@@ -122,6 +172,10 @@ pub(crate) struct SupportItem {
     pub group: &'static str,
     /// If true, this driver is not shown in the peripheral support table.
     pub hide_from_peri_table: bool,
+}
+
+fn default_cpu_pmp_granularity() -> Option<u32> {
+    Some(4)
 }
 
 /// Define driver configuration structs, and a PeriConfig struct
@@ -159,6 +213,7 @@ macro_rules! driver_configs {
             // The list of peripherals for which this driver is implemented.
             // If empty, the driver supports a single instance only.
             #[serde(default)]
+            #[serde(deserialize_with = "deserialize_peri_instances")]
             pub instances: Vec<PeriInstance $(<$instance_config>)?>,
             $(
                 $(#[$meta])*
@@ -312,6 +367,15 @@ driver_configs![
                 remap_iomux_pin_registers: bool,
                 #[serde(default)] // currently 0 in all devices
                 func_in_sel_offset: u32,
+                /// Whether the digital pads must be isolated in software when a power domain that
+                /// feeds them is powered down (`SOC_GPIO_NEED_SOFT_ISOLATE_DURING_PD` in ESP-IDF).
+                ///
+                /// This is independent of `sleep.deep_sleep_needs_gpio_isolation`. That flag covers
+                /// chips that cannot hold a single pad through a deep sleep. This flag covers chips
+                /// that can hold a pad, but still leak current unless software disconnects the
+                /// unused digital pads.
+                #[serde(default)]
+                need_soft_isolate_during_pd: bool,
 
                 #[serde(flatten)]
                 pins_and_signals: GpioPinsAndSignals,
@@ -495,8 +559,6 @@ driver_configs![
             properties: {
                 /// Register-layout generation derived from the chip SVD.
                 version: Option<u32>,
-                /// Default clock source selector written to the I2S clock source register.
-                default_clock_source: Option<u32>,
                 /// Width of the MCLK divider field in the I2S clock register.
                 mclk_divider_bit_width: Option<u32>,
                 /// Largest WS divider value supported by the peripheral.
@@ -574,7 +636,7 @@ driver_configs![
             name: "TWAI",
             properties: {}
         },
-        CanFdProperties {
+        CanFdProperties<CanFdInstanceConfig> {
             driver: canfd,
             name: "CANFD",
             properties: {}
@@ -619,6 +681,12 @@ driver_configs![
                 has_5g: bool,
                 #[serde(default)]
                 csi_supported: bool,
+                /// The Wi-Fi blobs contain Wi-Fi Aware (NAN) code (`SOC_WIFI_NAN_SUPPORT`).
+                #[serde(default)]
+                has_nan: bool,
+                /// The Wi-Fi blobs contain Fine Timing Measurement code (`SOC_WIFI_FTM_SUPPORT`).
+                #[serde(default)]
+                has_ftm: bool,
             }
         },
         IeeeProperties {
@@ -632,6 +700,26 @@ driver_configs![
             properties: {
                 #[serde(default)]
                 mii_via_gpio_matrix: bool,
+                /// When true, the RX FIFO can hold a full frame and DMAOMR.RSF is
+                /// enabled so the DMA can drop FCS/length errors as complete frames.
+                #[serde(default)]
+                rx_store_and_forward: bool,
+                /// When true, Type-2 RX IP checksum offload (`MAC.config.IPC`) is
+                /// enabled and the driver inspects RDES4. False on chips whose COE
+                /// mis-flags valid frames.
+                #[serde(default)]
+                rx_checksum_offload: bool,
+                /// When true, TX IP/TCP/UDP checksum insertion (`TDES0.CIC`) is
+                /// enabled and DMAOMR.TSF is set so the MAC sees the whole frame.
+                /// Requires a TX FIFO that can hold a full frame.
+                #[serde(default)]
+                tx_checksum_offload: bool,
+                /// Programmable DMA burst length (`DMABUSMODE.PBL`). A 32-beat burst
+                /// overflows the AXI bus on some chips.
+                dma_burst_len: u32,
+                /// When true, the MAC exposes RGMII (1000 Mbps) pads in addition to RMII/MII.
+                #[serde(default)]
+                has_rgmii: bool,
             }
         },
         PhyProperties {
@@ -666,7 +754,9 @@ driver_configs![
         RgbProperties {
             driver: rgb_display,
             name: "RGB display", // LCD_CAM, ESP32 I2S, S2 I2S
-            properties: {}
+            properties: {
+                output_lines: u32,
+            }
         },
         SpiLcdProperties {
             driver: spi_lcd,
@@ -761,7 +851,7 @@ driver_configs![
             name: "MCPWM",
             properties: {}
         },
-        PcntProperties {
+        PcntProperties<PcntInstanceConfig> {
             driver: pcnt,
             name: "PCNT",
             properties: {}
@@ -792,9 +882,13 @@ driver_configs![
                 timg_has_timer1: bool,
                 #[serde(default)]
                 timg_has_divcnt_rst: bool,
+                #[serde(default)]
+                wdt_has_conf_update: bool,
 
                 #[serde(default)]
                 rc_fast_calibration: Option<RcFastCalibrationProperties>,
+                #[serde(default)]
+                rc_slow_calibration: Option<RcSlowCalibrationProperties>,
             }
         },
     ]
@@ -909,6 +1003,13 @@ driver_configs![
                 /// Whether deep-sleep entry must isolate the digital pads to prevent a leakage current.
                 #[serde(default)]
                 deep_sleep_needs_gpio_isolation: bool,
+                /// CPU retention capabilities and reachable retention-memory bounds.
+                ///
+                /// Not `Option`: an absent table must emit no symbols at all, and an optional
+                /// property also emits `<name>_is_set`, which would claim retention on the chips
+                /// that have none. `cfgs()` returns `None` when the table is empty.
+                #[serde(default)]
+                retention: SleepRetentionProperties,
             }
         },
         UlpFsmProperties {
@@ -962,6 +1063,7 @@ driver_configs![
             properties: {
                 status_registers: u32,
                 controller: InterruptControllerProperties,
+                context_switch_source: ContextSwitchSource,
                 #[serde(flatten)]
                 software_interrupt_properties: SoftwareInterruptProperties,
             }
@@ -977,12 +1079,19 @@ driver_configs![
                 entry_num: u32,
             }
         },
+        FlashProperties {
+            driver: flash,
+            name: "Flash",
+            properties: {}
+        },
         PsramProperties {
             driver: psram,
             name: "PSRAM",
             properties: {
                 #[serde(default)]
                 octal_spi: bool,
+                #[serde(default)]
+                hex_spi: bool,
                 extmem_origin: u32,
             }
         },
@@ -1010,6 +1119,10 @@ driver_configs![
                 cpu_has_branch_predictor: bool,
                 #[serde(default)]
                 cpu_has_csr_pc: bool,
+                // Interrupts can fire mid-instruction while mstatus.mie is cleared, masking them
+                // requires raising the interrupt threshold as well.
+                #[serde(default)]
+                cpu_has_zcmp_workaround: bool,
                 #[serde(default)]
                 multi_core_enabled: bool,
                 #[serde(default)]
@@ -1020,6 +1133,10 @@ driver_configs![
                 has_swd_watchdog: bool,
                 #[serde(default)]
                 cpu_mcause_mask: u32,
+                /// PMP address matching granularity, in bytes.
+                /// ESP-IDF: `SOC_CPU_PMP_REGION_GRANULARITY`.
+                #[serde(default = "default_cpu_pmp_granularity")]
+                cpu_pmp_granularity: Option<u32>,
                 #[serde(flatten)]
                 config: SocConfig,
             }

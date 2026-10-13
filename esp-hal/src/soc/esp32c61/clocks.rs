@@ -14,7 +14,7 @@
 #![allow(missing_docs, reason = "Experimental")]
 
 use crate::{
-    peripherals::{I2C_ANA_MST, LP_CLKRST, PCR, PMU},
+    peripherals::{I2C_ANA_MST, LP_CLKRST, MODEM_LPCON, PCR, PMU},
     soc::{regi2c, xtal32k},
 };
 
@@ -46,6 +46,8 @@ impl CpuClock {
         apb_clk: Some(ApbClkConfig::new(0)),
         lp_fast_clk: Some(LpFastClkConfig::RcFast),
         lp_slow_clk: Some(xtal32k::default_lp_slow_clk()),
+        ble_lp_clk: Some(BleLpClkConfig::Xtal),
+        crypto_clk: Some(CryptoClkConfig::PllF480m),
         timg_calibration_clock: None,
     };
     const PRESET_160: ClockConfig = ClockConfig {
@@ -56,6 +58,8 @@ impl CpuClock {
         apb_clk: Some(ApbClkConfig::new(0)),
         lp_fast_clk: Some(LpFastClkConfig::RcFast),
         lp_slow_clk: Some(xtal32k::default_lp_slow_clk()),
+        ble_lp_clk: Some(BleLpClkConfig::Xtal),
+        crypto_clk: Some(CryptoClkConfig::PllF480m),
         timg_calibration_clock: None,
     };
 }
@@ -101,6 +105,16 @@ fn configure_xtal_clk_impl(
     _config: XtalClkConfig,
 ) {
     // Nothing to do here.
+}
+
+/// Configures and calibrates the BBPLL again.
+///
+/// The BBPLL loses its analog configuration while the PMU powers it down, for example in a light
+/// sleep. ESP-IDF configures it again before it uses the PLL after a wake.
+pub(crate) fn reconfigure_pll(clocks: &mut ClockTree) {
+    if clocks.pll_clk_refcount > 0 {
+        enable_pll_clk_impl(clocks, true);
+    }
 }
 
 fn enable_pll_clk_impl(_clocks: &mut ClockTree, en: bool) {
@@ -179,6 +193,7 @@ fn enable_rc_fast_clk_impl(_clocks: &mut ClockTree, en: bool) {
 
 // XTAL32K_CLK
 
+#[cfg(use_xtal32k)]
 fn enable_xtal32k_clk_impl(_clocks: &mut ClockTree, en: bool) {
     LP_CLKRST::regs()
         .clk_to_hp()
@@ -277,6 +292,21 @@ fn configure_hp_root_clk_impl(
             HpRootClkConfig::PllF160m => 2,
         })
     });
+
+    bus_clock_update();
+}
+
+/// Applies the new `soc_clk_sel`, `cpu_div_num` and `ahb_div_num` values.
+fn bus_clock_update() {
+    PCR::regs()
+        .bus_clk_update()
+        .write(|w| w.bus_clock_update().set_bit());
+    while PCR::regs()
+        .bus_clk_update()
+        .read()
+        .bus_clock_update()
+        .bit_is_set()
+    {}
 }
 
 // CPU_CLK
@@ -294,9 +324,7 @@ fn configure_cpu_clk_impl(
         .cpu_freq_conf()
         .modify(|_, w| unsafe { w.cpu_div_num().bits(new_config.divisor() as u8) });
 
-    PCR::regs()
-        .bus_clk_update()
-        .write(|w| w.bus_clock_update().set_bit());
+    bus_clock_update();
 }
 
 // AHB_CLK
@@ -314,9 +342,7 @@ fn configure_ahb_clk_impl(
         .ahb_freq_conf()
         .modify(|_, w| unsafe { w.ahb_div_num().bits(new_config.divisor() as u8) });
 
-    PCR::regs()
-        .bus_clk_update()
-        .write(|w| w.bus_clock_update().set_bit());
+    bus_clock_update();
 }
 
 // APB_CLK
@@ -375,9 +401,36 @@ fn configure_lp_slow_clk_impl(
     LP_CLKRST::regs().lp_clk_conf().modify(|_, w| unsafe {
         w.slow_clk_sel().bits(match new_config {
             LpSlowClkConfig::RcSlow => 0,
+            #[cfg(use_xtal32k)]
             LpSlowClkConfig::Xtal32k => 1,
             // LpSlowClkConfig::Ext32k => 2,
             LpSlowClkConfig::OscSlow => 3,
+        })
+    });
+}
+
+// CRYPTO_PLL_DIV
+
+fn enable_crypto_pll_div_impl(_clocks: &mut ClockTree, _en: bool) {
+    // The divider is fixed in hardware, there is nothing to gate.
+}
+
+// CRYPTO_CLK
+
+fn enable_crypto_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do here.
+}
+
+fn configure_crypto_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<CryptoClkConfig>,
+    new_config: CryptoClkConfig,
+) {
+    PCR::regs().sec_conf().modify(|_, w| unsafe {
+        w.sec_clk_sel().bits(match new_config {
+            CryptoClkConfig::Xtal => 0,
+            CryptoClkConfig::RcFast => 1,
+            CryptoClkConfig::PllF480m => 2,
         })
     });
 }
@@ -396,6 +449,7 @@ fn configure_timg_calibration_clock_impl(
     PCR::regs().ctrl_32k_conf().modify(|_, w| unsafe {
         w._32k_sel().bits(match new_config {
             TimgCalibrationClockConfig::OscSlowClk => 0,
+            #[cfg(use_xtal32k)]
             TimgCalibrationClockConfig::Xtal32kClk => 1,
             // TimgCalibrationClockConfig::Ext32kClk => 2,
             TimgCalibrationClockConfig::RcSlowClk => 3,
@@ -476,5 +530,55 @@ impl TimgInstance {
                     TimgWdtClockConfig::PllF80m => 2,
                 })
             });
+    }
+}
+
+// BLE_LP_XTAL_CLK
+
+fn enable_ble_lp_xtal_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do.
+}
+
+// BLE_LP_CLK
+
+fn enable_ble_lp_clk_impl(_clocks: &mut ClockTree, en: bool) {
+    MODEM_LPCON::regs()
+        .clk_conf()
+        .modify(|_, w| w.clk_lp_timer_en().bit(en));
+}
+
+fn configure_ble_lp_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<BleLpClkConfig>,
+    new_config: BleLpClkConfig,
+) {
+    let divisor = match new_config {
+        BleLpClkConfig::Xtal => xtal_clk_frequency() / ble_lp_xtal_clk_frequency() - 1,
+        _ => 0,
+    };
+    let sel_xtal32k = cfg_select! {
+        use_xtal32k => new_config == BleLpClkConfig::Xtal32k,
+        _ => false,
+    };
+
+    MODEM_LPCON::regs()
+        .test_conf()
+        .modify(|_, w| w.clk_en().set_bit());
+
+    MODEM_LPCON::regs().lp_timer_conf().modify(|_, w| unsafe {
+        w.clk_lp_timer_sel_osc_slow()
+            .bit(new_config == BleLpClkConfig::RcSlow);
+        w.clk_lp_timer_sel_osc_fast().clear_bit();
+        w.clk_lp_timer_sel_xtal()
+            .bit(new_config == BleLpClkConfig::Xtal);
+        w.clk_lp_timer_sel_xtal32k().bit(sel_xtal32k);
+        w.clk_lp_timer_div_num().bits(divisor as u16)
+    });
+
+    if sel_xtal32k {
+        // 0 routes XTAL32K to the modem 32 kHz input.
+        MODEM_LPCON::regs()
+            .modem_32k_clk_conf()
+            .modify(|_, w| unsafe { w.clk_modem_32k_sel().bits(0) });
     }
 }

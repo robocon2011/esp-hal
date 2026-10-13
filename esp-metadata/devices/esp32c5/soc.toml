@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-c5_t
 page_size = 0x10000
 entry_num = 512
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -27,6 +30,7 @@ cpu_has_branch_predictor = true
 cpu_has_csr_pc = false
 cpu_csr_prv_mode = 0x810
 cpu_mcause_mask = 0x1f
+cpu_pmp_granularity = 128
 
 has_swd_watchdog = true
 
@@ -45,6 +49,7 @@ peripherals = [
     # { name = "AVC" },
     # { name = "BITSCRAMBLER" },
     { name = "CACHE" },
+    { name = "CLIC", hidden = true },
     { name = "CLINT" },
     # { name = "CPU_APM" }, # TODO: verify we need it
     { name = "DMA" },
@@ -62,7 +67,7 @@ peripherals = [
     { name = "HUK" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
     { name = "IEEE802154", interrupts = { mac = "ZB_MAC" } },
     { name = "INTERRUPT_CORE0" },
     { name = "INTPRI" },
@@ -95,7 +100,7 @@ peripherals = [
     # { name = "OTP_DEBUG" },
     { name = "PARL_IO", interrupts = { tx = "PARL_IO_TX", rx = "PARL_IO_RX" }, clock_group = "PARL_IO" },
     { name = "PAU" },
-    { name = "PCNT" },
+    { name = "PCNT", interrupts = { peri = "PCNT" } },
     { name = "PCR" },
     { name = "PMU" },
     # { name = "PSRAM_MEM_MONITOR" },
@@ -115,8 +120,8 @@ peripherals = [
     { name = "TIMG0", clock_group = "TIMG" },
     { name = "TIMG1", clock_group = "TIMG" },
     # { name = "TRACE0", pac = "TRACE" },
-    # { name = "TWAI0" }, # TODO: too different from what we know
-    # { name = "TWAI1" }, # TODO: too different from what we know
+    { name = "TWAI0", interrupts = { peri = "TWAI0", timer = "TWAI0_TIMER" }, clock_group = "TWAI" },
+    { name = "TWAI1", interrupts = { peri = "TWAI1", timer = "TWAI1_TIMER" }, clock_group = "TWAI" },
     { name = "UART0", interrupts = { peri = "UART0" }, stable = true, clock_group = "UART" },
     { name = "UART1", interrupts = { peri = "UART1" }, stable = true, clock_group = "UART" },
     { name = "UHCI0" },
@@ -128,9 +133,12 @@ peripherals = [
     { name = "FLASH", virtual = true },
     { name = "GPIO_DEDICATED", virtual = true },
     { name = "LP_CORE", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "WIFI", virtual = true, interrupts = { bb = "WIFI_BB", mac = "WIFI_MAC", pwr = "WIFI_PWR" }, stable = true },
     { name = "PSRAM", virtual = true },
+    { name = "FROM_CPU_INTR0", virtual = true },
+    { name = "FROM_CPU_INTR1", virtual = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
@@ -162,7 +170,7 @@ engines = [
         name = "AHB_GDMA",
         max_priority = 5,
         burst_sizes = [4, 16, 32],
-        drivers = ["aes", "sha", "spi_master", "uhci", "i2s", "parl_io"],
+        drivers = ["aes", "sha", "spi_master", "spi_slave", "uhci", "i2s", "parl_io"],
         peripheral_instances = [
             { name = "SPI2", dma_id = 1 },
             { name = "UHCI0", dma_id = 2 },
@@ -251,6 +259,7 @@ support_status = "partial"
 status_registers = 3
 software_interrupt_count = 4
 controller = { Riscv = { flavour = "clic", interrupts = 48, priority_levels = 8 } }
+context_switch_source = "clint"
 
 [device.rmt]
 support_status = "partial"
@@ -300,6 +309,7 @@ support_status = "partial"
 instances = [{ name = "timg0" }, { name = "timg1" }]
 timg_has_divcnt_rst = true
 rc_fast_calibration = { divider = 32, min_rev = 0 }
+wdt_has_conf_update = true
 
 [device.uart]
 support_status = "supported"
@@ -328,7 +338,11 @@ has_region_monitor = true
 support_status = { status = "not_supported", issue = 5168 }
 
 [device.canfd]
-support_status = { status = "not_supported", issue = 5163 }
+support_status = "partial"
+instances = [
+    { name = "twai0", sys_instance = "Twai0", rx = "TWAI0_RX", tx = "TWAI0_TX" },
+    { name = "twai1", sys_instance = "Twai1", rx = "TWAI1_RX", tx = "TWAI1_TX" },
+]
 
 [device.key_manager]
 support_status = { status = "not_supported", issue = 5171 }
@@ -354,7 +368,7 @@ fifo_size = 16
 
 [device.rng]
 support_status = { status = "partial", issue = 5980 }
-trng_supported = false  # TODO
+trng_supported = true
 apb_cycle_wait_num = 16 # TODO
 is_lp_sys = true
 
@@ -363,6 +377,9 @@ is_lp_sys = true
 mac_version = 3
 has_5g = true
 csi_supported = true
+has_wifi6 = true
+has_nan = true
+has_ftm = true
 
 [device.bt]
 support_status = "partial"
@@ -372,11 +389,23 @@ controller = "npl"
 
 [device.phy]
 support_status = "partial"
-combo_module = true
+combo_module = false
 
 # ## Miscellaneous
 [device.systimer]
 [device.pcnt]
+instances = {
+    PCNT = {
+        sys_instance = "Pcnt",
+        interrupt = "PCNT",
+        units = [
+            { sig_ch0 = "PCNT0_SIG_CH0", sig_ch1 = "PCNT0_SIG_CH1", ctrl_ch0 = "PCNT0_CTRL_CH0", ctrl_ch1 = "PCNT0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_SIG_CH0", sig_ch1 = "PCNT1_SIG_CH1", ctrl_ch0 = "PCNT1_CTRL_CH0", ctrl_ch1 = "PCNT1_CTRL_CH1" },
+            { sig_ch0 = "PCNT2_SIG_CH0", sig_ch1 = "PCNT2_SIG_CH1", ctrl_ch0 = "PCNT2_CTRL_CH0", ctrl_ch1 = "PCNT2_CTRL_CH1" },
+            { sig_ch0 = "PCNT3_SIG_CH0", sig_ch1 = "PCNT3_SIG_CH1", ctrl_ch0 = "PCNT3_CTRL_CH0", ctrl_ch1 = "PCNT3_CTRL_CH1" },
+        ],
+    },
+}
 [device.usb_serial_jtag]
 
 [device.parl_io]
@@ -412,6 +441,11 @@ wakeup_sources = {
     LpCore = 11,
 }
 
+[device.sleep.retention]
+cpu_retention = "software"
+cpu_retention_frame = "clic"
+supports_top_power_down = true
+
 [device.etm]
 support_status = { status = "not_supported", issue = 5167 }
 
@@ -423,7 +457,6 @@ support_status = { status = "not_supported", issue = 5444 }
 
 [device.i2s]
 version = 3
-default_clock_source = 2
 mclk_divider_bit_width = 9
 max_ws_width = 512
 clock_configured_by_pcr = true

@@ -14,7 +14,7 @@ use strum::IntoEnumIterator;
 use crate::{
     Chip,
     Package,
-    cargo::{CargoArgsBuilder, CargoCommandBatcher},
+    cargo::{CargoArgsBuilder, CargoCommandBatcher, CargoToml},
     metadata::Config,
     windows_safe_path,
 };
@@ -115,6 +115,7 @@ pub fn build_documentation(
                 None,
                 &version,
                 channel.as_deref(),
+                base_url.as_deref(),
                 &manifest,
             )?;
         } else {
@@ -125,6 +126,7 @@ pub fn build_documentation(
                     Some(chip),
                     &version,
                     channel.as_deref(),
+                    base_url.as_deref(),
                     &manifest,
                 )?;
             }
@@ -158,6 +160,7 @@ fn build_documentation_for_package(
     chip: Option<Chip>,
     version: &semver::Version,
     channel: Option<&str>,
+    base_url: Option<&str>,
     manifest: &Manifest,
 ) -> Result<()> {
     // Ensure that the package/chip combination provided are valid:
@@ -170,7 +173,7 @@ fn build_documentation_for_package(
 
     // Build the documentation for the specified package, targeting the
     // specified chip:
-    let docs_path = cargo_doc(workspace, *package, chip)?;
+    let docs_path = cargo_doc(workspace, *package, chip, channel, base_url)?;
 
     ensure!(
         docs_path.exists(),
@@ -286,11 +289,26 @@ fn highest_eligible_version(manifest: &Manifest) -> Option<semver::Version> {
 }
 
 /// Relative URL from `latest/index.html` to this package's versioned docs root.
-fn latest_redirect_base(package: &Package, version: &semver::Version) -> String {
+///
+/// nginx rewrites `/latest/<rest>` deep links to `/latest/?path=<rest>`, and the
+/// redirect page merges that `path` onto this base, so the base must always be the
+/// version root: `<rest>` already starts with the chip directory for packages with
+/// device-specific docs, or with the crate directory otherwise.
+fn latest_redirect_base(version: &semver::Version) -> String {
+    format!("../{}/", version)
+}
+
+/// Path (relative to the versioned docs root) used when `/latest/` is requested
+/// without a deep-link remainder.
+///
+/// Packages with device-specific docs generate an index page at their version
+/// root, so no fallback path is needed. Other packages have no such index (the
+/// version root 404s/403s), so point at the crate's rustdoc index instead.
+fn latest_redirect_fallback(package: &Package) -> String {
     if package.chip_features_matter() {
-        format!("../{}/", version)
+        String::new()
     } else {
-        format!("../{}/{}/", version, package.to_string().replace('-', "_"))
+        format!("{}/index.html", package.to_string().replace('-', "_"))
     }
 }
 
@@ -300,25 +318,33 @@ fn latest_redirect_html(
     package: &Package,
     version: &semver::Version,
 ) -> Result<String> {
-    let base = latest_redirect_base(package, version);
+    let base = latest_redirect_base(version);
+    let fallback = latest_redirect_fallback(package);
     let resources_path = workspace.join("resources");
 
     render_template(&resources_path, "latest_redirect.html.somni", {
         let mut env = Env::new();
-        env.value("base", base.as_str());
+        env.value("base", base.as_str())
+            .value("fallback", fallback.as_str());
         env
     })
 }
 
-fn cargo_doc(workspace: &Path, package: Package, chip: Option<Chip>) -> Result<PathBuf> {
-    let package_name = package.to_string();
-    let package_path = crate::windows_safe_path(&workspace.join(&package_name));
+fn cargo_doc(
+    workspace: &Path,
+    package: Package,
+    chip: Option<Chip>,
+    channel: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<PathBuf> {
+    let package_path = crate::windows_safe_path(&workspace.join(package.directory()));
 
     // Process Cargo.toml for documentation
     let pre_process_res = pre_process_cargo_toml(chip, &package_path);
 
     if pre_process_res.is_ok() {
-        let cargo_doc_res = cargo_doc_without_pre_processing(workspace, package, chip);
+        let cargo_doc_res =
+            cargo_doc_without_pre_processing(workspace, package, chip, channel, base_url);
 
         // Restore the original Cargo.toml
         restore_cargo_toml(package_path)?;
@@ -334,9 +360,11 @@ fn cargo_doc_without_pre_processing(
     workspace: &Path,
     package: Package,
     chip: Option<Chip>,
+    channel: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<PathBuf> {
     let package_name = package.to_string();
-    let package_path = crate::windows_safe_path(&workspace.join(&package_name));
+    let package_path = crate::windows_safe_path(&workspace.join(package.directory()));
 
     // build documentation using the pre-processed Cargo.toml
     if let Some(chip) = chip {
@@ -361,6 +389,34 @@ fn cargo_doc_without_pre_processing(
     } else {
         None
     };
+
+    // cleaning the docs isn't strictly necessary but otherwise rustdoc will pick up
+    // any docs which were built previously resulting in inconsistency regarding how esp-*
+    // inter-crate links are rendered
+    //
+    // however a real problem is that this could pick up e.g. esp-hal docs for the wrong target chip
+    // (rustdoc doesn't know about our chip features, it just knows about target triples!)
+    //
+    // this was never an issue when building via the GitHub workflow because of the way the job is
+    // setup but better safe than sorry
+    //
+    // ideally we could just use `cargo clean --doc` but for `+esp` this turned out to be not
+    // working as intended
+    let mut docs_target = if let Ok(target_path) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(target_path)
+    } else {
+        workspace.join(package.directory()).join("target")
+    };
+    if let Some(ref target) = target {
+        docs_target = docs_target.join(&target);
+    };
+    docs_target = docs_target.join("doc");
+
+    if docs_target.exists() {
+        log::info!("Removing directory {:?}", docs_target);
+        fs::remove_dir_all(&docs_target)
+            .with_context(|| format!("Unable to remove {:?}", docs_target))?;
+    }
 
     let mut features = vec![];
     let doc_config = if let Some(chip) = &chip {
@@ -392,17 +448,59 @@ fn cargo_doc_without_pre_processing(
         builder.add_arg("-Zbuild-std=alloc,core");
     }
 
-    let rustdocflags = [
-        "--cfg docsrs",
-        "--cfg not_really_docsrs",
-        // Activating this would redirect *all* rand_core version to 0.10.0, which is wrong.
-        // "--extern-html-root-takes-precedence",
-        // While we could use --extern-html-root-url to remap rand_core links, it doesn't seem to
-        // support multiple versions of the same crate. We could redirect everything to 0.10.0,
-        // which isn't ideal.
-        // "--extern-html-root-url rand_core-09=https://docs.rs/rand_core/0.9.5/",
-    ]
-    .join(" ");
+    // Make `esp-*` eco-system inter-crate links work
+    let docs_base = base_url
+        .unwrap_or("https://docs.espressif.com/projects/rust")
+        .trim_end_matches('/');
+    let mut repo_html_root_urls = Vec::new();
+    let mut manifest = CargoToml::new(workspace, package)
+        .with_context(|| format!("Unable to get TOML for {}", package_name))?;
+    let repo_deps = manifest.repo_dependencies();
+    for dep in repo_deps {
+        let chip_features_matter = dep.chip_features_matter();
+        let toml = dep.toml();
+        if let Some(ref toml) = *toml {
+            let version = if let Some(channel) = channel {
+                channel
+            } else {
+                toml.version()
+            };
+
+            let pkg = dep.to_string();
+
+            let normalized_pkg = pkg.replace('-', "_");
+
+            let chip = if let Some(chip) = chip
+                && chip_features_matter
+            {
+                format!("{chip}/")
+            } else {
+                String::new()
+            };
+
+            repo_html_root_urls.push(format!(
+                "--extern-html-root-url {normalized_pkg}={docs_base}/{pkg}/{version}/{chip}"
+            ));
+        }
+    }
+
+    let mut rustdocflags = Vec::from_iter(
+        [
+            "--cfg docsrs",
+            "--cfg not_really_docsrs",
+            "-Z unstable-options",
+            // fix-up broken documentation links for `rand_core`
+            "--extern-html-root-takes-precedence",
+            "--extern-html-root-url rand_core_06=https://docs.rs/rand_core/0.6.4/",
+            "--extern-html-root-url rand_core_09=https://docs.rs/rand_core/0.9.5/",
+        ]
+        .iter()
+        .map(|v| v.to_string()),
+    );
+
+    rustdocflags.extend_from_slice(&repo_html_root_urls);
+
+    let rustdocflags = rustdocflags.join(" ");
 
     if let Some(doc_config) = &doc_config {
         for (key, value) in &doc_config.env {
@@ -424,7 +522,7 @@ fn cargo_doc_without_pre_processing(
     let mut docs_path = if let Ok(target_path) = std::env::var("CARGO_TARGET_DIR") {
         PathBuf::from(target_path)
     } else {
-        workspace.join(package.to_string()).join("target")
+        workspace.join(package.directory()).join("target")
     };
 
     if let Some(ref target) = target {
@@ -933,6 +1031,7 @@ mod tests {
         highest_eligible_version,
         is_eligible_docs_version,
         latest_redirect_base,
+        latest_redirect_fallback,
         latest_redirect_html,
         render_template,
         should_write_latest_redirect,
@@ -1063,28 +1162,46 @@ mod tests {
     #[test]
     fn latest_redirect_base_paths() {
         let v = semver::Version::parse("2.1.0").unwrap();
+        // The base is always the version root; deep-link remainders appended by
+        // the redirect page already include the chip or crate directory.
+        assert_eq!(latest_redirect_base(&v), "../2.1.0/");
+    }
+
+    #[test]
+    fn latest_redirect_fallback_paths() {
+        // Packages with device-specific docs generate an index at the version root.
+        assert_eq!(latest_redirect_fallback(&crate::Package::EspHal), "");
+        // Other packages have no version-root index; land on the crate's index.
         assert_eq!(
-            latest_redirect_base(&crate::Package::EspHal, &v),
-            "../2.1.0/"
-        );
-        assert_eq!(
-            latest_redirect_base(&crate::Package::EspAlloc, &v),
-            "../2.1.0/esp_alloc/"
+            latest_redirect_fallback(&crate::Package::EspAlloc),
+            "esp_alloc/index.html"
         );
     }
 
     /// Small integration check for the redirect template.
     #[test]
-    fn latest_redirect_html_matches_latest_redirect_base() {
+    fn latest_redirect_html_matches_base_and_fallback() {
         let ws = workspace();
         let ver = semver::Version::parse("1.0.0").unwrap();
-        let pkg = crate::Package::EspHal;
 
-        let html = latest_redirect_html(ws, &pkg, &ver).unwrap();
-        let base = latest_redirect_base(&pkg, &ver);
+        for (pkg, fallback) in [
+            (crate::Package::EspHal, ""),
+            (crate::Package::EspAlloc, "esp_alloc/index.html"),
+        ] {
+            let html = latest_redirect_html(ws, &pkg, &ver).unwrap();
+            let base = latest_redirect_base(&ver);
 
-        assert!(html.contains(&format!("var base = \"{base}\"")));
-        assert!(html.contains(&format!("content=\"0; url={base}\"")));
+            assert!(html.contains(&format!("var base = \"{base}\"")));
+            assert!(html.contains(&format!("var fallback = \"{fallback}\"")));
+            assert!(html.contains(&format!("content=\"0; url={base}{fallback}\"")));
+
+            // URL fragments (`#method.foo`) never reach nginx, but browsers
+            // re-attach them to the 301 target, so the redirect page must carry
+            // `location.hash` over to the final destination explicitly.
+            assert!(html.contains("var hash = location.hash;"));
+            assert!(html.contains("location.replace(base + pathFromQuery + hash)"));
+            assert!(html.contains("location.replace(base + fallback + hash)"));
+        }
     }
 
     /// The version select box is embedded in a page full of braces, so make sure the

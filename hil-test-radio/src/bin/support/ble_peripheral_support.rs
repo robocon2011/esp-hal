@@ -10,11 +10,7 @@
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_time::{Duration, Timer};
-use esp_hal::{
-    clock::CpuClock,
-    interrupt::software::SoftwareInterruptControl,
-    timer::timg::TimerGroup,
-};
+use esp_hal::{clock::CpuClock, timer::timg::TimerGroup};
 use esp_radio::ble::controller::BleConnector;
 use hil_test as _;
 use semihosting as _;
@@ -61,8 +57,7 @@ async fn main(_spawner: Spawner) {
     let p = esp_hal::init(config);
 
     let timg0 = TimerGroup::new(p.TIMG0);
-    let sw_ints = SoftwareInterruptControl::new(p.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+    esp_rtos::start(timg0.timer0);
 
     let connector = BleConnector::new(p.BT, Default::default()).unwrap();
     let controller: ExternalController<_, 1> = ExternalController::new(connector);
@@ -76,7 +71,7 @@ where
 {
     let address = Address::random(PERIPHERAL_ADDRESS);
 
-    let mut resources: HostResources<_, DefaultPacketPool, 1, 2> = HostResources::new();
+    let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();
